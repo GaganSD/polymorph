@@ -1,0 +1,33 @@
+[package]
+name = "polymorph-mcp"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Polymorph: lossless context compressor MCP server (token-locking pipeline)"
+
+[lib]
+name = "polymorph"
+path = "src/lib.rs"
+
+[[bin]]
+name = "polymorph-mcp"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "0.8"
+jsonschema = { version = "0.18", default-features = false }
+tiktoken-rs = "0.6"
+daachorse = "1"
+anyhow = "1"
+thiserror = "1"
+tree-sitter = { version = "0.25", features = ["wasm"] }
+once_cell = "1"
+
+[dev-dependencies]
+pretty_assertions = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
