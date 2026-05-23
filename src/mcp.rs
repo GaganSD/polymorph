@@ -1,333 +1,245 @@
-use anyhow::Result;
-use serde_json::{json, Value};
-use std::io::Write;
+//! MCP server implementation using the official `rmcp` SDK.
+//!
+//! All wire framing, JSON-RPC handling, schema publication, and capability
+//! advertisement are delegated to rmcp. Each tool is a `#[tool]`-annotated
+//! async method on `PolymorphServer`. The core AST/DAAC/SQLite logic is
+//! untouched — this module is only the protocol routing wrapper.
+
 use std::path::PathBuf;
+use std::sync::Arc;
+
+use rmcp::{
+    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    model::{
+        CallToolResult, ErrorData, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
+    },
+    tool, tool_handler, tool_router, ServerHandler,
+};
+use serde_json::{json, Value};
 
 use crate::ccr::{self, CacheMiss, CcrOpts};
 use crate::db::DbHandle;
 use crate::io_guard::{
-    validate_compress_array_input_strict, validate_lcm_append_input_strict,
-    validate_lcm_node_input_strict, validate_lock_mask_input_strict,
-    validate_retrieve_cache_input_strict, BoundedStdin, CompressArrayInput, LcmAppendInput,
-    LcmNodeInput, RetrieveCacheInput, MAX_MASK_TOKENS,
+    check_compress_array_input, check_lcm_append_input, check_lcm_node_input,
+    check_lock_mask_input, check_retrieve_cache_input, CompressArrayInput, LcmAppendInput,
+    LcmNodeInput, LockMaskInput, RetrieveCacheInput, MAX_MASK_TOKENS,
 };
 use crate::lcm::{self, NotFound as LcmNotFound, DEFAULT_SOFT_THRESHOLD};
 use crate::{lock_payload, Language};
 
-/// Server-wide state threaded into each tool handler. Holds the SQLite actor
-/// handle, which is cheaply cloneable and owns DB access through one worker.
+/// Shared server state. Cheap to clone — `DbHandle` is an actor handle, the
+/// grammars path is `Arc`-wrapped for the same reason.
 #[derive(Clone)]
-pub struct AppState {
+pub struct PolymorphServer {
     pub db: DbHandle,
-    pub grammars_dir: PathBuf,
+    pub grammars_dir: Arc<PathBuf>,
+    #[allow(dead_code)]
+    tool_router: ToolRouter<PolymorphServer>,
 }
 
-/// JSON-RPC 2.0 over newline-delimited stdio.
-pub fn serve(state: AppState) -> Result<()> {
-    let stdin = std::io::stdin().lock();
-    let mut reader = BoundedStdin::new(stdin);
-    let mut stdout = std::io::stdout().lock();
-
-    while let Some(line) = reader.read_message()? {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
+impl PolymorphServer {
+    pub fn new(db: DbHandle, grammars_dir: PathBuf) -> Self {
+        Self {
+            db,
+            grammars_dir: Arc::new(grammars_dir),
+            tool_router: Self::tool_router(),
         }
-        let req: Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(e) => {
-                write_response(
-                    &mut stdout,
-                    error_response(Value::Null, -32700, &format!("parse error: {e}")),
-                )?;
-                continue;
-            }
-        };
-
-        let is_notification = req.get("id").is_none();
-        let id = req.get("id").cloned().unwrap_or(Value::Null);
-        let method = req
-            .get("method")
-            .and_then(|m| m.as_str())
-            .unwrap_or("")
-            .to_string();
-        let params = req.get("params").cloned().unwrap_or(json!({}));
-
-        if is_notification {
-            continue;
-        }
-
-        let response = match method.as_str() {
-            "initialize" => handle_initialize(id),
-            "tools/list" => handle_tools_list(id),
-            "tools/call" => handle_tools_call(id, &params, &state),
-            "ping" => json!({"jsonrpc": "2.0", "id": id, "result": {}}),
-            other => error_response(id, -32601, &format!("method not found: {other}")),
-        };
-
-        write_response(&mut stdout, response)?;
-    }
-
-    Ok(())
-}
-
-fn write_response<W: Write>(w: &mut W, v: Value) -> Result<()> {
-    let s = serde_json::to_string(&v)?;
-    w.write_all(s.as_bytes())?;
-    w.write_all(b"\n")?;
-    w.flush()?;
-    Ok(())
-}
-
-fn handle_initialize(id: Value) -> Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "result": {
-            "protocolVersion": "2025-06-18",
-            "capabilities": {"tools": {}},
-            "serverInfo": {"name": "polymorph-mcp", "version": env!("CARGO_PKG_VERSION")}
-        }
-    })
-}
-
-fn tool_descriptor<S: schemars::JsonSchema>(name: &str, description: &str) -> Value {
-    let schema = schemars::schema_for!(S);
-    let schema_json = serde_json::to_value(&schema).unwrap_or(json!({}));
-    json!({
-        "name": name,
-        "description": description,
-        "inputSchema": schema_json,
-    })
-}
-
-fn handle_tools_list(id: Value) -> Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "result": {
-            "tools": [
-                tool_descriptor::<crate::io_guard::LockMaskInput>(
-                    "lock_mask",
-                    "Produce a per-token lock+drop mask. lock_mask[i]=true means structural/keyword (must keep); drop_mask[i]=true means the mock LaMR pruner suggests dropping this unlocked token.",
-                ),
-                tool_descriptor::<CompressArrayInput>(
-                    "compress_array",
-                    "Compress a large JSON array by keeping head + tail elements and stashing the middle in the local SQLite cache. Returns the compressed array and a cache_id for retrieval.",
-                ),
-                tool_descriptor::<RetrieveCacheInput>(
-                    "polymorph_retrieve_cache",
-                    "Retrieve the original middle slice of a previously-compressed JSON array by its cache_id.",
-                ),
-                tool_descriptor::<LcmAppendInput>(
-                    "lcm_append",
-                    "Append a conversational turn to the LCM store. If the conversation's active token count exceeds soft_threshold (default 80000), the oldest turns are archived into a Depth-0 summary node.",
-                ),
-                tool_descriptor::<LcmNodeInput>(
-                    "lcm_describe",
-                    "Return metadata about an archived summary node (child_count, total_tokens, roles, created_at).",
-                ),
-                tool_descriptor::<LcmNodeInput>(
-                    "lcm_expand",
-                    "Return the original verbatim turns archived under a summary node, in turn-index order.",
-                ),
-            ]
-        }
-    })
-}
-
-fn handle_tools_call(id: Value, params: &Value, state: &AppState) -> Value {
-    let tool_name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
-    let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
-
-    match tool_name {
-        "lock_mask" => call_lock_mask(id, &arguments, &state.grammars_dir),
-        "compress_array" => call_compress_array(id, &arguments, &state.db),
-        "polymorph_retrieve_cache" => call_retrieve_cache(id, &arguments, &state.db),
-        "lcm_append" => call_lcm_append(id, &arguments, state),
-        "lcm_describe" => call_lcm_describe(id, &arguments, &state.db),
-        "lcm_expand" => call_lcm_expand(id, &arguments, &state.db),
-        other => error_response(id, -32602, &format!("unknown tool: {other}")),
     }
 }
 
-fn call_lock_mask(id: Value, arguments: &Value, grammars_dir: &std::path::Path) -> Value {
-    let input = match validate_lock_mask_input_strict(arguments) {
-        Ok(v) => v,
-        Err(e) => return error_response(id, -32602, &format!("invalid arguments: {e}")),
-    };
-
-    let lang = match Language::from_str(&input.language) {
-        Some(l) => l,
-        None => {
-            return error_response(
-                id,
-                -32602,
-                &format!("unsupported language: {}", input.language),
+#[tool_router]
+impl PolymorphServer {
+    #[tool(
+        description = "Produce a per-token lock+drop mask. lock_mask[i]=true means structural/keyword (must keep); drop_mask[i]=true means the mock LaMR pruner suggests dropping this unlocked token."
+    )]
+    async fn lock_mask(
+        &self,
+        Parameters(input): Parameters<LockMaskInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        check_lock_mask_input(&input).map_err(validation_err)?;
+        let lang = Language::from_str(&input.language).ok_or_else(|| {
+            ErrorData::invalid_params(
+                format!("unsupported language: {}", input.language),
+                None,
             )
+        })?;
+        let grammars = self.grammars_dir.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            lock_payload(&input.text, lang, &input.keywords, grammars.as_path())
+        })
+        .await
+        .map_err(|e| ErrorData::internal_error(format!("join: {e}"), None))?
+        .map_err(|e| ErrorData::internal_error(format!("lock_payload failed: {e}"), None))?;
+        if res.mask.len() > MAX_MASK_TOKENS {
+            return Err(ErrorData::invalid_params(
+                format!("lock_mask output exceeds max token count ({MAX_MASK_TOKENS}) \u{2014} reduce input text"),
+                None,
+            ));
         }
-    };
+        Ok(CallToolResult::structured(json!({
+            "tokens": res.token_ids.len(),
+            "kept_tokens": res.kept_tokens,
+            "mask": res.mask,
+            "drop_mask": res.drop_mask,
+        })))
+    }
 
-    match lock_payload(&input.text, lang, &input.keywords, grammars_dir) {
-        Ok(res) => {
-            if res.mask.len() > MAX_MASK_TOKENS {
-                return error_response(
-                    id,
-                    -32602,
-                    &format!(
-                        "lock_mask output exceeds max token count ({MAX_MASK_TOKENS}) — reduce input text"
-                    ),
-                );
-            }
-            let structured = json!({
-                "tokens": res.token_ids.len(),
-                "kept_tokens": res.kept_tokens,
-                "mask": res.mask,
-                "drop_mask": res.drop_mask,
-            });
-            tool_ok(id, &structured)
+    #[tool(
+        description = "Compress a large JSON array by keeping head + tail elements and stashing the middle in the local SQLite cache. Returns the compressed array and a cache_id for retrieval."
+    )]
+    async fn compress_array(
+        &self,
+        Parameters(input): Parameters<CompressArrayInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        check_compress_array_input(&input).map_err(validation_err)?;
+        let mut opts = CcrOpts::default();
+        if let Some(h) = input.head_keep {
+            opts.head_keep = h;
         }
-        Err(e) => error_response(id, -32000, &format!("lock_payload failed: {e}")),
+        if let Some(t) = input.tail_keep {
+            opts.tail_keep = t;
+        }
+        let db = self.db.clone();
+        let value = input.value;
+        let cache = input.cache;
+        let res = tokio::task::spawn_blocking(move || ccr::compress_array(value, opts, &db, cache))
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("join: {e}"), None))?
+            .map_err(|e| ErrorData::internal_error(format!("compress_array failed: {e}"), None))?;
+        Ok(CallToolResult::structured(json!({
+            "compressed": res.compressed,
+            "cache_id": res.cache_id,
+            "omitted_count": res.omitted_count,
+        })))
+    }
+
+    #[tool(
+        description = "Retrieve the original middle slice of a previously-compressed JSON array by its cache_id."
+    )]
+    async fn polymorph_retrieve_cache(
+        &self,
+        Parameters(input): Parameters<RetrieveCacheInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        check_retrieve_cache_input(&input).map_err(validation_err)?;
+        let db = self.db.clone();
+        let cache_id = input.cache_id.clone();
+        let res = tokio::task::spawn_blocking(move || ccr::retrieve(&input.cache_id, &db))
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("join: {e}"), None))?;
+        match res {
+            Ok(value) => Ok(CallToolResult::structured(json!({"value": value}))),
+            Err(e) if e.is::<CacheMiss>() => Err(ErrorData::invalid_params(
+                "cache_miss",
+                Some(json!({
+                    "cache_id": cache_id,
+                    "hint": "cache entry expired or never existed",
+                })),
+            )),
+            Err(e) => Err(ErrorData::internal_error(
+                format!("retrieve failed: {e}"),
+                None,
+            )),
+        }
+    }
+
+    #[tool(
+        description = "Append a conversational turn to the LCM store. If the conversation's active token count exceeds soft_threshold (default 80000), the oldest turns are archived into a Depth-0 summary node."
+    )]
+    async fn lcm_append(
+        &self,
+        Parameters(input): Parameters<LcmAppendInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        check_lcm_append_input(&input).map_err(validation_err)?;
+        let threshold = input.soft_threshold.unwrap_or(DEFAULT_SOFT_THRESHOLD);
+        let db = self.db.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            lcm::append_and_maybe_archive(
+                &input.conversation_id,
+                &input.role,
+                &input.content,
+                threshold,
+                &db,
+            )
+        })
+        .await
+        .map_err(|e| ErrorData::internal_error(format!("join: {e}"), None))?
+        .map_err(|e| ErrorData::internal_error(format!("lcm_append failed: {e}"), None))?;
+        Ok(CallToolResult::structured(json!({
+            "turn_id": res.turn_id,
+            "turn_index": res.turn_index,
+            "tokens": res.tokens,
+            "archived_node_id": res.archived_node_id,
+        })))
+    }
+
+    #[tool(
+        description = "Return metadata about an archived summary node (child_count, total_tokens, roles, created_at)."
+    )]
+    async fn lcm_describe(
+        &self,
+        Parameters(input): Parameters<LcmNodeInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        check_lcm_node_input(&input).map_err(validation_err)?;
+        let db = self.db.clone();
+        let node_id = input.node_id.clone();
+        let res = tokio::task::spawn_blocking(move || lcm::describe(&input.node_id, &db))
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("join: {e}"), None))?;
+        match res {
+            Ok(meta) => Ok(CallToolResult::structured(
+                serde_json::to_value(&meta).unwrap_or(Value::Null),
+            )),
+            Err(e) if e.is::<LcmNotFound>() => Err(lcm_not_found(&node_id)),
+            Err(e) => Err(ErrorData::internal_error(
+                format!("lcm_describe failed: {e}"),
+                None,
+            )),
+        }
+    }
+
+    #[tool(
+        description = "Return the original verbatim turns archived under a summary node, in turn-index order."
+    )]
+    async fn lcm_expand(
+        &self,
+        Parameters(input): Parameters<LcmNodeInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        check_lcm_node_input(&input).map_err(validation_err)?;
+        let db = self.db.clone();
+        let node_id = input.node_id.clone();
+        let res = tokio::task::spawn_blocking(move || lcm::expand(&input.node_id, &db))
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("join: {e}"), None))?;
+        match res {
+            Ok(rows) => Ok(CallToolResult::structured(json!({"turns": rows}))),
+            Err(e) if e.is::<LcmNotFound>() => Err(lcm_not_found(&node_id)),
+            Err(e) => Err(ErrorData::internal_error(
+                format!("lcm_expand failed: {e}"),
+                None,
+            )),
+        }
     }
 }
 
-fn call_compress_array(id: Value, arguments: &Value, db: &DbHandle) -> Value {
-    let input = match validate_compress_array_input_strict(arguments) {
-        Ok(v) => v,
-        Err(e) => return error_response(id, -32602, &format!("invalid arguments: {e}")),
-    };
-
-    let mut opts = CcrOpts::default();
-    if let Some(h) = input.head_keep {
-        opts.head_keep = h;
-    }
-    if let Some(t) = input.tail_keep {
-        opts.tail_keep = t;
-    }
-
-    match ccr::compress_array(input.value, opts, db, input.cache) {
-        Ok(res) => tool_ok(
-            id,
-            &json!({
-                "compressed": res.compressed,
-                "cache_id": res.cache_id,
-                "omitted_count": res.omitted_count,
-            }),
-        ),
-        Err(e) => error_response(id, -32000, &format!("compress_array failed: {e}")),
+#[tool_handler]
+impl ServerHandler for PolymorphServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_protocol_version(ProtocolVersion::V_2025_06_18)
+            .with_server_info(Implementation::new(
+                "polymorph-mcp",
+                env!("CARGO_PKG_VERSION"),
+            ))
     }
 }
 
-fn call_retrieve_cache(id: Value, arguments: &Value, db: &DbHandle) -> Value {
-    let input = match validate_retrieve_cache_input_strict(arguments) {
-        Ok(v) => v,
-        Err(e) => return error_response(id, -32602, &format!("invalid arguments: {e}")),
-    };
-
-    match ccr::retrieve(&input.cache_id, db) {
-        Ok(value) => tool_ok(id, &json!({"value": value})),
-        Err(e) if e.is::<CacheMiss>() => error_response_with_data(
-            id,
-            -32602,
-            "cache_miss",
-            json!({
-                "cache_id": input.cache_id,
-                "hint": "cache entry expired or never existed",
-            }),
-        ),
-        Err(e) => error_response(id, -32000, &format!("retrieve failed: {e}")),
-    }
+fn validation_err(e: anyhow::Error) -> ErrorData {
+    ErrorData::invalid_params(format!("invalid arguments: {e}"), None)
 }
 
-fn call_lcm_append(id: Value, arguments: &Value, state: &AppState) -> Value {
-    let input = match validate_lcm_append_input_strict(arguments) {
-        Ok(v) => v,
-        Err(e) => return error_response(id, -32602, &format!("invalid arguments: {e}")),
-    };
-    let threshold = input.soft_threshold.unwrap_or(DEFAULT_SOFT_THRESHOLD);
-
-    let result = match lcm::append_and_maybe_archive(
-        &input.conversation_id,
-        &input.role,
-        &input.content,
-        threshold,
-        &state.db,
-    ) {
-        Ok(r) => r,
-        Err(e) => return error_response(id, -32000, &format!("lcm_append failed: {e}")),
-    };
-
-    tool_ok(
-        id,
-        &json!({
-            "turn_id": result.turn_id,
-            "turn_index": result.turn_index,
-            "tokens": result.tokens,
-            "archived_node_id": result.archived_node_id,
-        }),
+fn lcm_not_found(node_id: &str) -> ErrorData {
+    ErrorData::invalid_params(
+        "lcm_not_found",
+        Some(json!({"node_id": node_id, "hint": "no summary node with that id"})),
     )
-}
-
-fn call_lcm_describe(id: Value, arguments: &Value, db: &DbHandle) -> Value {
-    let input = match validate_lcm_node_input_strict(arguments) {
-        Ok(v) => v,
-        Err(e) => return error_response(id, -32602, &format!("invalid arguments: {e}")),
-    };
-    match lcm::describe(&input.node_id, db) {
-        Ok(meta) => tool_ok(id, &serde_json::to_value(&meta).unwrap_or(Value::Null)),
-        Err(e) if e.is::<LcmNotFound>() => error_response_with_data(
-            id,
-            -32602,
-            "lcm_not_found",
-            json!({"node_id": input.node_id, "hint": "no summary node with that id"}),
-        ),
-        Err(e) => error_response(id, -32000, &format!("lcm_describe failed: {e}")),
-    }
-}
-
-fn call_lcm_expand(id: Value, arguments: &Value, db: &DbHandle) -> Value {
-    let input = match validate_lcm_node_input_strict(arguments) {
-        Ok(v) => v,
-        Err(e) => return error_response(id, -32602, &format!("invalid arguments: {e}")),
-    };
-    match lcm::expand(&input.node_id, db) {
-        Ok(rows) => tool_ok(id, &json!({"turns": rows})),
-        Err(e) if e.is::<LcmNotFound>() => error_response_with_data(
-            id,
-            -32602,
-            "lcm_not_found",
-            json!({"node_id": input.node_id, "hint": "no summary node with that id"}),
-        ),
-        Err(e) => error_response(id, -32000, &format!("lcm_expand failed: {e}")),
-    }
-}
-
-fn tool_ok(id: Value, structured: &Value) -> Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "result": {
-            "content": [{
-                "type": "text",
-                "text": serde_json::to_string(structured).unwrap_or_default(),
-            }],
-            "structuredContent": structured,
-        }
-    })
-}
-
-fn error_response(id: Value, code: i64, message: &str) -> Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "error": {"code": code, "message": message}
-    })
-}
-
-fn error_response_with_data(id: Value, code: i64, message: &str, data: Value) -> Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "error": {"code": code, "message": message, "data": data}
-    })
 }

@@ -10,6 +10,7 @@ pub mod locking;
 pub mod mcp;
 pub mod selftest;
 pub mod tokenizer;
+pub mod transport;
 
 pub use ast::extract_ast_intervals;
 pub use daac::DaacScanner;

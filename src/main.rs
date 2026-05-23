@@ -1,6 +1,7 @@
 use anyhow::Result;
 
-use polymorph::{db, mcp};
+use polymorph::{db, mcp::PolymorphServer, transport::BoundedAsyncRead};
+use rmcp::ServiceExt;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -15,10 +16,19 @@ fn main() -> Result<()> {
         return polymorph::selftest::run(&grammars_dir);
     }
 
-    // Set up shared state: one SQLite worker thread + MCP handlers.
     let db_path = db::default_path()?;
     let db = db::open_pool(&db_path)?;
 
-    let state = mcp::AppState { db, grammars_dir };
-    mcp::serve(state)
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async move {
+        let server = PolymorphServer::new(db, grammars_dir);
+        let stdin = BoundedAsyncRead::new(tokio::io::stdin());
+        let stdout = tokio::io::stdout();
+        let running = server.serve((stdin, stdout)).await?;
+        running.waiting().await?;
+        Ok::<(), anyhow::Error>(())
+    })?;
+    Ok(())
 }
