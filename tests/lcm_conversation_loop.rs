@@ -1,14 +1,14 @@
 //! The headline M2 end-to-end test: drive a mock agent conversation through
 //! the LCM store and assert that auto-archive fires + round-trip works.
 
-use polymorph::{db, lcm, tokens};
+use polymorph::{db, lcm};
 
 /// Build a deterministic ~target-token filler string via the M1 tokenizer.
 fn filler(target_tokens: usize) -> String {
     let unit = "lorem ipsum dolor sit amet consectetur adipiscing elit ";
     let mut s = String::new();
     loop {
-        let (ids, _) = tokens::token_spans(&s).unwrap();
+        let (ids, _) = polymorph::tokenizer::token_spans(&s).unwrap();
         if ids.len() >= target_tokens {
             return s;
         }

@@ -297,6 +297,38 @@ fn mcp_lcm_describe_unknown_returns_not_found_data() {
 }
 
 #[test]
+fn mcp_compress_array_missing_value_rejected() {
+    let req = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"compress_array","arguments":{"head_keep":3}}}"#;
+    let out = send_messages(&[req]);
+    assert!(out.contains("\"error\""));
+    assert!(out.contains("invalid arguments"));
+}
+
+#[test]
+fn mcp_retrieve_cache_missing_id_rejected() {
+    let req = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"polymorph_retrieve_cache","arguments":{}}}"#;
+    let out = send_messages(&[req]);
+    assert!(out.contains("\"error\""));
+    assert!(out.contains("invalid arguments"));
+}
+
+#[test]
+fn mcp_lcm_append_missing_content_rejected() {
+    let req = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"lcm_append","arguments":{"conversation_id":"c1","role":"user"}}}"#;
+    let out = send_messages(&[req]);
+    assert!(out.contains("\"error\""));
+    assert!(out.contains("invalid arguments"));
+}
+
+#[test]
+fn mcp_lcm_describe_missing_node_id_rejected() {
+    let req = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"lcm_describe","arguments":{}}}"#;
+    let out = send_messages(&[req]);
+    assert!(out.contains("\"error\""));
+    assert!(out.contains("invalid arguments"));
+}
+
+#[test]
 fn mcp_lock_mask_response_includes_drop_mask() {
     let req = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"lock_mask","arguments":{"text":"{\"k\":\"v\"}","language":"json","keywords":[]}}}"#;
     let out = send_messages(&[req]);
