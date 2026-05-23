@@ -29,6 +29,8 @@ pub fn serve(grammars_dir: PathBuf) -> Result<()> {
             }
         };
 
+        // Notifications (no `id`) get no response per JSON-RPC 2.0 §4.1.
+        let is_notification = req.get("id").is_none();
         let id = req.get("id").cloned().unwrap_or(Value::Null);
         let method = req
             .get("method")
@@ -36,6 +38,12 @@ pub fn serve(grammars_dir: PathBuf) -> Result<()> {
             .unwrap_or("")
             .to_string();
         let params = req.get("params").cloned().unwrap_or(json!({}));
+
+        if is_notification {
+            // Common notifications: `notifications/initialized`, `notifications/cancelled`.
+            // Silently consume.
+            continue;
+        }
 
         let response = match method.as_str() {
             "initialize" => handle_initialize(id),
@@ -64,7 +72,7 @@ fn handle_initialize(id: Value) -> Value {
         "jsonrpc": "2.0",
         "id": id,
         "result": {
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": "2025-06-18",
             "capabilities": {"tools": {}},
             "serverInfo": {"name": "polymorph-mcp", "version": env!("CARGO_PKG_VERSION")}
         }

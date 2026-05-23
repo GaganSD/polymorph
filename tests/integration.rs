@@ -189,6 +189,25 @@ fn python_brackets_and_colons_locked() {
 }
 
 #[test]
+fn deeply_nested_input_does_not_overflow_stack() {
+    // Adversarial input: 2000 levels of `[`. The old recursive walker would
+    // overflow the default thread stack around 4-8k levels on some platforms.
+    let depth = 2000usize;
+    let mut text = String::with_capacity(2 * depth + 1);
+    for _ in 0..depth {
+        text.push('[');
+    }
+    text.push('0');
+    for _ in 0..depth {
+        text.push(']');
+    }
+    let res = lock_payload(&text, Language::Json, &[], &grammars_dir()).unwrap();
+    assert_eq!(res.mask.len(), res.token_spans.len());
+    // The opening `[` must be locked.
+    assert!(res.mask[0]);
+}
+
+#[test]
 fn large_payload_smoke() {
     // ~10k tokens, exercises the sweep + DAAC at scale.
     let mut text = String::from("[");

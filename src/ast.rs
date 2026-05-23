@@ -73,18 +73,20 @@ pub fn extract_ast_intervals(
 
     let mut intervals = Vec::new();
     let mut cursor = tree.walk();
-    collect(&mut cursor, language, &mut intervals);
+    collect_iterative(&mut cursor, language, &mut intervals);
 
     Ok(sort_and_merge(intervals))
 }
 
-fn collect(cursor: &mut TreeCursor, lang: Language, out: &mut Vec<(usize, usize)>) {
+/// Iterative tree walk — switched from recursion to avoid stack overflow on
+/// adversarial inputs like `[[[[...]]]]` nested thousands of layers deep.
+/// Uses the TreeCursor's natural goto_*-sibling/parent traversal without
+/// extending the call stack per node.
+fn collect_iterative(cursor: &mut TreeCursor, lang: Language, out: &mut Vec<(usize, usize)>) {
     loop {
         let node = cursor.node();
         let kind = node.kind();
-
         let is_structural = if !node.is_named() {
-            // Anonymous nodes = punctuation + literal keywords (e.g. `{`, `def`).
             true
         } else {
             match lang {
@@ -94,17 +96,20 @@ fn collect(cursor: &mut TreeCursor, lang: Language, out: &mut Vec<(usize, usize)
                 }
             }
         };
-
         if is_structural {
             out.push((node.start_byte(), node.end_byte()));
         }
 
         if cursor.goto_first_child() {
-            collect(cursor, lang, out);
-            cursor.goto_parent();
+            continue;
         }
-        if !cursor.goto_next_sibling() {
-            break;
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return;
+            }
         }
     }
 }

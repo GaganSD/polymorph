@@ -107,6 +107,25 @@ fn mcp_ping() {
 }
 
 #[test]
+fn mcp_notification_produces_no_response() {
+    // No `id` field → JSON-RPC notification. Server must not write a response.
+    // We send a notification then a real request; only the request gets a reply.
+    let out = send_messages(&[
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        r#"{"jsonrpc":"2.0","id":7,"method":"ping"}"#,
+    ]);
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 1, "exactly one response expected, got: {out}");
+    assert!(lines[0].contains("\"id\":7"));
+}
+
+#[test]
+fn mcp_protocol_version_is_current() {
+    let out = send_messages(&[r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#]);
+    assert!(out.contains("\"2025-06-18\""), "expected 2025-06-18 protocol version, got: {out}");
+}
+
+#[test]
 fn mcp_multiple_messages_in_sequence() {
     let out = send_messages(&[
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
