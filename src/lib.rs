@@ -3,6 +3,7 @@ pub mod ccr;
 pub mod daac;
 pub mod db;
 pub mod io_guard;
+pub mod lcm;
 pub mod mcp;
 pub mod selftest;
 pub mod sweep;
