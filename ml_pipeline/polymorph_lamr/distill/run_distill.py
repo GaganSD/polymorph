@@ -50,6 +50,9 @@ async def _run(args: argparse.Namespace) -> int:
         gpt_model=args.gpt_model,
         num_retries=args.retries,
         request_timeout_s=args.timeout,
+        max_tokens=args.output_max_tokens,
+        temperature=args.temperature,
+        failure_policy=args.failure_policy,
     )
 
     results = []
@@ -79,6 +82,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--gpt-model", default="openai/gpt-4o")
     p.add_argument("--retries", type=int, default=4)
     p.add_argument("--timeout", type=float, default=60.0)
+    p.add_argument("--output-max-tokens", type=int, default=2048)
+    p.add_argument("--temperature", type=float, default=0.2)
+    p.add_argument("--failure-policy", choices=["record", "raise"], default="record")
     return p
 
 

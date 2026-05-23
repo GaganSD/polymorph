@@ -31,6 +31,7 @@ class DistillConfig:
     request_timeout_s: float = 60.0
     max_tokens: int = 2048
     temperature: float = 0.2
+    failure_policy: str = "record"  # "record" or "raise"
 
 
 @dataclass
@@ -72,12 +73,10 @@ async def _call_one(model: str, prompt: str, cfg: DistillConfig) -> tuple[str, f
                 timeout=cfg.request_timeout_s,
                 num_retries=0,  # we do the outer retry
             )
-            text = resp["choices"][0]["message"]["content"] or ""
-            cost = 0.0
-            try:
-                cost = float(getattr(resp, "_hidden_params", {}).get("response_cost") or 0.0)
-            except Exception:
-                cost = 0.0
+            text = _response_text(resp)
+            cost = _response_cost(resp)
+            if not text.strip():
+                return "", cost, f"{model}: empty response content"
             return text.strip(), cost, None
         except Exception as e:
             last_err = e
@@ -94,6 +93,8 @@ async def distill_pair(
     cfg: DistillConfig | None = None,
 ) -> DistillResult:
     cfg = cfg or DistillConfig()
+    if cfg.failure_policy not in {"record", "raise"}:
+        raise ValueError(f"unknown failure_policy: {cfg.failure_policy}")
     claude_prompt = render(CLAUDE_MAX_COMPRESSION, text)
     gpt_prompt = render(GPT4O_REASONING_PRESERVED, text)
 
@@ -104,6 +105,8 @@ async def distill_pair(
     )
 
     errs = [e for e in (claude_err, gpt_err) if e]
+    if errs and cfg.failure_policy == "raise":
+        raise RuntimeError("; ".join(errs))
     return DistillResult(
         src_path=src_path,
         chunk_id=chunk_id,
@@ -159,3 +162,47 @@ def write_jsonl(results: list[DistillResult], out_path: Path) -> None:
     with out_path.open("w") as f:
         for r in results:
             f.write(r.to_json() + "\n")
+
+
+def _get(obj: Any, key: str, default: Any = None) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _response_text(resp: Any) -> str:
+    choices = _get(resp, "choices", [])
+    if not choices:
+        return ""
+    first = choices[0]
+    message = _get(first, "message", {})
+    content = _get(message, "content", "")
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            else:
+                text = _get(item, "text", None)
+                if text is not None:
+                    parts.append(str(text))
+        return "".join(parts)
+    return str(content or "")
+
+
+def _response_cost(resp: Any) -> float:
+    hidden = _get(resp, "_hidden_params", {}) or {}
+    for source in (hidden, resp):
+        for key in ("response_cost", "cost", "cost_usd"):
+            value = _get(source, key, None)
+            if value is not None:
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    pass
+    usage = _get(resp, "usage", {}) or {}
+    value = _get(usage, "cost", None) or _get(usage, "response_cost", None)
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
