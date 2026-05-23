@@ -11,7 +11,7 @@ ml_pipeline/
 │   ├── distill/    # async litellm client, Claude + GPT-4o
 │   ├── qc/         # LLMLingua-2 VR + AG metrics + percentile filter
 │   ├── label/      # LCS alignment + tree-sitter AST hop-decay split
-│   ├── model/      # stubbed Gated DeltaNet-2 + MoE + dual CRF
+│   ├── model/      # stubbed Gated DeltaNet-2 + head gate + dual CRF
 │   ├── train/      # IterableDataset, joint NLL loss, AMP loop
 │   └── export/     # ONNX + transitions.npz + parity check
 ├── tests/          # pytest, runs CPU-only with no API keys
@@ -95,8 +95,9 @@ lamr-train --config configs/default.yaml --shards data/labeled/*.jsonl --out art
 - Dry-run (no shards, prints param count + memory estimate):
   `lamr-train --config configs/default.yaml --dry-run`
 - Single-node `torchrun` works; cluster deployment is the user's problem.
-- Joint loss: `L = λ_s · NLL_sem + λ_d · NLL_dep` with per-token weights from
-  the hop-decay split.
+- Joint loss uses the learned sequence-level head gate:
+  `L = λ_s · gate_sem · NLL_sem + λ_d · gate_dep · NLL_dep`, with per-token
+  hop-decay weights inside each CRF likelihood.
 
 ### 5. Export (`polymorph_lamr.export.to_onnx`)
 
@@ -107,7 +108,7 @@ lamr-export --ckpt artifacts/ckpts/ckpt-final.pt --out artifacts/lamr-v0 \
 
 Emits:
 
-- `model.onnx` — backbone + MoE + emission heads (dynamic seq axis).
+- `model.onnx` — backbone + semantic/dependency head gate + emission heads (dynamic seq axis).
 - `transitions.npz` — `{sem,dep}_{trans,start,end}` (2×2 each, tiny).
 - `config.yaml`, `README.md`, `parity.json`.
 
@@ -116,22 +117,23 @@ Viterbi runs in Rust; see `ARTIFACT_OUT/README.md` for the decode protocol.
 ## Architecture notes
 
 ### Stubbed backbone
-`polymorph_lamr/model/backbone.py:GatedDeltaNet2Stub` is a small bidirectional
-Transformer encoder. Search for the marker `_TODO_REAL_DELTANET` when
-swapping to the real kernel.
+`polymorph_lamr/model/backbone.py:GatedDeltaNet2Stub` is a small ONNX-friendly
+feed-forward encoder. Search for the marker `_TODO_REAL_DELTANET` when swapping
+to the real kernel.
 
 ### Dual CRF rationale
 Single-CRF pruning collapses semantic-evidence and dependency-scaffold
 transitions into one matrix — see
 `research/Context Management Papers Analysis.md`. We train two independent
-linear-chain CRFs whose emissions come from the same MoE-mixed hidden state.
-At inference the Rust side decodes each head separately and combines.
+linear-chain CRFs over the same backbone hidden states. A learned softmax head
+gate produces semantic/dependency weights per sequence. At inference the Rust
+side builds one weighted CRF from both heads and runs one Viterbi decode.
 
 ### ONNX export strategy
 Viterbi is dynamic-length and brittle under ONNX/TRT export. We export only
-the static graph (backbone + MoE + emissions) and ship the tiny `(2,2)`
-transition matrices as a side-car. Rust decodes — the runtime already does
-sequential work, so the marginal cost is negligible.
+the static graph (backbone + head gate + emissions) and ship the tiny `(2,2)`
+transition matrices as a side-car. Rust decodes the weighted CRF — the runtime
+already does sequential work, so the marginal cost is negligible.
 
 ## Testing
 

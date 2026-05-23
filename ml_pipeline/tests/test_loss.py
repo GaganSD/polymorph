@@ -13,8 +13,6 @@ def test_joint_equals_sum_at_lambda_one():
         n_heads=2,
         ff_mult=2,
         dropout=0.0,
-        n_experts=2,
-        top_k=2,
     )
     torch.manual_seed(0)
     model = LaMRModel(cfg)
@@ -26,4 +24,5 @@ def test_joint_equals_sum_at_lambda_one():
     w_d = torch.ones((b, t))
 
     out = model.joint_nll(ids, mask, tags, w_s, w_d, lambda_sem=1.0, lambda_dep=1.0)
-    assert torch.isclose(out["loss"], out["nll_sem"] + out["nll_dep"], atol=1e-5)
+    expected = out["head_weights"][0, 0] * out["nll_sem"] + out["head_weights"][0, 1] * out["nll_dep"]
+    assert torch.isclose(out["loss"], expected, atol=1e-5)

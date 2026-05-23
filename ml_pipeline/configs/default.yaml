@@ -43,10 +43,6 @@ model:
   n_heads: 4
   ff_mult: 4
   dropout: 0.1
-  moe:
-    n_experts: 4
-    top_k: 2
-    expert_hidden_mult: 2
   use_real_deltanet: false  # _TODO_REAL_DELTANET swap point
 
 train:

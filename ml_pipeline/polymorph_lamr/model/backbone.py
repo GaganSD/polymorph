@@ -1,9 +1,9 @@
 """Stubbed Gated DeltaNet-2 backbone.
 
-This is a *placeholder* — a small bidirectional Transformer encoder that
-exposes the same `(B, T) -> (B, T, D)` interface a real Gated DeltaNet-2
-will. When the real kernel is available, swap this class without touching
-the rest of the pipeline.
+This is a *placeholder* — a small ONNX-friendly feed-forward encoder that
+exposes the same `(B, T) -> (B, T, D)` interface a real Gated DeltaNet-2 will.
+When the real kernel is available, swap this class without touching the rest of
+the pipeline.
 
 Search marker for the swap point: `_TODO_REAL_DELTANET`.
 """
@@ -32,13 +32,27 @@ class _SinusoidalPosEnc(nn.Module):
         return x + self.pe[: x.size(1)].unsqueeze(0)
 
 
+class _FeedForwardBlock(nn.Module):
+    def __init__(self, d_model: int, ff_mult: int, dropout: float):
+        super().__init__()
+        hidden = d_model * ff_mult
+        self.norm = nn.LayerNorm(d_model)
+        self.fc1 = nn.Linear(d_model, hidden)
+        self.fc2 = nn.Linear(hidden, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.fc2(torch.nn.functional.gelu(self.fc1(self.norm(x))))
+        return x + self.dropout(y)
+
+
 class GatedDeltaNet2Stub(nn.Module):
     """_TODO_REAL_DELTANET — replace with the actual Gated DeltaNet-2 kernel.
 
     The replacement must:
       - accept (B, T) token ids,
       - return (B, T, D) hidden states,
-      - support attention masking via a (B, T) bool key_padding_mask,
+      - support attention masking via a (B, T) bool mask,
       - be ONNX-exportable with a dynamic T axis.
     """
 
@@ -55,16 +69,7 @@ class GatedDeltaNet2Stub(nn.Module):
         self.d_model = d_model
         self.embed = nn.Embedding(vocab_size, d_model)
         self.pos = _SinusoidalPosEnc(d_model)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=n_heads,
-            dim_feedforward=d_model * ff_mult,
-            dropout=dropout,
-            batch_first=True,
-            norm_first=True,
-            activation="gelu",
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.blocks = nn.ModuleList([_FeedForwardBlock(d_model, ff_mult, dropout) for _ in range(n_layers)])
         self.norm = nn.LayerNorm(d_model)
 
     def forward(
@@ -74,9 +79,10 @@ class GatedDeltaNet2Stub(nn.Module):
     ) -> torch.Tensor:
         x = self.embed(input_ids)
         x = self.pos(x)
-        key_padding_mask = None
         if attention_mask is not None:
-            # nn.TransformerEncoder expects True where positions should be masked.
-            key_padding_mask = ~attention_mask.bool()
-        x = self.encoder(x, src_key_padding_mask=key_padding_mask)
+            x = x * attention_mask.to(x.dtype).unsqueeze(-1)
+        for block in self.blocks:
+            x = block(x)
+            if attention_mask is not None:
+                x = x * attention_mask.to(x.dtype).unsqueeze(-1)
         return self.norm(x)

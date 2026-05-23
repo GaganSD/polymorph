@@ -21,4 +21,6 @@ def joint_loss(
     return a fresh sum so callers can mix this loss with auxiliary terms
     (e.g. router load-balance regularisers) without aliasing `loss`.
     """
+    if lambda_sem == 1.0 and lambda_dep == 1.0 and "loss" in model_outputs:
+        return model_outputs["loss"]
     return lambda_sem * model_outputs["nll_sem"] + lambda_dep * model_outputs["nll_dep"]

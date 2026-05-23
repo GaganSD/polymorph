@@ -29,9 +29,6 @@ def build_model(cfg: dict) -> LaMRModel:
         n_heads=int(mcfg["n_heads"]),
         ff_mult=int(mcfg["ff_mult"]),
         dropout=float(mcfg["dropout"]),
-        n_experts=int(mcfg["moe"]["n_experts"]),
-        top_k=int(mcfg["moe"]["top_k"]),
-        expert_hidden_mult=int(mcfg["moe"]["expert_hidden_mult"]),
     )
     return LaMRModel(lcfg)
 

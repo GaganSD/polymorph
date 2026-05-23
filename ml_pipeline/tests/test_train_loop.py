@@ -30,7 +30,6 @@ def _tiny_cfg_dict(tmp_path):
             "n_heads": 2,
             "ff_mult": 2,
             "dropout": 0.0,
-            "moe": {"n_experts": 2, "top_k": 2, "expert_hidden_mult": 2},
         },
         "train": {
             "batch_size": 1,
@@ -125,7 +124,7 @@ def test_train_one_step_writes_checkpoint(tmp_path, monkeypatch):
 
 
 def test_save_checkpoint_serializes(tmp_path):
-    cfg = LaMRConfig(vocab_size=32, d_model=8, n_layers=1, n_heads=2, ff_mult=1, n_experts=2, top_k=2)
+    cfg = LaMRConfig(vocab_size=32, d_model=8, n_layers=1, n_heads=2, ff_mult=1)
     model = LaMRModel(cfg)
     p = tmp_path / "ckpt.pt"
     save_checkpoint(model, p, TrainState(step=42))

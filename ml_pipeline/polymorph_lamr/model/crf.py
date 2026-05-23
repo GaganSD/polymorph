@@ -1,4 +1,4 @@
-"""Linear-chain CRF with weighted-emission NLL training and Viterbi decode.
+"""Linear-chain CRF with weighted NLL training and Viterbi decode.
 
 Why hand-rolled instead of pytorch-crf:
   - pytorch-crf doesn't accept per-token soft weights, which we need for the
@@ -41,13 +41,14 @@ class LinearChainCRF(nn.Module):
         tags: torch.Tensor,       # (B, T) int64 in [0, NUM_TAGS)
         mask: torch.Tensor,       # (B, T) bool — True = valid position
         weights: torch.Tensor | None = None,  # (B, T) float — per-token weight
+        reduction: str = "mean",
     ) -> torch.Tensor:
-        """Mean per-batch NLL, optionally weighted per token.
+        """CRF NLL, optionally weighted per token.
 
-        Weights apply to the gold-path *emission* contribution only. Transition
-        scores are unweighted — they encode a structural prior over tag
-        sequences, not a per-token label statement. Padded positions (mask=0)
-        are excluded from both numerator and partition.
+        Per-token weights scale emission potentials before both the gold-path
+        score and the partition function are computed. Transition scores remain
+        unweighted: they encode a structural prior over tag sequences rather
+        than a per-token label statement.
 
         CRF arithmetic is forced to fp32 — `logsumexp` in bf16 loses 2-3 bits
         of precision per step, which compounds badly over T=1024 sequences.
@@ -56,22 +57,52 @@ class LinearChainCRF(nn.Module):
         emissions = emissions.float()
         if weights is not None:
             weights = weights.float()
-        score = self._gold_score(emissions, tags, mask, weights)
+            emissions = emissions * weights.unsqueeze(-1)
+        score = self._gold_score(emissions, tags, mask)
         partition = self._partition(emissions, mask)
         nll = partition - score  # (B,)
         # All-pad rows produce meaningless score/partition; zero their NLL so
         # they don't poison the batch mean.
         valid = (mask.long().sum(dim=1) > 0).to(nll.dtype)
         nll = nll * valid
-        denom = valid.sum().clamp(min=1.0)
-        return nll.sum() / denom
+        if reduction == "none":
+            return nll
+        if reduction == "sum":
+            return nll.sum()
+        if reduction == "mean":
+            denom = valid.sum().clamp(min=1.0)
+            return nll.sum() / denom
+        raise ValueError(f"unknown reduction: {reduction}")
 
     def decode(
         self,
         emissions: torch.Tensor,  # (B, T, NUM_TAGS)
         mask: torch.Tensor,       # (B, T) bool
     ) -> list[list[int]]:
-        return self._viterbi(emissions, mask)
+        return self._viterbi(
+            emissions,
+            mask,
+            transitions=self.transitions,
+            start_transitions=self.start_transitions,
+            end_transitions=self.end_transitions,
+        )
+
+    @staticmethod
+    def decode_with_params(
+        emissions: torch.Tensor,
+        mask: torch.Tensor,
+        transitions: torch.Tensor,
+        start_transitions: torch.Tensor,
+        end_transitions: torch.Tensor,
+    ) -> list[list[int]]:
+        crf = LinearChainCRF()
+        return crf._viterbi(
+            emissions,
+            mask,
+            transitions=transitions,
+            start_transitions=start_transitions,
+            end_transitions=end_transitions,
+        )
 
     # ------------------- internals -------------------
 
@@ -80,23 +111,27 @@ class LinearChainCRF(nn.Module):
         emissions: torch.Tensor,
         tags: torch.Tensor,
         mask: torch.Tensor,
-        weights: torch.Tensor | None,
+        transitions: torch.Tensor | None = None,
+        start_transitions: torch.Tensor | None = None,
+        end_transitions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         b, t, k = emissions.shape
-        if weights is None:
-            weights = torch.ones((b, t), dtype=emissions.dtype, device=emissions.device)
         mask_f = mask.to(emissions.dtype)
+        trans = self._batch_matrix(transitions if transitions is not None else self.transitions, b)
+        start = self._batch_vector(start_transitions if start_transitions is not None else self.start_transitions, b)
+        end = self._batch_vector(end_transitions if end_transitions is not None else self.end_transitions, b)
 
         # Start transition + emission at position 0.
-        score = self.start_transitions[tags[:, 0]]  # (B,)
-        score = score + emissions[:, 0].gather(1, tags[:, 0:1]).squeeze(1) * weights[:, 0] * mask_f[:, 0]
+        batch_idx = torch.arange(b, device=emissions.device)
+        score = start[batch_idx, tags[:, 0]]  # (B,)
+        score = score + emissions[:, 0].gather(1, tags[:, 0:1]).squeeze(1) * mask_f[:, 0]
 
         for i in range(1, t):
             prev_tag = tags[:, i - 1]
             cur_tag = tags[:, i]
-            trans_score = self.transitions[prev_tag, cur_tag]
+            trans_score = trans[batch_idx, prev_tag, cur_tag]
             emit_score = emissions[:, i].gather(1, cur_tag.unsqueeze(1)).squeeze(1)
-            step = (trans_score + emit_score * weights[:, i]) * mask_f[:, i]
+            step = (trans_score + emit_score) * mask_f[:, i]
             score = score + step
 
         # End transition at the last valid position per sequence. Clamp at 0
@@ -104,21 +139,26 @@ class LinearChainCRF(nn.Module):
         # wrong rather than crash).
         seq_lens = (mask.long().sum(dim=1) - 1).clamp(min=0)  # (B,)
         last_tag = tags.gather(1, seq_lens.unsqueeze(1)).squeeze(1)
-        score = score + self.end_transitions[last_tag]
+        score = score + end[batch_idx, last_tag] * (mask.long().sum(dim=1) > 0).to(score.dtype)
         return score
 
     def _partition(
         self,
         emissions: torch.Tensor,
         mask: torch.Tensor,
+        transitions: torch.Tensor | None = None,
+        start_transitions: torch.Tensor | None = None,
+        end_transitions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         b, t, k = emissions.shape
+        trans = self._batch_matrix(transitions if transitions is not None else self.transitions, b)
+        start = self._batch_vector(start_transitions if start_transitions is not None else self.start_transitions, b)
+        end = self._batch_vector(end_transitions if end_transitions is not None else self.end_transitions, b)
         # alpha[i, j] = log Σ paths ending at tag j up to position i.
-        alpha = self.start_transitions.unsqueeze(0) + emissions[:, 0]  # (B, K)
+        alpha = start + emissions[:, 0]  # (B, K)
 
         for i in range(1, t):
             emit = emissions[:, i].unsqueeze(1)              # (B, 1, K)
-            trans = self.transitions.unsqueeze(0)            # (1, K, K)
             prev = alpha.unsqueeze(2)                        # (B, K, 1)
             next_alpha = torch.logsumexp(prev + trans + emit, dim=1)  # (B, K)
 
@@ -126,20 +166,26 @@ class LinearChainCRF(nn.Module):
             m = mask[:, i].unsqueeze(1).to(alpha.dtype)
             alpha = m * next_alpha + (1.0 - m) * alpha
 
-        alpha = alpha + self.end_transitions.unsqueeze(0)
+        alpha = alpha + end
         return torch.logsumexp(alpha, dim=1)  # (B,)
 
     def _viterbi(
         self,
         emissions: torch.Tensor,
         mask: torch.Tensor,
+        transitions: torch.Tensor,
+        start_transitions: torch.Tensor,
+        end_transitions: torch.Tensor,
     ) -> list[list[int]]:
         b, t, k = emissions.shape
+        trans = self._batch_matrix(transitions, b)
+        start = self._batch_vector(start_transitions, b)
+        end = self._batch_vector(end_transitions, b)
         history: list[torch.Tensor] = []
-        score = self.start_transitions.unsqueeze(0) + emissions[:, 0]  # (B, K)
+        score = start + emissions[:, 0]  # (B, K)
 
         for i in range(1, t):
-            broadcast = score.unsqueeze(2) + self.transitions.unsqueeze(0)  # (B, K, K)
+            broadcast = score.unsqueeze(2) + trans  # (B, K, K)
             best_prev = broadcast.argmax(dim=1)                              # (B, K)
             best_score = broadcast.gather(1, best_prev.unsqueeze(1)).squeeze(1)
             next_score = best_score + emissions[:, i]                        # (B, K)
@@ -148,7 +194,7 @@ class LinearChainCRF(nn.Module):
             score = torch.where(m, next_score, score)
             history.append(best_prev)
 
-        score = score + self.end_transitions.unsqueeze(0)
+        score = score + end
         best_last = score.argmax(dim=1)  # (B,)
 
         # Backtrack per-sequence to honour per-sequence lengths.
@@ -167,3 +213,19 @@ class LinearChainCRF(nn.Module):
                 tags_rev.append(tag)
             results.append(list(reversed(tags_rev)))
         return results
+
+    @staticmethod
+    def _batch_vector(param: torch.Tensor, batch_size: int) -> torch.Tensor:
+        if param.dim() == 1:
+            return param.unsqueeze(0).expand(batch_size, -1)
+        if param.dim() == 2 and param.shape[0] == batch_size:
+            return param
+        raise ValueError(f"cannot batch CRF vector with shape {tuple(param.shape)}")
+
+    @staticmethod
+    def _batch_matrix(param: torch.Tensor, batch_size: int) -> torch.Tensor:
+        if param.dim() == 2:
+            return param.unsqueeze(0).expand(batch_size, -1, -1)
+        if param.dim() == 3 and param.shape[0] == batch_size:
+            return param
+        raise ValueError(f"cannot batch CRF matrix with shape {tuple(param.shape)}")
