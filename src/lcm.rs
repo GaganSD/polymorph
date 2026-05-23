@@ -78,21 +78,15 @@ pub fn append_and_maybe_archive(
     let role = role.to_string();
     let content = content.to_string();
     db.call(move |conn| {
-        let row = append_on_conn(
+        append_and_maybe_archive_on_conn(
             conn,
-            conversation_id.clone(),
+            conversation_id,
             role,
             content,
             token_count,
             now,
-        )?;
-        let archived_node_id = maybe_archive_on_conn(conn, &conversation_id, soft_threshold)?;
-        Ok(AppendResult {
-            turn_id: row.id,
-            turn_index: row.turn_index,
-            tokens: row.tokens,
-            archived_node_id,
-        })
+            soft_threshold,
+        )
     })
 }
 
@@ -136,7 +130,55 @@ fn append_on_conn(
     now: i64,
 ) -> Result<MessageRow> {
     let tx = conn.transaction()?;
-    let next_idx: i64 = tx
+    let row = insert_turn(
+        &tx,
+        &conversation_id,
+        &role,
+        &content,
+        token_count,
+        now,
+    )?;
+    tx.commit()?;
+    Ok(row)
+}
+
+fn append_and_maybe_archive_on_conn(
+    conn: &mut Connection,
+    conversation_id: String,
+    role: String,
+    content: String,
+    token_count: i64,
+    now: i64,
+    soft_threshold: u64,
+) -> Result<AppendResult> {
+    let tx = conn.transaction()?;
+    let row = insert_turn(
+        &tx,
+        &conversation_id,
+        &role,
+        &content,
+        token_count,
+        now,
+    )?;
+    let archived_node_id = maybe_archive_core(&tx, &conversation_id, soft_threshold)?;
+    tx.commit()?;
+    Ok(AppendResult {
+        turn_id: row.id,
+        turn_index: row.turn_index,
+        tokens: row.tokens,
+        archived_node_id,
+    })
+}
+
+fn insert_turn(
+    conn: &Connection,
+    conversation_id: &str,
+    role: &str,
+    content: &str,
+    token_count: i64,
+    now: i64,
+) -> Result<MessageRow> {
+    let next_idx: i64 = conn
         .query_row(
             "SELECT COALESCE(MAX(turn_index), -1) + 1 FROM lcm_messages WHERE conversation_id = ?1",
             params![conversation_id],
@@ -144,20 +186,19 @@ fn append_on_conn(
         )
         .unwrap_or(0);
 
-    tx.execute(
+    conn.execute(
         "INSERT INTO lcm_messages (conversation_id, turn_index, role, content, tokens, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![conversation_id, next_idx, role, content, token_count, now],
     )?;
-    let id = tx.last_insert_rowid();
-    tx.commit()?;
+    let id = conn.last_insert_rowid();
 
     Ok(MessageRow {
         id,
-        conversation_id,
+        conversation_id: conversation_id.to_string(),
         turn_index: next_idx,
-        role,
-        content,
+        role: role.to_string(),
+        content: content.to_string(),
         tokens: token_count,
         created_at: now,
         archived_to: None,
@@ -176,6 +217,17 @@ fn active_token_count_on_conn(conn: &Connection, conversation_id: &str) -> Resul
 
 fn maybe_archive_on_conn(
     conn: &mut Connection,
+    conversation_id: &str,
+    soft_threshold: u64,
+) -> Result<Option<String>> {
+    let tx = conn.transaction()?;
+    let node_id = maybe_archive_core(&tx, conversation_id, soft_threshold)?;
+    tx.commit()?;
+    Ok(node_id)
+}
+
+fn maybe_archive_core(
+    conn: &Connection,
     conversation_id: &str,
     soft_threshold: u64,
 ) -> Result<Option<String>> {
@@ -221,7 +273,6 @@ fn maybe_archive_on_conn(
     // leave at least one row active.
     let mut to_archive: Vec<&MessageRow> = Vec::new();
     let mut remaining = total as u64;
-    let mut leftover_index = 0;
     for (i, row) in rows.iter().enumerate() {
         if i == rows.len() - 1 {
             // Don't archive the latest turn.
@@ -229,12 +280,10 @@ fn maybe_archive_on_conn(
         }
         to_archive.push(row);
         remaining = remaining.saturating_sub(row.tokens as u64);
-        leftover_index = i + 1;
         if remaining <= soft_threshold {
             break;
         }
     }
-    let _ = leftover_index;
     if to_archive.is_empty() {
         return Ok(None);
     }
@@ -251,8 +300,7 @@ fn maybe_archive_on_conn(
         to_archive.first().unwrap().turn_index,
     );
 
-    let tx = conn.transaction()?;
-    tx.execute(
+    conn.execute(
         "INSERT INTO lcm_summary_nodes
             (id, conversation_id, depth, child_turn_ids, summary_text, total_tokens, created_at)
             VALUES (?1, ?2, 0, ?3, ?4, ?5, ?6)",
@@ -266,12 +314,11 @@ fn maybe_archive_on_conn(
         ],
     )?;
     for row in &to_archive {
-        tx.execute(
+        conn.execute(
             "UPDATE lcm_messages SET archived_to = ?1 WHERE id = ?2",
             params![node_id, row.id],
         )?;
     }
-    tx.commit()?;
 
     Ok(Some(node_id))
 }

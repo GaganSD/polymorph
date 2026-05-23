@@ -2,6 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use crossbeam_channel::{bounded, Sender};
 use rusqlite::Connection;
 use std::any::Any;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::thread;
 
@@ -90,7 +91,10 @@ fn spawn_worker(mut conn: Connection) -> DbHandle {
         .name("polymorph-db-worker".into())
         .spawn(move || {
             while let Ok(job) = rx.recv() {
-                let result = (job.task)(&mut conn);
+                let result = match catch_unwind(AssertUnwindSafe(|| (job.task)(&mut conn))) {
+                    Ok(reply) => reply,
+                    Err(_) => Err(anyhow!("db worker task panicked")),
+                };
                 let _ = job.reply.send(result);
             }
         })
