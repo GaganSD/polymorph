@@ -12,16 +12,16 @@ fn bpe() -> Result<&'static CoreBPE> {
 /// Tokenize `text` and return both the token ID stream and a parallel array of
 /// (start_byte, end_byte) spans into the original input.
 ///
-/// cl100k uses byte-level BPE, so concatenating `decode_single_token_bytes` for
-/// each id reproduces the input byte-for-byte — that's what lets us assign
-/// each token a precise byte range without relying on a tokenizer API for
-/// offsets.
+/// cl100k uses byte-level BPE, so concatenating decoded token bytes reproduces
+/// the input byte-for-byte — that is what lets us assign each token a precise
+/// byte range without a separate offset API.
 pub fn token_spans(text: &str) -> Result<(Vec<u32>, Vec<(usize, usize)>)> {
     let bpe = bpe()?;
     let ids: Vec<u32> = bpe.encode_ordinary(text);
     let mut spans: Vec<(usize, usize)> = Vec::with_capacity(ids.len());
 
     let mut cursor: usize = 0;
+    // `_decode_native_and_split` takes ownership; clone is cold-path only (once per lock).
     for bytes in bpe._decode_native_and_split(ids.clone()) {
         let start = cursor;
         cursor += bytes.len();
@@ -69,5 +69,16 @@ mod tests {
         let (ids, spans) = token_spans(s).unwrap();
         assert_eq!(spans.last().unwrap().1, s.len());
         assert_eq!(ids.len(), spans.len());
+    }
+
+    #[test]
+    fn byte_spans_are_contiguous() {
+        let s = "café 🎉";
+        let (_, spans) = token_spans(s).unwrap();
+        assert_eq!(spans.first().unwrap().0, 0);
+        assert_eq!(spans.last().unwrap().1, s.len());
+        for w in spans.windows(2) {
+            assert_eq!(w[0].1, w[1].0);
+        }
     }
 }

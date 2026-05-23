@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use std::path::Path;
 
-use crate::{ccr, db, lcm, tokens};
+use crate::{ccr, db, lcm, tokenizer};
 
 /// `polymorph-mcp --demo <kind>` entry point. Prints visible output so a new
 /// user can confirm the system works in under 10 seconds.
@@ -95,7 +95,7 @@ fn filler_text(target_tokens: usize) -> String {
     let unit = "lorem ipsum dolor sit amet consectetur adipiscing elit ";
     let mut s = String::new();
     loop {
-        let (ids, _) = tokens::token_spans(&s).expect("filler tokenize");
+        let (ids, _) = tokenizer::token_spans(&s).expect("filler tokenize");
         if ids.len() >= target_tokens {
             return s;
         }

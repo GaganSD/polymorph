@@ -1,11 +1,10 @@
-/// Two-pointer sweep-line intersector.
+/// Monotonic two-pointer sweep-line intersector for token lock masks.
 ///
-/// `token_spans` is naturally sorted (tokens are contiguous, non-overlapping,
-/// monotonically increasing). `ast_intervals` must be sorted by start; callers
-/// should merge overlapping intervals before passing them in.
+/// `token_spans` is sorted and non-overlapping. `ast_intervals` and
+/// `daac_token_intervals` must be sorted by start and merged (no overlaps).
 ///
-/// We mark `mask[i] = true` iff token i's byte span overlaps any AST interval,
-/// OR token i's index falls inside any DAAC token-index interval.
+/// Returns `mask[i] == true` when token `i` overlaps an AST byte interval or
+/// falls inside a DAAC token-index interval.
 pub fn build_mask(
     n_tokens: usize,
     token_spans: &[(usize, usize)],
@@ -15,37 +14,38 @@ pub fn build_mask(
     debug_assert_eq!(n_tokens, token_spans.len());
     let mut mask = vec![false; n_tokens];
 
-    // Pass 1: AST byte intervals × token byte spans.
-    // Two-pointer: advance `j` (AST) while its end is <= token start (no overlap).
-    // After advancing, the AST interval at j (if any) is the first that could overlap.
-    let mut j: usize = 0;
-    for (i, &(ts, te)) in token_spans.iter().enumerate() {
-        while j < ast_intervals.len() && ast_intervals[j].1 <= ts {
-            j += 1;
+    let mut ast_j: usize = 0;
+    let mut daac_j: usize = 0;
+
+    for i in 0..n_tokens {
+        let (ts, te) = token_spans[i];
+
+        while ast_j < ast_intervals.len() && ast_intervals[ast_j].1 <= ts {
+            ast_j += 1;
         }
-        if j < ast_intervals.len() {
-            let (as_, ae) = ast_intervals[j];
-            // overlap iff as_ < te && ts < ae
+        if ast_j < ast_intervals.len() {
+            let (as_, ae) = ast_intervals[ast_j];
             if as_ < te && ts < ae {
                 mask[i] = true;
+                continue;
             }
         }
-    }
 
-    // Pass 2: DAAC token-index intervals.
-    for &(s, e) in daac_token_intervals {
-        let s = s.min(n_tokens);
-        let e = e.min(n_tokens);
-        for slot in &mut mask[s..e] {
-            *slot = true;
+        while daac_j < daac_token_intervals.len() && daac_token_intervals[daac_j].1 <= i {
+            daac_j += 1;
+        }
+        if daac_j < daac_token_intervals.len() {
+            let (ds, de) = daac_token_intervals[daac_j];
+            if ds <= i && i < de {
+                mask[i] = true;
+            }
         }
     }
 
     mask
 }
 
-/// Sort + merge overlapping byte intervals. Useful for AST output before the
-/// sweep, since recursive walks emit nested intervals.
+/// Sort and merge overlapping byte or token-index intervals.
 pub fn sort_and_merge(mut intervals: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     if intervals.is_empty() {
         return intervals;
@@ -72,9 +72,8 @@ mod tests {
 
     #[test]
     fn ast_overlap_marks_tokens() {
-        // 4 tokens of 2 bytes each: spans (0,2)(2,4)(4,6)(6,8)
         let spans = vec![(0usize, 2), (2, 4), (4, 6), (6, 8)];
-        let ast = vec![(3usize, 5)]; // touches tokens 1 and 2
+        let ast = vec![(3usize, 5)];
         let daac: Vec<(usize, usize)> = vec![];
         let mask = build_mask(4, &spans, &ast, &daac);
         assert_eq!(mask, vec![false, true, true, false]);
@@ -92,8 +91,8 @@ mod tests {
     #[test]
     fn combined() {
         let spans = vec![(0usize, 2), (2, 4), (4, 6), (6, 8)];
-        let ast = vec![(0usize, 1)]; // marks token 0
-        let daac = vec![(3usize, 4)]; // marks token 3
+        let ast = vec![(0usize, 1)];
+        let daac = vec![(3usize, 4)];
         let mask = build_mask(4, &spans, &ast, &daac);
         assert_eq!(mask, vec![true, false, false, true]);
     }
@@ -108,5 +107,15 @@ mod tests {
     fn merge_touching_merges() {
         let r = sort_and_merge(vec![(0, 5), (5, 10)]);
         assert_eq!(r, vec![(0, 10)]);
+    }
+
+    #[test]
+    fn overlapping_daac_intervals_merged() {
+        let spans: Vec<(usize, usize)> = (0..8).map(|i| (i * 2, i * 2 + 2)).collect();
+        let raw = vec![(1usize, 3), (2, 5)];
+        let daac = sort_and_merge(raw);
+        let mask = build_mask(8, &spans, &[], &daac);
+        assert!(mask[1] && mask[2] && mask[3] && mask[4]);
+        assert!(!mask[0]);
     }
 }

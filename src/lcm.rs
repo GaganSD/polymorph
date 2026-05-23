@@ -6,7 +6,7 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::db::Pool;
-use crate::tokens;
+use crate::tokenizer;
 
 pub const DEFAULT_SOFT_THRESHOLD: u64 = 80_000;
 
@@ -107,7 +107,7 @@ pub fn append(
     content: &str,
     pool: &Pool,
 ) -> Result<MessageRow> {
-    let (token_ids, _) = tokens::token_spans(content)?;
+    let (token_ids, _) = tokenizer::token_spans(content)?;
     let token_count = token_ids.len() as i64;
     let now = unix_now()?;
 
@@ -357,7 +357,7 @@ mod tests {
         let unit = "lorem ipsum dolor sit amet consectetur adipiscing elit ";
         let mut s = String::new();
         while {
-            let (ids, _) = tokens::token_spans(&s).unwrap();
+            let (ids, _) = tokenizer::token_spans(&s).unwrap();
             ids.len() < target_tokens
         } {
             s.push_str(unit);

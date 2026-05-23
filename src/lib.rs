@@ -6,15 +6,15 @@ pub mod demo;
 pub mod io_guard;
 pub mod lamr;
 pub mod lcm;
+pub mod locking;
 pub mod mcp;
 pub mod selftest;
-pub mod sweep;
-pub mod tokens;
+pub mod tokenizer;
 
 pub use ast::extract_ast_intervals;
 pub use daac::DaacScanner;
-pub use sweep::build_mask;
-pub use tokens::token_spans;
+pub use locking::build_mask;
+pub use tokenizer::token_spans;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Language {
@@ -88,11 +88,11 @@ pub fn lock_payload(
     keywords: &[String],
     grammars_dir: &std::path::Path,
 ) -> anyhow::Result<LockResult> {
-    let (token_ids, token_spans) = tokens::token_spans(text)?;
-    let scanner = daac::DaacScanner::build(keywords)?;
+    let (token_ids, token_spans) = tokenizer::token_spans(text)?;
+    let mut scanner = daac::DaacScanner::build(keywords)?;
     let daac_token_intervals = scanner.scan(&token_ids);
     let ast_intervals = ast::extract_ast_intervals(text, language, grammars_dir)?;
-    let mask = sweep::build_mask(
+    let mask = locking::build_mask(
         token_spans.len(),
         &token_spans,
         &ast_intervals,
@@ -132,8 +132,6 @@ mod tests {
 
     #[test]
     fn resolve_grammars_dir_honors_env_var() {
-        // SAFETY: tests run sequentially within a module by default; the env
-        // mutation here is scoped and restored.
         let prev = std::env::var("POLYMORPH_GRAMMARS_DIR").ok();
         std::env::set_var("POLYMORPH_GRAMMARS_DIR", "/tmp/some/path");
         let resolved = resolve_grammars_dir();
@@ -152,4 +150,24 @@ mod tests {
         assert_eq!(res.token_ids.len(), res.mask.len());
     }
 
+    #[test]
+    fn mask_invariant_ast_and_daac_lock_tokens() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("grammars");
+        let text = r#"{"secret":"x"}"#;
+        let res = lock_payload(text, Language::Json, &["secret".to_string()], &dir).unwrap();
+        for (i, &locked) in res.mask.iter().enumerate() {
+            let (s, e) = res.token_spans[i];
+            let in_ast = res
+                .ast_intervals
+                .iter()
+                .any(|&(a, b)| a < e && s < b);
+            let in_daac = res
+                .daac_token_intervals
+                .iter()
+                .any(|&(a, b)| a <= i && i < b);
+            if in_ast || in_daac {
+                assert!(locked, "token {i} must be locked");
+            }
+        }
+    }
 }
