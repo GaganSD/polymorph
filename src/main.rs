@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use polymorph::{db, lcm, mcp};
+use polymorph::{db, mcp};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -15,15 +15,10 @@ fn main() -> Result<()> {
         return polymorph::selftest::run(&grammars_dir);
     }
 
-    // Set up shared state: SQLite pool + LCM archiver worker.
+    // Set up shared state: one SQLite worker thread + MCP handlers.
     let db_path = db::default_path()?;
-    let pool = db::open_pool(&db_path)?;
-    let archiver = lcm::Archiver::spawn(pool.clone());
+    let db = db::open_pool(&db_path)?;
 
-    let state = mcp::AppState {
-        pool,
-        archiver,
-        grammars_dir,
-    };
+    let state = mcp::AppState { db, grammars_dir };
     mcp::serve(state)
 }

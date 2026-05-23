@@ -1,11 +1,9 @@
-use anyhow::{anyhow, Result};
-use crossbeam_channel::{bounded, Sender, TrySendError};
-use rusqlite::{params, OptionalExtension};
+use anyhow::Result;
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::db::Pool;
+use crate::db::DbHandle;
 use crate::tokenizer;
 
 pub const DEFAULT_SOFT_THRESHOLD: u64 = 80_000;
@@ -25,6 +23,7 @@ pub struct MessageRow {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AppendResult {
     pub turn_id: i64,
+    pub turn_index: i64,
     pub tokens: i64,
     pub archived_node_id: Option<String>,
 }
@@ -45,111 +44,62 @@ pub struct NodeMetadata {
 #[error("lcm_not_found: no entry for node_id {0}")]
 pub struct NotFound(pub String);
 
-/// Archive request handed to the worker.
-#[derive(Debug, Clone)]
-pub struct ArchiveRequest {
-    pub conversation_id: String,
-    pub soft_threshold: u64,
-}
-
-/// Handle that the MCP layer holds to enqueue archive ticks. When the bounded
-/// channel is full or the worker is gone, the producer falls back to running
-/// the archive synchronously so the trigger is never silently dropped.
-#[derive(Clone)]
-pub struct Archiver {
-    tx: Sender<ArchiveRequest>,
-    pool: Pool,
-}
-
-impl Archiver {
-    /// Spawns the worker thread + returns an Archiver handle.
-    pub fn spawn(pool: Pool) -> Self {
-        let (tx, rx) = bounded::<ArchiveRequest>(64);
-        let worker_pool = pool.clone();
-        thread::Builder::new()
-            .name("lcm-archiver".into())
-            .spawn(move || {
-                while let Ok(req) = rx.recv() {
-                    if let Err(e) = maybe_archive(&req.conversation_id, req.soft_threshold, &worker_pool)
-                    {
-                        eprintln!("lcm-archiver: archive failed: {e}");
-                    }
-                }
-            })
-            .expect("spawn lcm-archiver");
-        Self { tx, pool }
-    }
-
-    /// Tries to enqueue; on `Full` / `Disconnected`, runs archive inline so we
-    /// never silently drop the trigger.
-    pub fn tick(&self, conversation_id: &str, soft_threshold: u64) -> Result<Option<String>> {
-        let req = ArchiveRequest {
-            conversation_id: conversation_id.to_string(),
-            soft_threshold,
-        };
-        match self.tx.try_send(req.clone()) {
-            Ok(()) => Ok(None), // archive will run off-thread; caller doesn't see the node_id yet
-            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
-                // Inline fallback. Returning the archive result here means the caller
-                // gets immediate visibility on what was archived.
-                maybe_archive(&req.conversation_id, req.soft_threshold, &self.pool)
-            }
-        }
-    }
-
-}
-
 /// Appends a turn to the active conversation. Token count comes from the M1
 /// tokenizer for parity with downstream compression.
 pub fn append(
     conversation_id: &str,
     role: &str,
     content: &str,
-    pool: &Pool,
+    db: &DbHandle,
 ) -> Result<MessageRow> {
     let (token_ids, _) = tokenizer::token_spans(content)?;
     let token_count = token_ids.len() as i64;
     let now = unix_now()?;
+    let conversation_id = conversation_id.to_string();
+    let role = role.to_string();
+    let content = content.to_string();
+    db.call(move |conn| append_on_conn(conn, conversation_id, role, content, token_count, now))
+}
 
-    let conn = pool.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
-    // turn_index = max(turn_index) + 1 within the conversation
-    let next_idx: i64 = conn
-        .query_row(
-            "SELECT COALESCE(MAX(turn_index), -1) + 1 FROM lcm_messages WHERE conversation_id = ?1",
-            params![conversation_id],
-            |r| r.get::<_, i64>(0),
-        )
-        .unwrap_or(0);
-
-    conn.execute(
-        "INSERT INTO lcm_messages (conversation_id, turn_index, role, content, tokens, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![conversation_id, next_idx, role, content, token_count, now],
-    )?;
-    let id = conn.last_insert_rowid();
-
-    Ok(MessageRow {
-        id,
-        conversation_id: conversation_id.to_string(),
-        turn_index: next_idx,
-        role: role.to_string(),
-        content: content.to_string(),
-        tokens: token_count,
-        created_at: now,
-        archived_to: None,
+/// Appends a turn and archives in the same database-worker turn. This is the
+/// deterministic MCP path: the caller receives the archive node created for the
+/// append without racing a background worker.
+pub fn append_and_maybe_archive(
+    conversation_id: &str,
+    role: &str,
+    content: &str,
+    soft_threshold: u64,
+    db: &DbHandle,
+) -> Result<AppendResult> {
+    let (token_ids, _) = tokenizer::token_spans(content)?;
+    let token_count = token_ids.len() as i64;
+    let now = unix_now()?;
+    let conversation_id = conversation_id.to_string();
+    let role = role.to_string();
+    let content = content.to_string();
+    db.call(move |conn| {
+        let row = append_on_conn(
+            conn,
+            conversation_id.clone(),
+            role,
+            content,
+            token_count,
+            now,
+        )?;
+        let archived_node_id = maybe_archive_on_conn(conn, &conversation_id, soft_threshold)?;
+        Ok(AppendResult {
+            turn_id: row.id,
+            turn_index: row.turn_index,
+            tokens: row.tokens,
+            archived_node_id,
+        })
     })
 }
 
 /// Sum of tokens for unarchived messages in the conversation.
-pub fn active_token_count(conversation_id: &str, pool: &Pool) -> Result<u64> {
-    let conn = pool.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
-    let n: i64 = conn.query_row(
-        "SELECT COALESCE(SUM(tokens), 0) FROM lcm_messages
-         WHERE conversation_id = ?1 AND archived_to IS NULL",
-        params![conversation_id],
-        |r| r.get(0),
-    )?;
-    Ok(n.max(0) as u64)
+pub fn active_token_count(conversation_id: &str, db: &DbHandle) -> Result<u64> {
+    let conversation_id = conversation_id.to_string();
+    db.call(move |conn| active_token_count_on_conn(conn, &conversation_id))
 }
 
 /// If the conversation's active token count exceeds `soft_threshold`, archive
@@ -161,9 +111,74 @@ pub fn active_token_count(conversation_id: &str, pool: &Pool) -> Result<u64> {
 pub fn maybe_archive(
     conversation_id: &str,
     soft_threshold: u64,
-    pool: &Pool,
+    db: &DbHandle,
 ) -> Result<Option<String>> {
-    let mut conn = pool.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+    let conversation_id = conversation_id.to_string();
+    db.call(move |conn| maybe_archive_on_conn(conn, &conversation_id, soft_threshold))
+}
+
+pub fn describe(node_id: &str, db: &DbHandle) -> Result<NodeMetadata> {
+    let node_id = node_id.to_string();
+    db.call(move |conn| describe_on_conn(conn, &node_id))
+}
+
+pub fn expand(node_id: &str, db: &DbHandle) -> Result<Vec<MessageRow>> {
+    let node_id = node_id.to_string();
+    db.call(move |conn| expand_on_conn(conn, &node_id))
+}
+
+fn append_on_conn(
+    conn: &mut Connection,
+    conversation_id: String,
+    role: String,
+    content: String,
+    token_count: i64,
+    now: i64,
+) -> Result<MessageRow> {
+    let tx = conn.transaction()?;
+    let next_idx: i64 = tx
+        .query_row(
+            "SELECT COALESCE(MAX(turn_index), -1) + 1 FROM lcm_messages WHERE conversation_id = ?1",
+            params![conversation_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0);
+
+    tx.execute(
+        "INSERT INTO lcm_messages (conversation_id, turn_index, role, content, tokens, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![conversation_id, next_idx, role, content, token_count, now],
+    )?;
+    let id = tx.last_insert_rowid();
+    tx.commit()?;
+
+    Ok(MessageRow {
+        id,
+        conversation_id,
+        turn_index: next_idx,
+        role,
+        content,
+        tokens: token_count,
+        created_at: now,
+        archived_to: None,
+    })
+}
+
+fn active_token_count_on_conn(conn: &Connection, conversation_id: &str) -> Result<u64> {
+    let n: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(tokens), 0) FROM lcm_messages
+         WHERE conversation_id = ?1 AND archived_to IS NULL",
+        params![conversation_id],
+        |r| r.get(0),
+    )?;
+    Ok(n.max(0) as u64)
+}
+
+fn maybe_archive_on_conn(
+    conn: &mut Connection,
+    conversation_id: &str,
+    soft_threshold: u64,
+) -> Result<Option<String>> {
     let total: i64 = conn.query_row(
         "SELECT COALESCE(SUM(tokens), 0) FROM lcm_messages
          WHERE conversation_id = ?1 AND archived_to IS NULL",
@@ -227,9 +242,8 @@ pub fn maybe_archive(
     let node_id = uuid::Uuid::new_v4().to_string();
     let now = unix_now()?;
     let total_archived_tokens: i64 = to_archive.iter().map(|r| r.tokens).sum();
-    let child_turn_ids: String = serde_json::to_string(
-        &to_archive.iter().map(|r| r.id).collect::<Vec<_>>(),
-    )?;
+    let child_turn_ids: String =
+        serde_json::to_string(&to_archive.iter().map(|r| r.id).collect::<Vec<_>>())?;
     let summary_text = format!(
         "depth-0 archive of {} turns ({} tokens, oldest turn_index {})",
         to_archive.len(),
@@ -262,8 +276,7 @@ pub fn maybe_archive(
     Ok(Some(node_id))
 }
 
-pub fn describe(node_id: &str, pool: &Pool) -> Result<NodeMetadata> {
-    let conn = pool.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+fn describe_on_conn(conn: &Connection, node_id: &str) -> Result<NodeMetadata> {
     let row = conn
         .query_row(
             "SELECT id, conversation_id, depth, total_tokens, created_at
@@ -284,9 +297,8 @@ pub fn describe(node_id: &str, pool: &Pool) -> Result<NodeMetadata> {
 
     let (id, conversation_id, depth, total_tokens, created_at) = row;
 
-    let mut stmt = conn.prepare(
-        "SELECT role FROM lcm_messages WHERE archived_to = ?1 ORDER BY turn_index ASC",
-    )?;
+    let mut stmt = conn
+        .prepare("SELECT role FROM lcm_messages WHERE archived_to = ?1 ORDER BY turn_index ASC")?;
     let roles: Vec<String> = stmt
         .query_map(params![node_id], |r| r.get::<_, String>(0))?
         .collect::<Result<_, _>>()?;
@@ -303,8 +315,7 @@ pub fn describe(node_id: &str, pool: &Pool) -> Result<NodeMetadata> {
     })
 }
 
-pub fn expand(node_id: &str, pool: &Pool) -> Result<Vec<MessageRow>> {
-    let conn = pool.lock().map_err(|_| anyhow!("db mutex poisoned"))?;
+fn expand_on_conn(conn: &Connection, node_id: &str) -> Result<Vec<MessageRow>> {
     // First confirm the node exists so we return NotFound, not just an empty vec.
     let exists: bool = conn
         .query_row(
@@ -335,13 +346,12 @@ pub fn expand(node_id: &str, pool: &Pool) -> Result<Vec<MessageRow>> {
             archived_to: r.get(7)?,
         })
     })?;
-    iter.collect::<Result<_, _>>().map_err(Into::into)
+    iter.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
 }
 
 fn unix_now() -> Result<i64> {
-    Ok(SystemTime::now()
-        .duration_since(UNIX_EPOCH)?
-        .as_secs() as i64)
+    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64)
 }
 
 #[cfg(test)]
@@ -442,24 +452,43 @@ mod tests {
     }
 
     #[test]
-    fn archiver_inline_fallback_works_on_disconnect() {
+    fn append_and_archive_is_single_db_worker_operation() {
         let pool = db::test_pool().unwrap();
-        let archiver = Archiver::spawn(pool.clone());
-        // Forcefully drop the worker by dropping all senders besides ours and
-        // letting the worker exit on rx close — easier path: simulate the
-        // inline fallback by directly calling maybe_archive (the same code path
-        // that tick() runs when the channel is disconnected/full).
         let chunk = filler(150);
+        let mut archived = None;
         for _ in 0..5 {
-            append("c", "user", &chunk, &pool).unwrap();
+            let result = append_and_maybe_archive("c", "user", &chunk, 300, &pool).unwrap();
+            archived = archived.or(result.archived_node_id);
         }
-        // tick() with a low threshold should result in archiving via the
-        // worker — but we may race the worker. The strong invariant is that
-        // active count converges to <= threshold after either path.
-        let _ = archiver.tick("c", 300);
-        // Give the worker thread a beat to drain its queue.
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(archived.is_some());
         let active = active_token_count("c", &pool).unwrap();
         assert!(active <= 600, "active count after archive: {active}");
+    }
+
+    #[test]
+    fn concurrent_expand_and_archive_share_db_actor_safely() {
+        let pool = db::test_pool().unwrap();
+        let chunk = filler(150);
+        for _ in 0..8 {
+            append("c", "user", &chunk, &pool).unwrap();
+        }
+        let node_id = maybe_archive("c", 300, &pool).unwrap().expect("archived");
+
+        let expand_pool = pool.clone();
+        let expand_node = node_id.clone();
+        let reader = std::thread::spawn(move || {
+            for _ in 0..20 {
+                let rows = expand(&expand_node, &expand_pool).unwrap();
+                assert!(!rows.is_empty());
+            }
+        });
+
+        for _ in 0..10 {
+            append_and_maybe_archive("c", "assistant", &chunk, 300, &pool).unwrap();
+        }
+
+        reader.join().unwrap();
+        let rows = expand(&node_id, &pool).unwrap();
+        assert!(!rows.is_empty());
     }
 }

@@ -17,7 +17,7 @@ pub fn run(kind: &str, _grammars_dir: &Path) -> Result<()> {
 }
 
 fn demo_lcm_loop() -> Result<()> {
-    let pool = db::test_pool()?;
+    let db = db::test_pool()?;
     let conversation_id = "demo-conv";
     let soft_threshold: u64 = 300;
     println!(
@@ -28,15 +28,14 @@ fn demo_lcm_loop() -> Result<()> {
 
     let chunk = filler_text(120);
     for turn in 1..=12 {
-        let row = lcm::append(conversation_id, "user", &chunk, &pool)?;
-        let active_before = lcm::active_token_count(conversation_id, &pool)?;
-        let archived = lcm::maybe_archive(conversation_id, soft_threshold, &pool)?;
-        let active_after = lcm::active_token_count(conversation_id, &pool)?;
-        match archived {
+        let result =
+            lcm::append_and_maybe_archive(conversation_id, "user", &chunk, soft_threshold, &db)?;
+        let active_after = lcm::active_token_count(conversation_id, &db)?;
+        match result.archived_node_id {
             Some(node_id) => {
                 println!(
                     "turn {:>2} +{} tokens -> active={}",
-                    turn, row.tokens, active_before
+                    turn, result.tokens, active_after
                 );
                 println!(
                     "  *** ARCHIVE TRIGGERED *** node_id={} -> active now {}",
@@ -47,7 +46,7 @@ fn demo_lcm_loop() -> Result<()> {
             None => {
                 println!(
                     "turn {:>2} +{} tokens -> active={}",
-                    turn, row.tokens, active_after
+                    turn, result.tokens, active_after
                 );
             }
         }
@@ -58,7 +57,7 @@ fn demo_lcm_loop() -> Result<()> {
 }
 
 fn demo_ccr() -> Result<()> {
-    let pool = db::test_pool()?;
+    let db = db::test_pool()?;
     let original: serde_json::Value = serde_json::Value::Array(
         (0..50)
             .map(|i| serde_json::json!({"row": i, "value": format!("item-{}", i)}))
@@ -68,7 +67,7 @@ fn demo_ccr() -> Result<()> {
     println!("CCR demo: compressing a {}-element JSON array", n);
     println!("---");
 
-    let res = ccr::compress_array(original.clone(), ccr::CcrOpts::default(), &pool, true)?;
+    let res = ccr::compress_array(original.clone(), ccr::CcrOpts::default(), &db, true)?;
     let cache_id = res.cache_id.clone().unwrap();
     println!(
         "compressed -> {} elements (head + summary + tail). omitted {} items.",
@@ -78,7 +77,7 @@ fn demo_ccr() -> Result<()> {
     println!("cache_id = {}", cache_id);
     println!();
 
-    let recovered = ccr::retrieve(&cache_id, &pool)?;
+    let recovered = ccr::retrieve(&cache_id, &db)?;
     let recovered_len = recovered.as_array().unwrap().len();
     println!(
         "retrieved cache_id -> {} items recovered byte-for-byte",
