@@ -40,10 +40,36 @@ pub fn dummy_lamr_forward_pass_seeded(
         .collect()
 }
 
+/// Scatter model decisions for the unlocked token slice back onto the original
+/// token stream. This is the stable handoff point for the future ONNX-backed
+/// LaMR path: Python exports semantic/dependency emissions plus `head_weights`;
+/// Rust will decode one weighted CRF over the unlocked slice and pass the
+/// resulting tag=drop bits here.
+///
+/// Locked tokens (`lock_mask[i] == true`) are NEVER dropped — invariant:
+/// `lock_mask[i] => !drop_mask[i]`.
+pub fn scatter_unlocked_drop_bits(lock_mask: &[bool], drop_bits: &[bool]) -> Vec<bool> {
+    let unlocked = lock_mask.iter().filter(|&&locked| !locked).count();
+    assert_eq!(
+        unlocked,
+        drop_bits.len(),
+        "drop_bits must match the number of unlocked tokens"
+    );
+
+    let mut drop_mask = vec![false; lock_mask.len()];
+    let mut cursor = 0;
+    for (i, &locked) in lock_mask.iter().enumerate() {
+        if !locked {
+            drop_mask[i] = drop_bits[cursor];
+            cursor += 1;
+        }
+    }
+    drop_mask
+}
+
 /// Apply the mock LaMR pruning to a M1 lock mask. For each i where
 /// `lock_mask[i] == false` (= unlocked), the i-th unlocked token's drop bit
-/// determines `drop_mask[i]`. Locked tokens (`lock_mask[i] == true`) are
-/// NEVER dropped — invariant: `lock_mask[i] => !drop_mask[i]`.
+/// determines `drop_mask[i]`.
 ///
 /// Returns the parallel `drop_mask` of length `lock_mask.len()`.
 pub fn apply_lamr(token_ids: &[u32], lock_mask: &[bool]) -> Vec<bool> {
@@ -57,16 +83,7 @@ pub fn apply_lamr(token_ids: &[u32], lock_mask: &[bool]) -> Vec<bool> {
         .collect();
     let drop_bits = dummy_lamr_forward_pass(&unlocked);
 
-    // Scatter drop_bits back into the parallel drop_mask.
-    let mut drop_mask = vec![false; lock_mask.len()];
-    let mut cursor = 0;
-    for (i, &locked) in lock_mask.iter().enumerate() {
-        if !locked {
-            drop_mask[i] = drop_bits[cursor];
-            cursor += 1;
-        }
-    }
-    drop_mask
+    scatter_unlocked_drop_bits(lock_mask, &drop_bits)
 }
 
 #[cfg(test)]
@@ -103,6 +120,19 @@ mod tests {
         for i in 0..500 {
             if lock_mask[i] {
                 assert!(!drop_mask[i], "locked token {i} was dropped");
+            }
+        }
+    }
+
+    #[test]
+    fn scatter_unlocked_drop_bits_never_drops_locked() {
+        let lock_mask = vec![true, false, true, false, false, true];
+        let drop_bits = vec![true, false, true];
+        let drop_mask = scatter_unlocked_drop_bits(&lock_mask, &drop_bits);
+        assert_eq!(drop_mask, vec![false, true, false, false, true, false]);
+        for (locked, dropped) in lock_mask.iter().zip(drop_mask.iter()) {
+            if *locked {
+                assert!(!*dropped);
             }
         }
     }
