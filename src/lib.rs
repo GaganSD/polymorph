@@ -2,6 +2,7 @@ pub mod ast;
 pub mod ccr;
 pub mod daac;
 pub mod db;
+pub mod demo;
 pub mod io_guard;
 pub mod lamr;
 pub mod lcm;

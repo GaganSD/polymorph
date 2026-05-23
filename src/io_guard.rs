@@ -63,6 +63,44 @@ pub struct LockMaskInput {
     pub keywords: Vec<String>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CompressArrayInput {
+    /// The JSON value to compress. Non-array values are returned unchanged.
+    pub value: serde_json::Value,
+    #[serde(default)]
+    pub head_keep: Option<usize>,
+    #[serde(default)]
+    pub tail_keep: Option<usize>,
+    /// When `false`, the omitted middle is dropped without persistence.
+    /// Default `true`.
+    #[serde(default = "default_true")]
+    pub cache: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RetrieveCacheInput {
+    pub cache_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct LcmAppendInput {
+    pub conversation_id: String,
+    pub role: String,
+    pub content: String,
+    /// Soft threshold for archive trigger. Defaults to 80,000.
+    #[serde(default)]
+    pub soft_threshold: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct LcmNodeInput {
+    pub node_id: String,
+}
+
 static LOCK_MASK_SCHEMA: OnceCell<JSONSchema> = OnceCell::new();
 
 fn lock_mask_schema() -> Result<&'static JSONSchema> {
