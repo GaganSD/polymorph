@@ -1,5 +1,6 @@
 pub mod ast;
 pub mod daac;
+pub mod db;
 pub mod io_guard;
 pub mod mcp;
 pub mod selftest;
