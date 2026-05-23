@@ -49,6 +49,29 @@ pub struct LockResult {
     pub mask: Vec<bool>,
 }
 
+/// Resolves the directory holding `tree-sitter-*.wasm` files. Honors the
+/// `POLYMORPH_GRAMMARS_DIR` env var, otherwise walks up from the binary
+/// location (`target/debug/polymorph-mcp` → repo root → `grammars/`), and
+/// finally falls back to a relative `grammars` path.
+pub fn resolve_grammars_dir() -> std::path::PathBuf {
+    if let Ok(env) = std::env::var("POLYMORPH_GRAMMARS_DIR") {
+        return std::path::PathBuf::from(env);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(candidate) = exe
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .map(|p| p.join("grammars"))
+        {
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+    std::path::PathBuf::from("grammars")
+}
+
 pub fn lock_payload(
     text: &str,
     language: Language,
@@ -72,4 +95,47 @@ pub fn lock_payload(
         daac_token_intervals,
         mask,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn language_from_str_known() {
+        assert_eq!(Language::from_str("json"), Some(Language::Json));
+        assert_eq!(Language::from_str("python"), Some(Language::Python));
+        assert_eq!(Language::from_str("typescript"), None);
+    }
+
+    #[test]
+    fn language_name_and_grammar_filename_match() {
+        assert_eq!(Language::Json.name(), "json");
+        assert_eq!(Language::Python.name(), "python");
+        assert_eq!(Language::Json.grammar_filename(), "tree-sitter-json.wasm");
+        assert_eq!(Language::Python.grammar_filename(), "tree-sitter-python.wasm");
+    }
+
+    #[test]
+    fn resolve_grammars_dir_honors_env_var() {
+        // SAFETY: tests run sequentially within a module by default; the env
+        // mutation here is scoped and restored.
+        let prev = std::env::var("POLYMORPH_GRAMMARS_DIR").ok();
+        std::env::set_var("POLYMORPH_GRAMMARS_DIR", "/tmp/some/path");
+        let resolved = resolve_grammars_dir();
+        assert_eq!(resolved, std::path::PathBuf::from("/tmp/some/path"));
+        match prev {
+            Some(v) => std::env::set_var("POLYMORPH_GRAMMARS_DIR", v),
+            None => std::env::remove_var("POLYMORPH_GRAMMARS_DIR"),
+        }
+    }
+
+    #[test]
+    fn lock_payload_returns_consistent_lengths() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("grammars");
+        let res = lock_payload(r#"{"a":1}"#, Language::Json, &[], &dir).unwrap();
+        assert_eq!(res.mask.len(), res.token_spans.len());
+        assert_eq!(res.token_ids.len(), res.mask.len());
+    }
+
 }

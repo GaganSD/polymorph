@@ -134,4 +134,30 @@ mod tests {
         assert_eq!(msg2, "world\n");
         assert!(r.read_message().unwrap().is_none());
     }
+
+    #[test]
+    fn bounded_reader_rejects_oversize_message() {
+        // Build a line that overflows MAX_PAYLOAD_BYTES.
+        let huge = vec![b'a'; (MAX_PAYLOAD_BYTES as usize) + 100];
+        let mut r = BoundedStdin::new(&huge[..]);
+        let err = r.read_message().expect_err("must reject");
+        let msg = format!("{err}");
+        assert!(msg.contains("exceeds"), "got: {msg}");
+    }
+
+    #[test]
+    fn bounded_reader_handles_non_utf8() {
+        let input = [b'h', 0xFF, b'\n'];
+        let mut r = BoundedStdin::new(&input[..]);
+        assert!(r.read_message().is_err());
+    }
+
+    #[test]
+    fn lock_mask_input_schema_is_object() {
+        let schema = schemars::schema_for!(LockMaskInput);
+        let v = serde_json::to_value(&schema).unwrap();
+        assert_eq!(v["type"], "object");
+        assert!(v["required"].as_array().unwrap().iter().any(|r| r == "text"));
+        assert!(v["required"].as_array().unwrap().iter().any(|r| r == "language"));
+    }
 }
