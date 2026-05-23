@@ -240,11 +240,14 @@ fn call_lcm_append(id: Value, arguments: &Value, state: &AppState) -> Value {
         Ok(r) => r,
         Err(e) => return error_response(id, -32000, &format!("lcm_append failed: {e}")),
     };
-    // Run archive synchronously so the response is deterministic. The Archiver
-    // worker thread is still spawned at startup for future background work
-    // (e.g. M3 Depth-1 summarization), but for M2 we want agent-facing predictability:
-    // when the agent calls lcm_append, the response tells them definitively
-    // whether an archive fired.
+    // Signal the worker (planned design: bounded(64) + try_send + inline
+    // fallback). The worker also runs maybe_archive against the same Mutex
+    // pool, but that operation is idempotent — whichever thread grabs the lock
+    // first does the archive, the other finds nothing left to archive.
+    let _worker_signal = state.archiver.tick(&input.conversation_id, threshold);
+    // Run archive synchronously so the response is deterministic. When the
+    // agent calls lcm_append, the response tells them definitively whether an
+    // archive fired (rather than depending on worker timing).
     let archived_node_id =
         match lcm::maybe_archive(&input.conversation_id, threshold, &state.pool) {
             Ok(node) => node,

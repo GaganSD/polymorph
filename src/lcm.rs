@@ -97,9 +97,6 @@ impl Archiver {
         }
     }
 
-    pub fn pool(&self) -> &Pool {
-        &self.pool
-    }
 }
 
 /// Appends a turn to the active conversation. Token count comes from the M1
