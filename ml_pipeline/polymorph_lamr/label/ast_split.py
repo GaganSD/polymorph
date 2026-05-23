@@ -16,9 +16,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Callable, Optional
+from collections.abc import Mapping
+from typing import Any, Callable, Optional
 
-from .hop_decay import exp_decay
+from .hop_decay import exp_decay, get_kernel
 
 
 # Default scaffold node types per language. Mirrors configs/default.yaml.
@@ -142,4 +143,27 @@ def split_labels(
         w_semantic=w_sem,
         w_dependency=w_dep,
         is_code=True,
+    )
+
+
+def split_labels_from_config(
+    text: str,
+    keep_mask: list[bool],
+    spans: list[tuple[int, int]],
+    lang: Optional[str],
+    cfg: Mapping[str, Any],
+) -> SplitLabels:
+    """Config-aware wrapper for the `label:` block in configs/default.yaml."""
+    kernel = get_kernel(dict(cfg.get("hop_decay", {})))
+    scaffold_cfg = cfg.get("scaffold_node_types", {})
+    scaffold_types: set[str] | None = None
+    if lang is not None and isinstance(scaffold_cfg, Mapping) and lang in scaffold_cfg:
+        scaffold_types = set(scaffold_cfg[lang])
+    return split_labels(
+        text=text,
+        keep_mask=keep_mask,
+        spans=spans,
+        lang=lang,
+        kernel=kernel,
+        scaffold_types=scaffold_types,
     )
