@@ -6,8 +6,10 @@ use std::path::PathBuf;
 use crate::ccr::{self, CacheMiss, CcrOpts};
 use crate::db::Pool;
 use crate::io_guard::{
-    validate_lock_mask_input, BoundedStdin, CompressArrayInput, LcmAppendInput, LcmNodeInput,
-    RetrieveCacheInput,
+    validate_compress_array_input_strict, validate_lcm_append_input_strict,
+    validate_lcm_node_input_strict, validate_lock_mask_input_strict,
+    validate_retrieve_cache_input_strict, BoundedStdin, CompressArrayInput, LcmAppendInput,
+    LcmNodeInput, RetrieveCacheInput, MAX_MASK_TOKENS,
 };
 use crate::lcm::{self, Archiver, NotFound as LcmNotFound, DEFAULT_SOFT_THRESHOLD};
 use crate::{lock_payload, Language};
@@ -151,7 +153,7 @@ fn handle_tools_call(id: Value, params: &Value, state: &AppState) -> Value {
 }
 
 fn call_lock_mask(id: Value, arguments: &Value, grammars_dir: &std::path::Path) -> Value {
-    let input = match validate_lock_mask_input(arguments) {
+    let input = match validate_lock_mask_input_strict(arguments) {
         Ok(v) => v,
         Err(e) => return error_response(id, -32602, &format!("invalid arguments: {e}")),
     };
@@ -169,6 +171,15 @@ fn call_lock_mask(id: Value, arguments: &Value, grammars_dir: &std::path::Path) 
 
     match lock_payload(&input.text, lang, &input.keywords, grammars_dir) {
         Ok(res) => {
+            if res.mask.len() > MAX_MASK_TOKENS {
+                return error_response(
+                    id,
+                    -32602,
+                    &format!(
+                        "lock_mask output exceeds max token count ({MAX_MASK_TOKENS}) — reduce input text"
+                    ),
+                );
+            }
             let structured = json!({
                 "tokens": res.token_ids.len(),
                 "kept_tokens": res.kept_tokens,
@@ -182,7 +193,7 @@ fn call_lock_mask(id: Value, arguments: &Value, grammars_dir: &std::path::Path) 
 }
 
 fn call_compress_array(id: Value, arguments: &Value, pool: &Pool) -> Value {
-    let input: CompressArrayInput = match serde_json::from_value(arguments.clone()) {
+    let input = match validate_compress_array_input_strict(arguments) {
         Ok(v) => v,
         Err(e) => return error_response(id, -32602, &format!("invalid arguments: {e}")),
     };
@@ -209,7 +220,7 @@ fn call_compress_array(id: Value, arguments: &Value, pool: &Pool) -> Value {
 }
 
 fn call_retrieve_cache(id: Value, arguments: &Value, pool: &Pool) -> Value {
-    let input: RetrieveCacheInput = match serde_json::from_value(arguments.clone()) {
+    let input = match validate_retrieve_cache_input_strict(arguments) {
         Ok(v) => v,
         Err(e) => return error_response(id, -32602, &format!("invalid arguments: {e}")),
     };
@@ -230,7 +241,7 @@ fn call_retrieve_cache(id: Value, arguments: &Value, pool: &Pool) -> Value {
 }
 
 fn call_lcm_append(id: Value, arguments: &Value, state: &AppState) -> Value {
-    let input: LcmAppendInput = match serde_json::from_value(arguments.clone()) {
+    let input = match validate_lcm_append_input_strict(arguments) {
         Ok(v) => v,
         Err(e) => return error_response(id, -32602, &format!("invalid arguments: {e}")),
     };
@@ -266,7 +277,7 @@ fn call_lcm_append(id: Value, arguments: &Value, state: &AppState) -> Value {
 }
 
 fn call_lcm_describe(id: Value, arguments: &Value, pool: &Pool) -> Value {
-    let input: LcmNodeInput = match serde_json::from_value(arguments.clone()) {
+    let input = match validate_lcm_node_input_strict(arguments) {
         Ok(v) => v,
         Err(e) => return error_response(id, -32602, &format!("invalid arguments: {e}")),
     };
@@ -283,7 +294,7 @@ fn call_lcm_describe(id: Value, arguments: &Value, pool: &Pool) -> Value {
 }
 
 fn call_lcm_expand(id: Value, arguments: &Value, pool: &Pool) -> Value {
-    let input: LcmNodeInput = match serde_json::from_value(arguments.clone()) {
+    let input = match validate_lcm_node_input_strict(arguments) {
         Ok(v) => v,
         Err(e) => return error_response(id, -32602, &format!("invalid arguments: {e}")),
     };

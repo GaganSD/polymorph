@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use jsonschema::JSONSchema;
 use once_cell::sync::OnceCell;
 use schemars::JsonSchema;
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Read};
@@ -11,10 +12,20 @@ use std::io::{BufRead, BufReader, Read};
 /// since we never allocate beyond this bound.
 pub const MAX_PAYLOAD_BYTES: u64 = 16 * 1024 * 1024;
 
+/// Maximum tokens returned in a lock_mask response (prevents egress amplification).
+pub const MAX_MASK_TOKENS: usize = 262_144;
+
+/// Zero-trust field bounds advertised in tool schemas.
+pub const MAX_TEXT_LEN: usize = 1_048_576;
+pub const MAX_CONTENT_LEN: usize = 1_048_576;
+pub const MAX_KEYWORDS: usize = 256;
+pub const MAX_KEYWORD_ITEM_LEN: usize = 4_096;
+pub const MAX_ID_LEN: usize = 256;
+pub const MAX_JSON_ARRAY_ITEMS: usize = 100_000;
+
 /// Wraps stdin (or any reader) with `Read::take` and a line-buffered reader so
 /// we can read newline-delimited JSON messages while never reading more than
-/// `MAX_PAYLOAD_BYTES * N_messages` total. Per-line cap enforced by
-/// `read_message`.
+/// `MAX_PAYLOAD_BYTES` per line.
 pub struct BoundedStdin<R: Read> {
     inner: BufReader<R>,
 }
@@ -30,7 +41,6 @@ impl<R: Read> BoundedStdin<R> {
     /// exceeds `MAX_PAYLOAD_BYTES`. Returns `Ok(None)` on EOF.
     pub fn read_message(&mut self) -> Result<Option<String>> {
         let mut buf = String::new();
-        // BufRead::take returns a bounded reader; we read until newline OR cap.
         let mut limited = (&mut self.inner).take(MAX_PAYLOAD_BYTES + 1);
         let mut bytes = Vec::new();
         let _ = limited
@@ -54,25 +64,22 @@ impl<R: Read> BoundedStdin<R> {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct LockMaskInput {
-    /// The text payload to analyze. Capped by MAX_PAYLOAD_BYTES upstream.
+    #[schemars(length(max = 1048576))]
     pub text: String,
-    /// "json" or "python".
+    #[schemars(length(max = 16))]
     pub language: String,
-    /// Keyword strings to hard-lock via DAAC.
+    #[schemars(length(max = 256))]
     #[serde(default)]
     pub keywords: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CompressArrayInput {
-    /// The JSON value to compress. Non-array values are returned unchanged.
     pub value: serde_json::Value,
     #[serde(default)]
     pub head_keep: Option<usize>,
     #[serde(default)]
     pub tail_keep: Option<usize>,
-    /// When `false`, the omitted middle is dropped without persistence.
-    /// Default `true`.
     #[serde(default = "default_true")]
     pub cache: bool,
 }
@@ -83,47 +90,121 @@ fn default_true() -> bool {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RetrieveCacheInput {
+    #[schemars(length(max = 256))]
     pub cache_id: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct LcmAppendInput {
+    #[schemars(length(max = 256))]
     pub conversation_id: String,
+    #[schemars(length(max = 64))]
     pub role: String,
+    #[schemars(length(max = 1048576))]
     pub content: String,
-    /// Soft threshold for archive trigger. Defaults to 80,000.
     #[serde(default)]
     pub soft_threshold: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct LcmNodeInput {
+    #[schemars(length(max = 256))]
     pub node_id: String,
 }
 
-static LOCK_MASK_SCHEMA: OnceCell<JSONSchema> = OnceCell::new();
-
-fn lock_mask_schema() -> Result<&'static JSONSchema> {
-    LOCK_MASK_SCHEMA.get_or_try_init(|| {
-        let schema = schemars::schema_for!(LockMaskInput);
-        let json = serde_json::to_value(&schema)
-            .map_err(|e| anyhow!("schema serialization failed: {e}"))?;
-        JSONSchema::options()
-            .compile(&json)
-            .map_err(|e| anyhow!("schema compile failed: {e}"))
-    })
+fn compile_schema<T: JsonSchema>() -> Result<JSONSchema> {
+    let json = serde_json::to_value(schemars::schema_for!(T))
+        .map_err(|e| anyhow!("schema serialization failed: {e}"))?;
+    JSONSchema::options()
+        .compile(&json)
+        .map_err(|e| anyhow!("schema compile failed: {e}"))
 }
 
-/// Validates an incoming JSON value against the LockMaskInput schema BEFORE
-/// deserialization. This is the zero-trust boundary: we never construct a Rust
-/// struct from unvalidated input.
-pub fn validate_lock_mask_input(value: &Value) -> Result<LockMaskInput> {
-    let schema = lock_mask_schema()?;
+fn validate_and_deserialize<T>(value: &Value, schema: &JSONSchema) -> Result<T>
+where
+    T: DeserializeOwned,
+{
     if let Err(errors) = schema.validate(value) {
         let messages: Vec<String> = errors.map(|e| format!("{e}")).collect();
         return Err(anyhow!("schema validation failed: {}", messages.join("; ")));
     }
     serde_json::from_value(value.clone()).map_err(|e| anyhow!("deserialize failed: {e}"))
+}
+
+macro_rules! impl_tool_validator {
+    ($fn_name:ident, $ty:ty, $static:ident) => {
+        static $static: OnceCell<JSONSchema> = OnceCell::new();
+
+        pub fn $fn_name(value: &Value) -> Result<$ty> {
+            let schema = $static.get_or_try_init(|| compile_schema::<$ty>())?;
+            validate_and_deserialize(value, schema)
+        }
+    };
+}
+
+impl_tool_validator!(validate_lock_mask_input, LockMaskInput, LOCK_MASK_SCHEMA);
+impl_tool_validator!(
+    validate_compress_array_input,
+    CompressArrayInput,
+    COMPRESS_ARRAY_SCHEMA
+);
+impl_tool_validator!(
+    validate_retrieve_cache_input,
+    RetrieveCacheInput,
+    RETRIEVE_CACHE_SCHEMA
+);
+impl_tool_validator!(validate_lcm_append_input, LcmAppendInput, LCM_APPEND_SCHEMA);
+impl_tool_validator!(validate_lcm_node_input, LcmNodeInput, LCM_NODE_SCHEMA);
+
+fn check_string_len(field: &str, s: &str, max: usize) -> Result<()> {
+    if s.len() > max {
+        return Err(anyhow!("{field} exceeds max length {max}"));
+    }
+    Ok(())
+}
+
+/// Extra semantic bounds after jsonschema (keyword item lengths, array size).
+pub fn validate_lock_mask_input_strict(value: &Value) -> Result<LockMaskInput> {
+    let input = validate_lock_mask_input(value)?;
+    check_string_len("text", &input.text, MAX_TEXT_LEN)?;
+    if input.keywords.len() > MAX_KEYWORDS {
+        return Err(anyhow!("keywords exceeds max count {MAX_KEYWORDS}"));
+    }
+    for (i, kw) in input.keywords.iter().enumerate() {
+        check_string_len(&format!("keywords[{i}]"), kw, MAX_KEYWORD_ITEM_LEN)?;
+    }
+    Ok(input)
+}
+
+pub fn validate_compress_array_input_strict(value: &Value) -> Result<CompressArrayInput> {
+    let input = validate_compress_array_input(value)?;
+    if let Value::Array(arr) = &input.value {
+        if arr.len() > MAX_JSON_ARRAY_ITEMS {
+            return Err(anyhow!(
+                "value array exceeds max items {MAX_JSON_ARRAY_ITEMS}"
+            ));
+        }
+    }
+    Ok(input)
+}
+
+pub fn validate_retrieve_cache_input_strict(value: &Value) -> Result<RetrieveCacheInput> {
+    let input = validate_retrieve_cache_input(value)?;
+    check_string_len("cache_id", &input.cache_id, MAX_ID_LEN)?;
+    Ok(input)
+}
+
+pub fn validate_lcm_append_input_strict(value: &Value) -> Result<LcmAppendInput> {
+    let input = validate_lcm_append_input(value)?;
+    check_string_len("conversation_id", &input.conversation_id, MAX_ID_LEN)?;
+    check_string_len("content", &input.content, MAX_CONTENT_LEN)?;
+    Ok(input)
+}
+
+pub fn validate_lcm_node_input_strict(value: &Value) -> Result<LcmNodeInput> {
+    let input = validate_lcm_node_input(value)?;
+    check_string_len("node_id", &input.node_id, MAX_ID_LEN)?;
+    Ok(input)
 }
 
 #[cfg(test)]
@@ -138,7 +219,7 @@ mod tests {
             "language": "json",
             "keywords": ["k1", "k2"]
         });
-        let parsed = validate_lock_mask_input(&v).unwrap();
+        let parsed = validate_lock_mask_input_strict(&v).unwrap();
         assert_eq!(parsed.language, "json");
         assert_eq!(parsed.keywords.len(), 2);
     }
@@ -146,20 +227,34 @@ mod tests {
     #[test]
     fn accepts_input_without_keywords() {
         let v = json!({"text": "hello", "language": "python"});
-        let parsed = validate_lock_mask_input(&v).unwrap();
+        let parsed = validate_lock_mask_input_strict(&v).unwrap();
         assert!(parsed.keywords.is_empty());
     }
 
     #[test]
     fn rejects_missing_text() {
         let v = json!({"language": "json"});
-        assert!(validate_lock_mask_input(&v).is_err());
+        assert!(validate_lock_mask_input_strict(&v).is_err());
     }
 
     #[test]
     fn rejects_wrong_type() {
         let v = json!({"text": 123, "language": "json"});
-        assert!(validate_lock_mask_input(&v).is_err());
+        assert!(validate_lock_mask_input_strict(&v).is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_keywords_array() {
+        let keywords: Vec<String> = (0..MAX_KEYWORDS + 1).map(|i| format!("k{i}")).collect();
+        let v = json!({"text": "x", "language": "json", "keywords": keywords});
+        assert!(validate_lock_mask_input_strict(&v).is_err());
+    }
+
+    #[test]
+    fn compress_array_rejects_huge_array() {
+        let arr: Vec<usize> = (0..MAX_JSON_ARRAY_ITEMS + 1).collect();
+        let v = json!({"value": arr});
+        assert!(validate_compress_array_input_strict(&v).is_err());
     }
 
     #[test]
@@ -175,7 +270,6 @@ mod tests {
 
     #[test]
     fn bounded_reader_rejects_oversize_message() {
-        // Build a line that overflows MAX_PAYLOAD_BYTES.
         let huge = vec![b'a'; (MAX_PAYLOAD_BYTES as usize) + 100];
         let mut r = BoundedStdin::new(&huge[..]);
         let err = r.read_message().expect_err("must reject");
