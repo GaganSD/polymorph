@@ -36,6 +36,44 @@ def test_alignment_gap_zero_for_pure_extractive():
     assert hr > 0
     # Both metrics treat extractive cleanly; AG should be small and finite.
     assert alignment_gap(orig, comp) == hr - mr
+    assert alignment_gap(orig, comp) == 0.0
+
+
+def test_empty_inputs_are_finite_and_directional():
+    assert variation_rate("", "") == 0.0
+    assert matching_rate("", "") == 0.0
+    assert hitting_rate("", "") == 0.0
+    assert alignment_gap("", "") == 0.0
+
+    assert variation_rate("", "novel tokens") == 1.0
+    assert matching_rate("", "novel tokens") == 0.0
+    assert hitting_rate("", "novel tokens") == 0.0
+    assert alignment_gap("", "novel tokens") == 0.0
+
+    assert variation_rate("source tokens", "") == 0.0
+    assert matching_rate("source tokens", "") == 0.0
+    assert hitting_rate("source tokens", "") == 0.0
+    assert alignment_gap("source tokens", "") == 0.0
+
+
+def test_duplicate_source_tokens_drive_alignment_gap():
+    orig = "alpha beta"
+    comp = "alpha alpha alpha beta"
+    assert variation_rate(orig, comp) == 0.0
+    assert matching_rate(orig, comp) == 1.0
+    assert hitting_rate(orig, comp) == 2.0
+    assert alignment_gap(orig, comp) == 1.0
+
+
+def test_alignment_gap_never_negative_for_multiset_matching():
+    cases = [
+        ("alpha alpha beta", "alpha beta"),
+        ("alpha beta", "beta alpha"),
+        ("alpha beta", "alpha alpha beta beta"),
+        ("alpha beta gamma", "alpha novel gamma"),
+    ]
+    for orig, comp in cases:
+        assert alignment_gap(orig, comp) >= 0.0
 
 
 def test_filter_drops_top_pcts():
