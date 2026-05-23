@@ -3,6 +3,7 @@ pub mod ccr;
 pub mod daac;
 pub mod db;
 pub mod io_guard;
+pub mod lamr;
 pub mod lcm;
 pub mod mcp;
 pub mod selftest;
@@ -49,7 +50,12 @@ pub struct LockResult {
     pub token_spans: Vec<(usize, usize)>,
     pub ast_intervals: Vec<(usize, usize)>,
     pub daac_token_intervals: Vec<(usize, usize)>,
+    /// M1: per-token lock mask. `true` = structural/keyword, must not be dropped.
     pub mask: Vec<bool>,
+    /// M2: mock-LaMR drop mask. `true` = drop. Always `false` where `mask[i]` is `true`.
+    pub drop_mask: Vec<bool>,
+    /// Convenience: count of tokens kept after the drop mask is applied.
+    pub kept_tokens: usize,
 }
 
 /// Resolves the directory holding `tree-sitter-*.wasm` files. Honors the
@@ -91,12 +97,16 @@ pub fn lock_payload(
         &ast_intervals,
         &daac_token_intervals,
     );
+    let drop_mask = lamr::apply_lamr(&token_ids, &mask);
+    let kept_tokens = drop_mask.iter().filter(|&&d| !d).count();
     Ok(LockResult {
         token_ids,
         token_spans,
         ast_intervals,
         daac_token_intervals,
         mask,
+        drop_mask,
+        kept_tokens,
     })
 }
 
