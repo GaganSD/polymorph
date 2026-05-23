@@ -55,9 +55,7 @@ impl<R: Read> BoundedStdin<R> {
                 "incoming message exceeds {MAX_PAYLOAD_BYTES} bytes — refusing"
             ));
         }
-        buf.push_str(
-            std::str::from_utf8(&bytes).map_err(|e| anyhow!("non-utf8 message: {e}"))?,
-        );
+        buf.push_str(std::str::from_utf8(&bytes).map_err(|e| anyhow!("non-utf8 message: {e}"))?);
         Ok(Some(buf))
     }
 }
@@ -178,6 +176,27 @@ pub fn validate_lock_mask_input_strict(value: &Value) -> Result<LockMaskInput> {
 
 pub fn validate_compress_array_input_strict(value: &Value) -> Result<CompressArrayInput> {
     let input = validate_compress_array_input(value)?;
+    if input.head_keep.unwrap_or(0) > MAX_JSON_ARRAY_ITEMS {
+        return Err(anyhow!(
+            "head_keep exceeds max items {MAX_JSON_ARRAY_ITEMS}"
+        ));
+    }
+    if input.tail_keep.unwrap_or(0) > MAX_JSON_ARRAY_ITEMS {
+        return Err(anyhow!(
+            "tail_keep exceeds max items {MAX_JSON_ARRAY_ITEMS}"
+        ));
+    }
+    let edge_size_ok = input
+        .head_keep
+        .unwrap_or(0)
+        .checked_add(input.tail_keep.unwrap_or(0))
+        .map(|edge| edge <= MAX_JSON_ARRAY_ITEMS)
+        .unwrap_or(false);
+    if !edge_size_ok {
+        return Err(anyhow!(
+            "head_keep + tail_keep exceeds max items {MAX_JSON_ARRAY_ITEMS}"
+        ));
+    }
     if let Value::Array(arr) = &input.value {
         if arr.len() > MAX_JSON_ARRAY_ITEMS {
             return Err(anyhow!(
@@ -258,6 +277,16 @@ mod tests {
     }
 
     #[test]
+    fn compress_array_rejects_pathological_edges() {
+        let v = json!({
+            "value": [1, 2, 3],
+            "head_keep": MAX_JSON_ARRAY_ITEMS,
+            "tail_keep": 1
+        });
+        assert!(validate_compress_array_input_strict(&v).is_err());
+    }
+
+    #[test]
     fn bounded_reader_reads_one_line() {
         let input = b"hello\nworld\n";
         let mut r = BoundedStdin::new(&input[..]);
@@ -289,7 +318,15 @@ mod tests {
         let schema = schemars::schema_for!(LockMaskInput);
         let v = serde_json::to_value(&schema).unwrap();
         assert_eq!(v["type"], "object");
-        assert!(v["required"].as_array().unwrap().iter().any(|r| r == "text"));
-        assert!(v["required"].as_array().unwrap().iter().any(|r| r == "language"));
+        assert!(v["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r == "text"));
+        assert!(v["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r == "language"));
     }
 }

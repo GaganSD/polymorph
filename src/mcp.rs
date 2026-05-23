@@ -4,22 +4,21 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use crate::ccr::{self, CacheMiss, CcrOpts};
-use crate::db::Pool;
+use crate::db::DbHandle;
 use crate::io_guard::{
     validate_compress_array_input_strict, validate_lcm_append_input_strict,
     validate_lcm_node_input_strict, validate_lock_mask_input_strict,
     validate_retrieve_cache_input_strict, BoundedStdin, CompressArrayInput, LcmAppendInput,
     LcmNodeInput, RetrieveCacheInput, MAX_MASK_TOKENS,
 };
-use crate::lcm::{self, Archiver, NotFound as LcmNotFound, DEFAULT_SOFT_THRESHOLD};
+use crate::lcm::{self, NotFound as LcmNotFound, DEFAULT_SOFT_THRESHOLD};
 use crate::{lock_payload, Language};
 
-/// Server-wide state threaded into each tool handler. Holds the SQLite Pool and
-/// the LCM Archiver handle. Both are cheaply cloneable (Arc inside).
+/// Server-wide state threaded into each tool handler. Holds the SQLite actor
+/// handle, which is cheaply cloneable and owns DB access through one worker.
 #[derive(Clone)]
 pub struct AppState {
-    pub pool: Pool,
-    pub archiver: Archiver,
+    pub db: DbHandle,
     pub grammars_dir: PathBuf,
 }
 
@@ -143,11 +142,11 @@ fn handle_tools_call(id: Value, params: &Value, state: &AppState) -> Value {
 
     match tool_name {
         "lock_mask" => call_lock_mask(id, &arguments, &state.grammars_dir),
-        "compress_array" => call_compress_array(id, &arguments, &state.pool),
-        "polymorph_retrieve_cache" => call_retrieve_cache(id, &arguments, &state.pool),
+        "compress_array" => call_compress_array(id, &arguments, &state.db),
+        "polymorph_retrieve_cache" => call_retrieve_cache(id, &arguments, &state.db),
         "lcm_append" => call_lcm_append(id, &arguments, state),
-        "lcm_describe" => call_lcm_describe(id, &arguments, &state.pool),
-        "lcm_expand" => call_lcm_expand(id, &arguments, &state.pool),
+        "lcm_describe" => call_lcm_describe(id, &arguments, &state.db),
+        "lcm_expand" => call_lcm_expand(id, &arguments, &state.db),
         other => error_response(id, -32602, &format!("unknown tool: {other}")),
     }
 }
@@ -192,7 +191,7 @@ fn call_lock_mask(id: Value, arguments: &Value, grammars_dir: &std::path::Path) 
     }
 }
 
-fn call_compress_array(id: Value, arguments: &Value, pool: &Pool) -> Value {
+fn call_compress_array(id: Value, arguments: &Value, db: &DbHandle) -> Value {
     let input = match validate_compress_array_input_strict(arguments) {
         Ok(v) => v,
         Err(e) => return error_response(id, -32602, &format!("invalid arguments: {e}")),
@@ -206,7 +205,7 @@ fn call_compress_array(id: Value, arguments: &Value, pool: &Pool) -> Value {
         opts.tail_keep = t;
     }
 
-    match ccr::compress_array(input.value, opts, pool, input.cache) {
+    match ccr::compress_array(input.value, opts, db, input.cache) {
         Ok(res) => tool_ok(
             id,
             &json!({
@@ -219,13 +218,13 @@ fn call_compress_array(id: Value, arguments: &Value, pool: &Pool) -> Value {
     }
 }
 
-fn call_retrieve_cache(id: Value, arguments: &Value, pool: &Pool) -> Value {
+fn call_retrieve_cache(id: Value, arguments: &Value, db: &DbHandle) -> Value {
     let input = match validate_retrieve_cache_input_strict(arguments) {
         Ok(v) => v,
         Err(e) => return error_response(id, -32602, &format!("invalid arguments: {e}")),
     };
 
-    match ccr::retrieve(&input.cache_id, pool) {
+    match ccr::retrieve(&input.cache_id, db) {
         Ok(value) => tool_ok(id, &json!({"value": value})),
         Err(e) if e.is::<CacheMiss>() => error_response_with_data(
             id,
@@ -247,41 +246,34 @@ fn call_lcm_append(id: Value, arguments: &Value, state: &AppState) -> Value {
     };
     let threshold = input.soft_threshold.unwrap_or(DEFAULT_SOFT_THRESHOLD);
 
-    let row = match lcm::append(&input.conversation_id, &input.role, &input.content, &state.pool) {
+    let result = match lcm::append_and_maybe_archive(
+        &input.conversation_id,
+        &input.role,
+        &input.content,
+        threshold,
+        &state.db,
+    ) {
         Ok(r) => r,
         Err(e) => return error_response(id, -32000, &format!("lcm_append failed: {e}")),
     };
-    // Signal the worker (planned design: bounded(64) + try_send + inline
-    // fallback). The worker also runs maybe_archive against the same Mutex
-    // pool, but that operation is idempotent — whichever thread grabs the lock
-    // first does the archive, the other finds nothing left to archive.
-    let _worker_signal = state.archiver.tick(&input.conversation_id, threshold);
-    // Run archive synchronously so the response is deterministic. When the
-    // agent calls lcm_append, the response tells them definitively whether an
-    // archive fired (rather than depending on worker timing).
-    let archived_node_id =
-        match lcm::maybe_archive(&input.conversation_id, threshold, &state.pool) {
-            Ok(node) => node,
-            Err(e) => return error_response(id, -32000, &format!("lcm_archive failed: {e}")),
-        };
 
     tool_ok(
         id,
         &json!({
-            "turn_id": row.id,
-            "turn_index": row.turn_index,
-            "tokens": row.tokens,
-            "archived_node_id": archived_node_id,
+            "turn_id": result.turn_id,
+            "turn_index": result.turn_index,
+            "tokens": result.tokens,
+            "archived_node_id": result.archived_node_id,
         }),
     )
 }
 
-fn call_lcm_describe(id: Value, arguments: &Value, pool: &Pool) -> Value {
+fn call_lcm_describe(id: Value, arguments: &Value, db: &DbHandle) -> Value {
     let input = match validate_lcm_node_input_strict(arguments) {
         Ok(v) => v,
         Err(e) => return error_response(id, -32602, &format!("invalid arguments: {e}")),
     };
-    match lcm::describe(&input.node_id, pool) {
+    match lcm::describe(&input.node_id, db) {
         Ok(meta) => tool_ok(id, &serde_json::to_value(&meta).unwrap_or(Value::Null)),
         Err(e) if e.is::<LcmNotFound>() => error_response_with_data(
             id,
@@ -293,12 +285,12 @@ fn call_lcm_describe(id: Value, arguments: &Value, pool: &Pool) -> Value {
     }
 }
 
-fn call_lcm_expand(id: Value, arguments: &Value, pool: &Pool) -> Value {
+fn call_lcm_expand(id: Value, arguments: &Value, db: &DbHandle) -> Value {
     let input = match validate_lcm_node_input_strict(arguments) {
         Ok(v) => v,
         Err(e) => return error_response(id, -32602, &format!("invalid arguments: {e}")),
     };
-    match lcm::expand(&input.node_id, pool) {
+    match lcm::expand(&input.node_id, db) {
         Ok(rows) => tool_ok(id, &json!({"turns": rows})),
         Err(e) if e.is::<LcmNotFound>() => error_response_with_data(
             id,

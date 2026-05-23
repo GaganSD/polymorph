@@ -1,12 +1,53 @@
 use anyhow::{anyhow, Context, Result};
+use crossbeam_channel::{bounded, Sender};
 use rusqlite::Connection;
+use std::any::Any;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::thread;
 
-/// Single shared rusqlite connection. `Connection` is `!Sync` so the only safe
-/// way to share it across threads (MCP request handler + LCM archiver worker)
-/// is behind a Mutex. We hold the lock per SQL call, never across other I/O.
-pub type Pool = Arc<Mutex<Connection>>;
+type DbReply = Result<Box<dyn Any + Send>>;
+type DbTask = Box<dyn FnOnce(&mut Connection) -> DbReply + Send + 'static>;
+
+struct DbJob {
+    task: DbTask,
+    reply: Sender<DbReply>,
+}
+
+/// Cloneable handle to the single SQLite owner thread.
+///
+/// `rusqlite::Connection` is synchronous and not `Sync`; callers never touch it
+/// directly. Each operation sends an owned closure to the worker and waits for a
+/// typed reply, giving us strict thread ownership without `Arc<Mutex<Connection>>`.
+#[derive(Clone)]
+pub struct DbHandle {
+    tx: Sender<DbJob>,
+}
+
+impl DbHandle {
+    pub fn call<T, F>(&self, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+    {
+        let (reply_tx, reply_rx) = bounded::<DbReply>(1);
+        let task: DbTask =
+            Box::new(move |conn| f(conn).map(|value| Box::new(value) as Box<dyn Any + Send>));
+        self.tx
+            .send(DbJob {
+                task,
+                reply: reply_tx,
+            })
+            .map_err(|_| anyhow!("db worker stopped"))?;
+        let boxed = reply_rx
+            .recv()
+            .map_err(|_| anyhow!("db worker dropped response"))??;
+        boxed
+            .downcast::<T>()
+            .map(|value| *value)
+            .map_err(|_| anyhow!("db worker returned unexpected response type"))
+    }
+}
 
 /// Resolves the database path. Order: `$POLYMORPH_DB_PATH`, then
 /// `~/.polymorph/cache.db`. Creates the parent directory if missing.
@@ -20,7 +61,7 @@ pub fn default_path() -> Result<PathBuf> {
 
 /// Opens a connection at `path`, ensures the parent dir exists, applies WAL
 /// + foreign_keys pragmas, and runs migrations idempotently.
-pub fn open_pool(path: &Path) -> Result<Pool> {
+pub fn open_pool(path: &Path) -> Result<DbHandle> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)
@@ -31,17 +72,34 @@ pub fn open_pool(path: &Path) -> Result<Pool> {
         .with_context(|| format!("opening sqlite db at {}", path.display()))?;
     configure(&conn)?;
     migrate(&conn)?;
-    Ok(Arc::new(Mutex::new(conn)))
+    Ok(spawn_worker(conn))
 }
 
 /// In-memory pool for tests. Same migrations, same pragmas (WAL is a no-op on
 /// :memory: but harmless).
-pub fn test_pool() -> Result<Pool> {
+pub fn test_pool() -> Result<DbHandle> {
     let conn = Connection::open_in_memory()?;
     // WAL is unsupported in-memory; only set foreign_keys + synchronous.
     conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL;")?;
     migrate(&conn)?;
-    Ok(Arc::new(Mutex::new(conn)))
+    Ok(spawn_worker(conn))
+}
+
+fn spawn_worker(mut conn: Connection) -> DbHandle {
+    let (tx, rx) = bounded::<DbJob>(256);
+    thread::Builder::new()
+        .name("polymorph-db-worker".into())
+        .spawn(move || {
+            while let Ok(job) = rx.recv() {
+                let result = match catch_unwind(AssertUnwindSafe(|| (job.task)(&mut conn))) {
+                    Ok(reply) => reply,
+                    Err(_) => Err(anyhow!("db worker task panicked")),
+                };
+                let _ = job.reply.send(result);
+            }
+        })
+        .expect("spawn db worker");
+    DbHandle { tx }
 }
 
 fn configure(conn: &Connection) -> Result<()> {
@@ -94,17 +152,19 @@ fn migrate(conn: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::params;
+    use std::thread;
 
     #[test]
     fn test_pool_creates_all_tables() {
-        let pool = test_pool().unwrap();
-        let conn = pool.lock().unwrap();
-        let names: Vec<String> = conn
-            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
-            .unwrap()
-            .query_map([], |row| row.get::<_, String>(0))
-            .unwrap()
-            .collect::<Result<_, _>>()
+        let db = test_pool().unwrap();
+        let names: Vec<String> = db
+            .call(|conn| {
+                conn.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")?
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(Into::into)
+            })
             .unwrap();
         assert!(names.contains(&"ccr_cache".to_string()));
         assert!(names.contains(&"lcm_messages".to_string()));
@@ -124,7 +184,10 @@ mod tests {
     fn default_path_honors_env_var() {
         let prev = std::env::var("POLYMORPH_DB_PATH").ok();
         std::env::set_var("POLYMORPH_DB_PATH", "/tmp/some/specific/db");
-        assert_eq!(default_path().unwrap(), PathBuf::from("/tmp/some/specific/db"));
+        assert_eq!(
+            default_path().unwrap(),
+            PathBuf::from("/tmp/some/specific/db")
+        );
         match prev {
             Some(v) => std::env::set_var("POLYMORPH_DB_PATH", v),
             None => std::env::remove_var("POLYMORPH_DB_PATH"),
@@ -133,10 +196,44 @@ mod tests {
 
     #[test]
     fn migrate_is_idempotent() {
-        let pool = test_pool().unwrap();
+        let db = test_pool().unwrap();
         // Running again on the same connection must not error.
-        let conn = pool.lock().unwrap();
-        migrate(&conn).unwrap();
-        migrate(&conn).unwrap();
+        db.call(|conn| {
+            migrate(conn)?;
+            migrate(conn)
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn cloned_handles_serialize_writes_on_worker_thread() {
+        let db = test_pool().unwrap();
+        let mut workers = Vec::new();
+        for i in 0..8 {
+            let db = db.clone();
+            workers.push(thread::spawn(move || {
+                db.call(move |conn| {
+                    conn.execute(
+                        "INSERT INTO ccr_cache (id, payload, omitted_count, created_at)
+                         VALUES (?1, ?2, 0, 0)",
+                        params![format!("cache-{i}"), Vec::<u8>::new()],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            }));
+        }
+
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let count: i64 = db
+            .call(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM ccr_cache", [], |row| row.get(0))
+                    .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(count, 8);
     }
 }
