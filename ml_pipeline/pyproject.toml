@@ -1,0 +1,44 @@
+[project]
+name = "polymorph-lamr"
+version = "0.1.0"
+description = "Training and distillation pipeline for Polymorph's LaMR dual-CRF token classifier"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.4",
+    "numpy>=1.26",
+    "tiktoken>=0.7",
+    "litellm>=1.50",
+    "tree-sitter>=0.22",
+    "tree-sitter-python>=0.23",
+    "tree-sitter-json>=0.23",
+    "pyyaml>=6.0",
+    "tqdm>=4.66",
+    "onnx>=1.16",
+    "onnxruntime>=1.18",
+    "onnxscript>=0.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+train = [
+    "wandb>=0.17",
+]
+
+[project.scripts]
+lamr-distill = "polymorph_lamr.distill.run_distill:main"
+lamr-train = "polymorph_lamr.train.train:main"
+lamr-export = "polymorph_lamr.export.to_onnx:main"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["polymorph_lamr*"]

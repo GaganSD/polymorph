@@ -1,0 +1,70 @@
+# LaMR default training + pipeline config.
+tokenizer:
+  name: cl100k_base  # must match src/tokens.rs
+
+distill:
+  models:
+    max_compression: anthropic/claude-3-5-sonnet-latest
+    reasoning_preserved: openai/gpt-4o
+  max_chunk_tokens: 512
+  concurrency: 8
+  num_retries: 4
+  request_timeout_s: 60
+
+qc:
+  vr_drop_top_pct: 5.0   # drop top 5% by Variation Rate
+  ag_drop_top_pct: 10.0  # then drop top 10% by Alignment Gap
+
+label:
+  hop_decay:
+    kernel: exp        # exp | linear
+    alpha: 0.5
+  scaffold_node_types:
+    python:
+      - function_definition
+      - class_definition
+      - import_statement
+      - import_from_statement
+      - decorator
+      - parameters
+      - typed_parameter
+      - typed_default_parameter
+      - type
+      - call           # call.function -- captured by parent type
+    json:
+      - object
+      - pair
+      - array
+
+model:
+  vocab_size: 100352   # cl100k vocab upper bound
+  d_model: 256
+  n_layers: 4
+  n_heads: 4
+  ff_mult: 4
+  dropout: 0.1
+  moe:
+    n_experts: 4
+    top_k: 2
+    expert_hidden_mult: 2
+  use_real_deltanet: false  # _TODO_REAL_DELTANET swap point
+
+train:
+  batch_size: 8
+  grad_accum: 8           # virtual batch 64
+  max_seq_len: 1024
+  lr: 3.0e-4
+  weight_decay: 0.01
+  warmup_steps: 200
+  max_steps: 20000
+  amp_dtype: bf16
+  ckpt_every: 1000
+  log_every: 50
+  lambda_sem: 1.0
+  lambda_dep: 1.0
+  seed: 1337
+
+export:
+  out_dir: artifacts/lamr-v0
+  opset: 17
+  dynamic_axes: true
