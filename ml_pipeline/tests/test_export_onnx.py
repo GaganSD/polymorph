@@ -17,8 +17,6 @@ def _tiny_cfg() -> LaMRConfig:
         n_heads=4,
         ff_mult=2,
         dropout=0.0,
-        n_experts=2,
-        top_k=2,
     )
 
 
@@ -38,10 +36,14 @@ def test_export_and_parity(tmp_path: Path):
     parity = export(checkpoint=ckpt, out_dir=out_dir, parity_seq_len=16)
     assert parity["max_abs_diff_sem"] < 1e-3
     assert parity["max_abs_diff_dep"] < 1e-3
+    assert parity["max_abs_diff_head_weights"] < 1e-3
+    assert parity["checked_shapes"] == 3
 
     # Side-car & docs exist.
     assert (out_dir / "model.onnx").exists()
     assert (out_dir / "transitions.npz").exists()
     assert (out_dir / "config.yaml").exists()
     assert (out_dir / "README.md").exists()
-    assert json.loads((out_dir / "parity.json").read_text())["max_abs_diff_sem"] < 1e-3
+    parity_json = json.loads((out_dir / "parity.json").read_text())
+    assert parity_json["max_abs_diff_sem"] < 1e-3
+    assert "head_weights" in (out_dir / "README.md").read_text()
