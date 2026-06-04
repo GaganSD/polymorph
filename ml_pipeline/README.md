@@ -46,14 +46,21 @@ one training step on CPU, and exports an ONNX artifact under
 ### 1. Distill (`polymorph_lamr.distill`)
 
 ```bash
-lamr-distill --in data/raw --out data/distilled.jsonl --concurrency 8
+OPENROUTER_API_KEY=sk-or-... \
+lamr-distill --in data/raw/trainticket --out data/distilled/trainticket.jsonl --concurrency 8
 ```
 
-- Calls `anthropic/claude-3-5-sonnet-latest` (max-compression) and
-  `openai/gpt-4o` (reasoning-preserving) concurrently per chunk.
-- Chunks are sentence-bounded, ≤512 cl100k tokens (LLMLingua-2 §Dataset
-  Distillation chunk-wise protocol).
-- Output: JSONL `{src_path, chunk_id, original, claude, gpt4o, cost_usd}`.
+- **Default: OpenRouter open-weight teacher ensemble** (E3) — Qwen-2.5-72B,
+  DeepSeek, Llama-3.3-70B. Each chunk is compressed by every teacher and the
+  per-chunk **best-QC** output (VR==0, lowest Alignment Gap) is kept as the
+  training target. Override teachers with `--teachers name=model ...`.
+- Uses the `LOG_TRACE_EXTRACTIVE` prompt (telemetry-tuned, extractive-only) and
+  log-aware chunking (`.log`/`.jsonl` split on lines).
+- Output JSONL: `{src_path, chunk_id, original, outputs{teacher->text},
+  compressed, chosen_teacher, qc{vr,ag,mr,hr}, cost_usd, errors}`.
+- Legacy two-teacher mode (Claude + GPT-4o): `--mode pair`.
+- Full end-to-end path (fetch → benchmark gate → distill → train): see
+  [`RUNBOOK_OPENROUTER.md`](RUNBOOK_OPENROUTER.md).
 
 ### 2. Quality control (`polymorph_lamr.qc`)
 

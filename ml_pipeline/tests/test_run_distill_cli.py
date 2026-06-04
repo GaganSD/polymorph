@@ -45,9 +45,12 @@ def test_run_distill_end_to_end(monkeypatch, tmp_path):
     assert len(lines) >= 2
     for line in lines:
         rec = json.loads(line)
+        # Ensemble schema (OpenRouter multi-teacher; default mode).
         assert rec["original"]
-        assert rec["claude"]
-        assert rec["gpt4o"]
+        assert "compressed" in rec
+        assert isinstance(rec["outputs"], dict) and rec["outputs"]
+        assert rec["chosen_teacher"] in rec["outputs"]
+        assert set(rec["qc"]) >= {"vr", "ag", "mr", "hr"}
 
 
 def test_run_distill_empty_dir_exits_nonzero(monkeypatch, tmp_path, capsys):

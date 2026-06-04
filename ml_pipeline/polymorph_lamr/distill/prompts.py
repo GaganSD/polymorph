@@ -49,5 +49,32 @@ GPT4O_REASONING_PRESERVED = (
 )
 
 
+LOG_TRACE_EXTRACTIVE = (
+    "You are a precise extractive compression tool for CLOUD-NATIVE LOGS and "
+    "DISTRIBUTED TRACE payloads. Your goal is to delete redundant, low-information "
+    "tokens while keeping the record forensically complete.\n\n"
+    + _BASE_RULES
+    + "\n6. NEVER delete: log levels (INFO/WARN/ERROR/FATAL), HTTP status codes, "
+    "error/exception names, trace/span IDs, resource identifiers, numeric "
+    "constants, hex offsets, or state-transition keywords.\n"
+    "7. You MAY delete: repeated boilerplate, verbose stack-frame chatter, "
+    "redundant timestamps, and filler prose around the signal.\n\n"
+    "Aim to delete 30-50% of tokens. Preserve everything an on-call engineer "
+    "would need to localize a fault.\n\n"
+    "ORIGINAL:\n{text}\n\nCOMPRESSED:"
+)
+
+
+# Default OpenRouter open-weight teacher ensemble (E3). Open-weight models are
+# individually weaker at obeying the strict extractive constraint than GPT-4o/
+# Claude, so we fan out across several and keep the per-chunk best-QC output. Model
+# IDs are litellm `openrouter/<vendor>/<model>` strings; override via config/CLI.
+DEFAULT_OPENROUTER_TEACHERS: list[tuple[str, str]] = [
+    ("qwen", "openrouter/qwen/qwen-2.5-72b-instruct"),
+    ("deepseek", "openrouter/deepseek/deepseek-chat"),
+    ("llama", "openrouter/meta-llama/llama-3.3-70b-instruct"),
+]
+
+
 def render(template: str, text: str) -> str:
     return template.format(text=text)

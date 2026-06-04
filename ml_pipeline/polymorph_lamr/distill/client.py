@@ -20,7 +20,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .prompts import CLAUDE_MAX_COMPRESSION, GPT4O_REASONING_PRESERVED, render
+from .prompts import (
+    CLAUDE_MAX_COMPRESSION,
+    DEFAULT_OPENROUTER_TEACHERS,
+    GPT4O_REASONING_PRESERVED,
+    LOG_TRACE_EXTRACTIVE,
+    render,
+)
 
 
 @dataclass
@@ -157,11 +163,181 @@ async def distill_many(
                 pass
 
 
-def write_jsonl(results: list[DistillResult], out_path: Path) -> None:
+def write_jsonl(results: list, out_path: Path) -> None:
+    """Write any result objects exposing `.to_json()` (DistillResult or
+    EnsembleResult)."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w") as f:
         for r in results:
             f.write(r.to_json() + "\n")
+
+
+# --------------------------------------------------------------------------- #
+# OpenRouter multi-teacher ensemble (E3): fan out across open-weight teachers,
+# keep the per-chunk best-QC output. This is the primary distillation path; the
+# legacy `distill_pair` (Claude + GPT-4o) above is retained for back-compat.
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class TeacherSpec:
+    """A single distillation teacher: a label + a litellm model id."""
+
+    name: str
+    model: str
+
+
+def default_teachers() -> list[TeacherSpec]:
+    return [TeacherSpec(name=n, model=m) for (n, m) in DEFAULT_OPENROUTER_TEACHERS]
+
+
+@dataclass
+class EnsembleConfig:
+    teachers: list[TeacherSpec] = field(default_factory=default_teachers)
+    prompt_template: str = LOG_TRACE_EXTRACTIVE
+    num_retries: int = 4
+    request_timeout_s: float = 60.0
+    max_tokens: int = 2048
+    temperature: float = 0.0  # deterministic-leaning teachers
+    failure_policy: str = "record"
+
+
+@dataclass
+class EnsembleResult:
+    src_path: str
+    chunk_id: int
+    original: str
+    outputs: dict[str, str]  # teacher_name -> compressed text
+    compressed: str  # the selected best-QC output (training target)
+    chosen_teacher: str
+    qc: dict[str, float]  # vr/ag/mr/hr of the chosen output
+    cost_usd: float = 0.0
+    errors: list[str] = field(default_factory=list)
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {
+                "src_path": self.src_path,
+                "chunk_id": self.chunk_id,
+                "original": self.original,
+                "outputs": self.outputs,
+                "compressed": self.compressed,
+                "chosen_teacher": self.chosen_teacher,
+                "qc": self.qc,
+                "cost_usd": self.cost_usd,
+                "errors": self.errors,
+            }
+        )
+
+
+def select_best(original: str, outputs: dict[str, str]) -> tuple[str, str, dict[str, float]]:
+    """Pick the best teacher output by QC. Strictly-extractive outputs (VR==0) win;
+    among them, lowest Alignment Gap, then highest compression (shortest) as the
+    tie-breaker. Cross-teacher agreement is NOT required (it is only an implicit
+    tie-break via compression). Returns (teacher_name, text, qc_dict). Empty
+    outputs yield ("", "", {})."""
+    from polymorph_lamr.qc.metrics import QCRecord  # local import keeps module light
+
+    scored = []
+    for name, text in outputs.items():
+        if text and text.strip():
+            qc = QCRecord.compute(original, text)
+            scored.append((name, text, qc))
+    if not scored:
+        return ("", "", {})
+    extractive = [s for s in scored if s[2].vr == 0.0]
+    pool = extractive if extractive else scored
+    pool.sort(key=lambda s: (s[2].vr, s[2].ag, len(s[1])))
+    name, text, qc = pool[0]
+    return name, text, {"vr": qc.vr, "ag": qc.ag, "mr": qc.mr, "hr": qc.hr}
+
+
+async def distill_ensemble(
+    text: str,
+    src_path: str = "",
+    chunk_id: int = 0,
+    cfg: EnsembleConfig | None = None,
+) -> EnsembleResult:
+    cfg = cfg or EnsembleConfig()
+    if cfg.failure_policy not in {"record", "raise"}:
+        raise ValueError(f"unknown failure_policy: {cfg.failure_policy}")
+    prompt = render(cfg.prompt_template, text)
+
+    # Reuse the single-call machinery (retries/cost/error handling).
+    call_cfg = DistillConfig(
+        num_retries=cfg.num_retries,
+        request_timeout_s=cfg.request_timeout_s,
+        max_tokens=cfg.max_tokens,
+        temperature=cfg.temperature,
+        failure_policy=cfg.failure_policy,
+    )
+    tasks = [
+        asyncio.create_task(_call_one(t.model, prompt, call_cfg)) for t in cfg.teachers
+    ]
+    results = await asyncio.gather(*tasks)
+
+    outputs: dict[str, str] = {}
+    errors: list[str] = []
+    total_cost = 0.0
+    for teacher, (out_text, cost, err) in zip(cfg.teachers, results):
+        total_cost += cost
+        if err:
+            errors.append(f"{teacher.name}: {err}")
+        if out_text:
+            outputs[teacher.name] = out_text
+
+    if not outputs and cfg.failure_policy == "raise":
+        raise RuntimeError("all teachers failed: " + "; ".join(errors))
+
+    chosen_teacher, compressed, qc = select_best(text, outputs)
+    return EnsembleResult(
+        src_path=src_path,
+        chunk_id=chunk_id,
+        original=text,
+        outputs=outputs,
+        compressed=compressed,
+        chosen_teacher=chosen_teacher,
+        qc=qc,
+        cost_usd=total_cost,
+        errors=errors,
+    )
+
+
+async def distill_ensemble_many(
+    items: Sequence[tuple[str, str, int]],  # (text, src_path, chunk_id)
+    cfg: EnsembleConfig | None = None,
+    concurrency: int = 8,
+) -> AsyncIterator[EnsembleResult]:
+    """Yield EnsembleResults as each chunk completes. Cancels in-flight requests
+    on teardown (prevents $$$ leak under Ctrl-C)."""
+    cfg = cfg or EnsembleConfig()
+    sem = asyncio.Semaphore(concurrency)
+    queue: asyncio.Queue[EnsembleResult] = asyncio.Queue()
+
+    async def _bounded(text: str, path: str, idx: int) -> None:
+        async with sem:
+            result = await distill_ensemble(text, path, idx, cfg)
+            await queue.put(result)
+
+    pending: list[asyncio.Task] = [
+        asyncio.create_task(_bounded(t, p, i)) for (t, p, i) in items
+    ]
+    try:
+        produced = 0
+        total = len(pending)
+        while produced < total:
+            result = await queue.get()
+            produced += 1
+            yield result
+    finally:
+        for task in pending:
+            if not task.done():
+                task.cancel()
+        for task in pending:
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 def _get(obj: Any, key: str, default: Any = None) -> Any:

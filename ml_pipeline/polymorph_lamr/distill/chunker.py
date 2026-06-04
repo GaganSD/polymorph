@@ -31,9 +31,20 @@ def _token_count(text: str) -> int:
 def _split_units(text: str, mode: str) -> list[str]:
     if mode == "code":
         parts = _BLANK_LINE_RE.split(text)
+    elif mode == "log":
+        # Line-oriented: each log record / trace line is a unit.
+        parts = text.split("\n")
     else:
         parts = _SENT_END_RE.split(text)
     return [p for p in parts if p.strip()]
+
+
+def _join(units: list[str], mode: str) -> str:
+    if mode == "code":
+        return "\n\n".join(units)
+    if mode == "log":
+        return "\n".join(units)
+    return " ".join(units)
 
 
 def chunk(text: str, max_tokens: int = 512, mode: str = "prose") -> list[str]:
@@ -51,19 +62,19 @@ def chunk(text: str, max_tokens: int = 512, mode: str = "prose") -> list[str]:
         if u_toks > max_tokens:
             # Flush, then hard-split this oversized unit.
             if cur:
-                chunks.append("\n\n".join(cur) if mode == "code" else " ".join(cur))
+                chunks.append(_join(cur, mode))
                 cur, cur_toks = [], 0
             chunks.extend(_hard_split(u, max_tokens))
             continue
 
         if cur_toks + u_toks > max_tokens and cur:
-            chunks.append("\n\n".join(cur) if mode == "code" else " ".join(cur))
+            chunks.append(_join(cur, mode))
             cur, cur_toks = [], 0
         cur.append(u)
         cur_toks += u_toks
 
     if cur:
-        chunks.append("\n\n".join(cur) if mode == "code" else " ".join(cur))
+        chunks.append(_join(cur, mode))
     return chunks
 
 
@@ -78,8 +89,15 @@ def _hard_split(text: str, max_tokens: int) -> list[str]:
 
 def detect_mode(path: str | None, text: str) -> str:
     if path:
+        if path.endswith((".log", ".jsonl")):
+            return "log"
         if path.endswith((".py", ".rs", ".ts", ".tsx", ".js", ".go", ".java", ".c", ".cpp", ".h")):
             return "code"
         if path.endswith(".json"):
             return "code"
+        if path.endswith(".txt"):
+            # Heuristic: many short newline-delimited records => treat as logs.
+            lines = text.splitlines()
+            if len(lines) >= 8 and (sum(len(l) for l in lines) / max(len(lines), 1)) < 240:
+                return "log"
     return "prose"
