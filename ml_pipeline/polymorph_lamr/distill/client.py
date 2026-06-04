@@ -22,11 +22,11 @@ from typing import Any
 
 from .prompts import (
     CLAUDE_MAX_COMPRESSION,
-    DEFAULT_OPENROUTER_TEACHERS,
     GPT4O_REASONING_PRESERVED,
     LOG_TRACE_EXTRACTIVE,
     render,
 )
+from .providers import DEFAULT_TEACHER_SPECS, resolve_routing
 
 
 @dataclass
@@ -64,9 +64,31 @@ class DistillResult:
         )
 
 
-async def _call_one(model: str, prompt: str, cfg: DistillConfig) -> tuple[str, float, str | None]:
-    """Single call. Returns (text, cost_usd, error_or_None)."""
+async def _call_one(
+    model: str,
+    prompt: str,
+    cfg: DistillConfig,
+    *,
+    api_base: str | None = None,
+    api_key: str | None = None,
+    aws_region: str | None = None,
+) -> tuple[str, float, str | None]:
+    """Single call. Returns (text, cost_usd, error_or_None).
+
+    ``api_base``/``api_key`` are forwarded to litellm when set (OpenAI-compatible
+    custom endpoints such as the Vercel AI Gateway); ``aws_region`` is forwarded as
+    ``aws_region_name`` for Bedrock. When all are None, litellm falls back to its
+    default per-provider credential resolution.
+    """
     import litellm  # local import keeps tests light
+
+    extra: dict[str, Any] = {}
+    if api_base:
+        extra["api_base"] = api_base
+    if api_key:
+        extra["api_key"] = api_key
+    if aws_region:
+        extra["aws_region_name"] = aws_region
 
     last_err: Exception | None = None
     for attempt in range(cfg.num_retries + 1):
@@ -78,6 +100,7 @@ async def _call_one(model: str, prompt: str, cfg: DistillConfig) -> tuple[str, f
                 temperature=cfg.temperature,
                 timeout=cfg.request_timeout_s,
                 num_retries=0,  # we do the outer retry
+                **extra,
             )
             text = _response_text(resp)
             cost = _response_cost(resp)
@@ -181,14 +204,37 @@ def write_jsonl(results: list, out_path: Path) -> None:
 
 @dataclass(frozen=True)
 class TeacherSpec:
-    """A single distillation teacher: a label + a litellm model id."""
+    """A single distillation teacher: a label + a litellm model id + routing.
+
+    ``api_base``/``api_key_env`` are populated by :meth:`from_spec` based on the
+    provider prefix; constructing directly (name+model only) keeps the legacy
+    default-provider behaviour for tests and back-compat.
+    """
 
     name: str
     model: str
+    api_base: str | None = None
+    api_key_env: str | None = None
+    aws_region: str | None = None
+
+    @classmethod
+    def from_spec(cls, name: str, spec_model: str) -> "TeacherSpec":
+        """Build a teacher from a provider-prefixed spec-string (e.g.
+        ``bedrock/deepseek.v3.2``, ``vercel/alibaba/qwen3.7-max``, or
+        ``openrouter/moonshotai/kimi-k2.6:free``). Enforces the Vercel
+        strict-model guard via :func:`resolve_routing`."""
+        r = resolve_routing(spec_model)
+        return cls(
+            name=name,
+            model=r.model,
+            api_base=r.api_base,
+            api_key_env=r.api_key_env,
+            aws_region=r.aws_region,
+        )
 
 
 def default_teachers() -> list[TeacherSpec]:
-    return [TeacherSpec(name=n, model=m) for (n, m) in DEFAULT_OPENROUTER_TEACHERS]
+    return [TeacherSpec.from_spec(n, m) for (n, m) in DEFAULT_TEACHER_SPECS]
 
 
 @dataclass
@@ -272,7 +318,17 @@ async def distill_ensemble(
         failure_policy=cfg.failure_policy,
     )
     tasks = [
-        asyncio.create_task(_call_one(t.model, prompt, call_cfg)) for t in cfg.teachers
+        asyncio.create_task(
+            _call_one(
+                t.model,
+                prompt,
+                call_cfg,
+                api_base=t.api_base,
+                api_key=os.environ.get(t.api_key_env) if t.api_key_env else None,
+                aws_region=t.aws_region,
+            )
+        )
+        for t in cfg.teachers
     ]
     results = await asyncio.gather(*tasks)
 
