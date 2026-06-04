@@ -22,6 +22,7 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "pytest-cov>=6.0",
 ]
 train = [
     "wandb>=0.17",
@@ -31,6 +32,7 @@ train = [
 lamr-distill = "polymorph_lamr.distill.run_distill:main"
 lamr-train = "polymorph_lamr.train.train:main"
 lamr-export = "polymorph_lamr.export.to_onnx:main"
+lamr-stage-corpora = "polymorph_lamr.distill.adapters.stage:main"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
