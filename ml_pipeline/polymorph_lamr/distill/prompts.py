@@ -65,15 +65,10 @@ LOG_TRACE_EXTRACTIVE = (
 )
 
 
-# Default OpenRouter open-weight teacher ensemble (E3). Open-weight models are
-# individually weaker at obeying the strict extractive constraint than GPT-4o/
-# Claude, so we fan out across several and keep the per-chunk best-QC output. Model
-# IDs are litellm `openrouter/<vendor>/<model>` strings; override via config/CLI.
-DEFAULT_OPENROUTER_TEACHERS: list[tuple[str, str]] = [
-    ("qwen", "openrouter/qwen/qwen-2.5-72b-instruct"),
-    ("deepseek", "openrouter/deepseek/deepseek-chat"),
-    ("llama", "openrouter/meta-llama/llama-3.3-70b-instruct"),
-]
+# NOTE: the default teacher ensemble + provider routing now live in
+# `providers.py` (DEFAULT_TEACHER_SPECS / resolve_routing) — open-weight models
+# are individually weaker at the strict extractive constraint, so we fan out
+# across teachers and keep the per-chunk best-QC output.
 
 
 def render(template: str, text: str) -> str:

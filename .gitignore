@@ -15,3 +15,8 @@ ml_pipeline/htmlcov/
 # datasets (large, fetched via scripts/fetch_datasets.sh) — track the card, not the corpora
 /data/*
 !/data/DATA_CARD.md
+
+# secrets — API keys for distillation teachers (OpenRouter / Vercel AI Gateway)
+.env
+*.env
+!*.env.example
