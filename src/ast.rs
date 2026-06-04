@@ -3,7 +3,7 @@ use once_cell::sync::OnceCell;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tree_sitter::{
@@ -18,7 +18,10 @@ use crate::Language;
 const MAX_GRAMMAR_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Hard wall-clock budget for WASM Tree-sitter parse (algorithmic complexity DoS guard).
-const PARSE_TIMEOUT: Duration = Duration::from_millis(50);
+///
+/// This is intentionally low enough to bound adversarial parses, but not so low
+/// that normal CI/test scheduler jitter turns large valid inputs into flakes.
+const PARSE_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Wasmtime stack budget per grammar invocation (bytes).
 const MAX_WASM_STACK: usize = 256 * 1024;
@@ -28,6 +31,7 @@ const WASM_MEMORY_RESERVATION: u64 = 16 * 1024 * 1024;
 
 static RUNTIME: OnceCell<tokio::runtime::Runtime> = OnceCell::new();
 static ENGINE: OnceCell<Engine> = OnceCell::new();
+static PARSE_PERMIT: OnceCell<Arc<tokio::sync::Semaphore>> = OnceCell::new();
 
 fn runtime() -> &'static tokio::runtime::Runtime {
     RUNTIME.get_or_init(|| {
@@ -54,6 +58,12 @@ fn engine() -> &'static Engine {
         // in `extract_ast_intervals` enforces execution bounds instead of fuel.
         Engine::new(&config).expect("failed to create sandboxed wasmtime Engine")
     })
+}
+
+fn parse_permit() -> Arc<tokio::sync::Semaphore> {
+    PARSE_PERMIT
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
+        .clone()
 }
 
 fn read_bounded_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
@@ -124,8 +134,12 @@ fn init_wasm_parser(language: Language, grammars_dir: &Path) -> Result<CachedWas
     Ok(CachedWasmParser { parser })
 }
 
-fn cached_parser(language: Language, grammars_dir: &Path) -> Result<&'static Mutex<CachedWasmParser>> {
-    parser_cache(language).get_or_try_init(|| init_wasm_parser(language, grammars_dir).map(Mutex::new))
+fn cached_parser(
+    language: Language,
+    grammars_dir: &Path,
+) -> Result<&'static Mutex<CachedWasmParser>> {
+    parser_cache(language)
+        .get_or_try_init(|| init_wasm_parser(language, grammars_dir).map(Mutex::new))
 }
 
 /// Parse off the MCP stdio thread with a 50ms timeout on the hot path.
@@ -141,9 +155,14 @@ pub fn extract_ast_intervals(
     let grammars_dir = grammars_dir.to_path_buf();
 
     runtime().block_on(async {
+        let permit = parse_permit()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow!("AST parse permit closed"))?;
         tokio::time::timeout(
             PARSE_TIMEOUT,
             tokio::task::spawn_blocking(move || {
+                let _permit = permit;
                 extract_ast_intervals_blocking(&text, language, &grammars_dir)
             }),
         )

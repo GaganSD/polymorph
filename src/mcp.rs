@@ -58,9 +58,14 @@ impl PolymorphServer {
     ) -> Result<CallToolResult, ErrorData> {
         check_lock_mask_input(&input).map_err(validation_err)?;
         let lang = Language::from_str(&input.language).ok_or_else(|| {
+            let language = input.language.clone();
             ErrorData::invalid_params(
-                format!("unsupported language: {}", input.language),
-                None,
+                format!("unsupported language: {language}"),
+                Some(json!({
+                    "error": "unsupported_language",
+                    "language": language,
+                    "hint": "use one of: json, python",
+                })),
             )
         })?;
         let grammars = self.grammars_dir.clone();
@@ -68,12 +73,16 @@ impl PolymorphServer {
             lock_payload(&input.text, lang, &input.keywords, grammars.as_path())
         })
         .await
-        .map_err(|e| ErrorData::internal_error(format!("join: {e}"), None))?
-        .map_err(|e| ErrorData::internal_error(format!("lock_payload failed: {e}"), None))?;
+        .map_err(|e| internal_err("task_join_failed", format!("join: {e}")))?
+        .map_err(|e| internal_err("lock_payload_failed", format!("lock_payload failed: {e}")))?;
         if res.mask.len() > MAX_MASK_TOKENS {
             return Err(ErrorData::invalid_params(
                 format!("lock_mask output exceeds max token count ({MAX_MASK_TOKENS}) \u{2014} reduce input text"),
-                None,
+                Some(json!({
+                    "error": "output_too_large",
+                    "max_tokens": MAX_MASK_TOKENS,
+                    "hint": "reduce input text",
+                })),
             ));
         }
         Ok(CallToolResult::structured(json!({
@@ -104,8 +113,13 @@ impl PolymorphServer {
         let cache = input.cache;
         let res = tokio::task::spawn_blocking(move || ccr::compress_array(value, opts, &db, cache))
             .await
-            .map_err(|e| ErrorData::internal_error(format!("join: {e}"), None))?
-            .map_err(|e| ErrorData::internal_error(format!("compress_array failed: {e}"), None))?;
+            .map_err(|e| internal_err("task_join_failed", format!("join: {e}")))?
+            .map_err(|e| {
+                internal_err(
+                    "compress_array_failed",
+                    format!("compress_array failed: {e}"),
+                )
+            })?;
         Ok(CallToolResult::structured(json!({
             "compressed": res.compressed,
             "cache_id": res.cache_id,
@@ -125,19 +139,20 @@ impl PolymorphServer {
         let cache_id = input.cache_id.clone();
         let res = tokio::task::spawn_blocking(move || ccr::retrieve(&input.cache_id, &db))
             .await
-            .map_err(|e| ErrorData::internal_error(format!("join: {e}"), None))?;
+            .map_err(|e| internal_err("task_join_failed", format!("join: {e}")))?;
         match res {
             Ok(value) => Ok(CallToolResult::structured(json!({"value": value}))),
             Err(e) if e.is::<CacheMiss>() => Err(ErrorData::invalid_params(
                 "cache_miss",
                 Some(json!({
+                    "error": "cache_miss",
                     "cache_id": cache_id,
                     "hint": "cache entry expired or never existed",
                 })),
             )),
-            Err(e) => Err(ErrorData::internal_error(
+            Err(e) => Err(internal_err(
+                "retrieve_failed",
                 format!("retrieve failed: {e}"),
-                None,
             )),
         }
     }
@@ -162,8 +177,8 @@ impl PolymorphServer {
             )
         })
         .await
-        .map_err(|e| ErrorData::internal_error(format!("join: {e}"), None))?
-        .map_err(|e| ErrorData::internal_error(format!("lcm_append failed: {e}"), None))?;
+        .map_err(|e| internal_err("task_join_failed", format!("join: {e}")))?
+        .map_err(|e| internal_err("lcm_append_failed", format!("lcm_append failed: {e}")))?;
         Ok(CallToolResult::structured(json!({
             "turn_id": res.turn_id,
             "turn_index": res.turn_index,
@@ -184,15 +199,15 @@ impl PolymorphServer {
         let node_id = input.node_id.clone();
         let res = tokio::task::spawn_blocking(move || lcm::describe(&input.node_id, &db))
             .await
-            .map_err(|e| ErrorData::internal_error(format!("join: {e}"), None))?;
+            .map_err(|e| internal_err("task_join_failed", format!("join: {e}")))?;
         match res {
             Ok(meta) => Ok(CallToolResult::structured(
                 serde_json::to_value(&meta).unwrap_or(Value::Null),
             )),
             Err(e) if e.is::<LcmNotFound>() => Err(lcm_not_found(&node_id)),
-            Err(e) => Err(ErrorData::internal_error(
+            Err(e) => Err(internal_err(
+                "lcm_describe_failed",
                 format!("lcm_describe failed: {e}"),
-                None,
             )),
         }
     }
@@ -209,13 +224,13 @@ impl PolymorphServer {
         let node_id = input.node_id.clone();
         let res = tokio::task::spawn_blocking(move || lcm::expand(&input.node_id, &db))
             .await
-            .map_err(|e| ErrorData::internal_error(format!("join: {e}"), None))?;
+            .map_err(|e| internal_err("task_join_failed", format!("join: {e}")))?;
         match res {
             Ok(rows) => Ok(CallToolResult::structured(json!({"turns": rows}))),
             Err(e) if e.is::<LcmNotFound>() => Err(lcm_not_found(&node_id)),
-            Err(e) => Err(ErrorData::internal_error(
+            Err(e) => Err(internal_err(
+                "lcm_expand_failed",
                 format!("lcm_expand failed: {e}"),
-                None,
             )),
         }
     }
@@ -234,12 +249,34 @@ impl ServerHandler for PolymorphServer {
 }
 
 fn validation_err(e: anyhow::Error) -> ErrorData {
-    ErrorData::invalid_params(format!("invalid arguments: {e}"), None)
+    ErrorData::invalid_params(
+        format!("invalid arguments: {e}"),
+        Some(json!({
+            "error": "validation_failed",
+            "details": e.to_string(),
+            "hint": "fix the tool arguments to match the schema and semantic bounds",
+        })),
+    )
 }
 
 fn lcm_not_found(node_id: &str) -> ErrorData {
     ErrorData::invalid_params(
         "lcm_not_found",
-        Some(json!({"node_id": node_id, "hint": "no summary node with that id"})),
+        Some(json!({
+            "error": "lcm_not_found",
+            "node_id": node_id,
+            "hint": "no summary node with that id",
+        })),
+    )
+}
+
+fn internal_err(error: &'static str, message: String) -> ErrorData {
+    ErrorData::internal_error(
+        message.clone(),
+        Some(json!({
+            "error": error,
+            "details": message,
+            "hint": "retry later or inspect server logs",
+        })),
     )
 }

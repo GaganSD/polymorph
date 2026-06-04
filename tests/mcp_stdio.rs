@@ -22,10 +22,8 @@ fn manifest_grammars() -> std::path::PathBuf {
 }
 
 async fn spawn_server() -> (Child, rmcp::service::RunningService<rmcp::RoleClient, ()>) {
-    let db_path = std::env::temp_dir().join(format!(
-        "polymorph-stdio-smoke-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db_path =
+        std::env::temp_dir().join(format!("polymorph-stdio-smoke-{}.db", uuid::Uuid::new_v4()));
     let mut child = Command::new(binary_path())
         .env("POLYMORPH_GRAMMARS_DIR", manifest_grammars())
         .env("POLYMORPH_DB_PATH", &db_path)
@@ -36,10 +34,7 @@ async fn spawn_server() -> (Child, rmcp::service::RunningService<rmcp::RoleClien
         .expect("spawn polymorph-mcp");
     let stdin = child.stdin.take().unwrap();
     let stdout = child.stdout.take().unwrap();
-    let client = ()
-        .serve((stdout, stdin))
-        .await
-        .expect("client initialize");
+    let client = ().serve((stdout, stdin)).await.expect("client initialize");
     (child, client)
 }
 
@@ -48,7 +43,10 @@ async fn stdio_initialize_handshake() {
     let (mut child, client) = spawn_server().await;
     let info = client.peer_info().expect("peer info after init");
     assert_eq!(info.server_info.name, "polymorph-mcp");
-    assert_eq!(info.protocol_version, rmcp::model::ProtocolVersion::V_2025_06_18);
+    assert_eq!(
+        info.protocol_version,
+        rmcp::model::ProtocolVersion::V_2025_06_18
+    );
     let _ = client.cancel().await;
     let _ = child.kill().await;
 }
@@ -56,7 +54,10 @@ async fn stdio_initialize_handshake() {
 #[tokio::test]
 async fn stdio_tools_list_advertises_all_six_tools() {
     let (mut child, client) = spawn_server().await;
-    let tools = client.list_tools(Default::default()).await.expect("list_tools");
+    let tools = client
+        .list_tools(Default::default())
+        .await
+        .expect("list_tools");
     let names: Vec<&str> = tools.tools.iter().map(|t| t.name.as_ref()).collect();
     for expected in [
         "lock_mask",
@@ -66,7 +67,10 @@ async fn stdio_tools_list_advertises_all_six_tools() {
         "lcm_describe",
         "lcm_expand",
     ] {
-        assert!(names.contains(&expected), "missing tool {expected}: {names:?}");
+        assert!(
+            names.contains(&expected),
+            "missing tool {expected}: {names:?}"
+        );
     }
     let _ = client.cancel().await;
     let _ = child.kill().await;
@@ -98,10 +102,8 @@ async fn stdio_lock_mask_round_trip() {
 async fn stdio_rejects_oversize_message() {
     // BoundedAsyncRead must trip the cap on a single JSON-RPC line before rmcp
     // allocates/deserializes the enormous arguments object.
-    let db_path = std::env::temp_dir().join(format!(
-        "polymorph-oversize-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db_path =
+        std::env::temp_dir().join(format!("polymorph-oversize-{}.db", uuid::Uuid::new_v4()));
     let mut child = Command::new(binary_path())
         .env("POLYMORPH_GRAMMARS_DIR", manifest_grammars())
         .env("POLYMORPH_DB_PATH", &db_path)

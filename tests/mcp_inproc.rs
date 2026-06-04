@@ -52,10 +52,10 @@ fn tool_schema(tools: &rmcp::model::ListToolsResult, name: &str) -> Value {
     serde_json::to_value(&*tool.input_schema).expect("schema serialize")
 }
 
-fn nested_element(i: usize, depth: usize) -> Value {
-    let mut value = json!({"i": i});
-    for level in 0..depth {
-        value = json!({"level": level, "child": value});
+fn nested_element(index: usize, depth: usize) -> Value {
+    let mut value = json!({"idx": index, "sentinel": format!("edge-{index}")});
+    for _ in 0..depth {
+        value = json!([value]);
     }
     value
 }
@@ -93,6 +93,13 @@ async fn call_err(
         rmcp::service::ServiceError::McpError(d) => d,
         other => panic!("expected McpError, got: {other:?}"),
     }
+}
+
+fn error_data<'a>(err: &'a rmcp::ErrorData, code: i32, error: &str) -> &'a Value {
+    assert_eq!(err.code.0, code);
+    let data = err.data.as_ref().expect("structured error data");
+    assert_eq!(data["error"], error);
+    data
 }
 
 #[tokio::test]
@@ -146,6 +153,8 @@ async fn lock_mask_unsupported_language_rejected() {
     )
     .await;
     assert!(format!("{}", err.message).contains("unsupported language"));
+    let data = error_data(&err, -32602, "unsupported_language");
+    assert_eq!(data["language"], "rust");
     let _ = client.cancel().await;
 }
 
@@ -266,7 +275,7 @@ async fn retrieve_unknown_cache_returns_structured_error() {
     )
     .await;
     assert!(format!("{}", err.message).contains("cache_miss"));
-    let data = err.data.as_ref().expect("error data");
+    let data = error_data(&err, -32602, "cache_miss");
     assert_eq!(data["cache_id"], "does-not-exist");
     assert!(data["hint"].as_str().unwrap().contains("cache"));
     let _ = client.cancel().await;
@@ -297,7 +306,11 @@ async fn token_mask_collision_locks_daac_ast_and_lamr_overlap() {
     .await;
     let sc = r.structured_content.unwrap();
     assert_eq!(sc["tokens"], 1);
-    assert_eq!(sc["mask"], json!([true]), "AST and DAAC must lock the token");
+    assert_eq!(
+        sc["mask"],
+        json!([true]),
+        "AST and DAAC must lock the token"
+    );
     assert_eq!(
         sc["drop_mask"],
         json!([false]),
@@ -337,10 +350,8 @@ async fn retrieve_cache_oversized_id_rejected_by_semantic_validator() {
     assert_eq!(err.code.0, -32602);
     let msg = format!("{}", err.message);
     assert!(msg.contains("cache_id exceeds max length"), "got: {msg}");
-    assert!(
-        err.data.is_none(),
-        "validation errors should not include data"
-    );
+    let data = error_data(&err, -32602, "validation_failed");
+    assert!(data["details"].as_str().unwrap().contains("cache_id"));
     let _ = client.cancel().await;
 }
 
@@ -359,10 +370,8 @@ async fn compress_array_rejects_pathological_edges_over_mcp() {
         msg.contains("head_keep + tail_keep exceeds max items"),
         "got: {msg}"
     );
-    assert!(
-        err.data.is_none(),
-        "validation errors should not include data"
-    );
+    let data = error_data(&err, -32602, "validation_failed");
+    assert!(data["details"].as_str().unwrap().contains("head_keep"));
     let _ = client.cancel().await;
 }
 
@@ -449,10 +458,12 @@ async fn lcm_concurrency_stress_archives_without_deadlocking_db_worker() {
         json!({"node_id": archived.last().unwrap()}),
     )
     .await;
-    assert!(desc.structured_content.unwrap()["child_count"]
-        .as_u64()
-        .unwrap()
-        > 0);
+    assert!(
+        desc.structured_content.unwrap()["child_count"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
     let _ = client.cancel().await;
 }
 
@@ -461,7 +472,7 @@ async fn lcm_describe_unknown_returns_not_found_data() {
     let (client, _server, _dir) = harness().await;
     let err = call_err(&client, "lcm_describe", json!({"node_id": "nope"})).await;
     assert!(format!("{}", err.message).contains("lcm_not_found"));
-    let data = err.data.as_ref().expect("error data");
+    let data = error_data(&err, -32602, "lcm_not_found");
     assert_eq!(data["node_id"], "nope");
     let _ = client.cancel().await;
 }
@@ -471,8 +482,7 @@ async fn lcm_expand_unknown_returns_not_found_data() {
     let (client, _server, _dir) = harness().await;
     let err = call_err(&client, "lcm_expand", json!({"node_id": "nope"})).await;
     assert!(format!("{}", err.message).contains("lcm_not_found"));
-    assert_eq!(err.code.0, -32602);
-    let data = err.data.as_ref().expect("error data");
+    let data = error_data(&err, -32602, "lcm_not_found");
     assert_eq!(data["node_id"], "nope");
     assert_eq!(data["hint"], "no summary node with that id");
     let _ = client.cancel().await;
@@ -508,10 +518,8 @@ async fn lcm_append_oversized_content_rejected_by_semantic_validator() {
     assert_eq!(err.code.0, -32602);
     let msg = format!("{}", err.message);
     assert!(msg.contains("content exceeds max length"), "got: {msg}");
-    assert!(
-        err.data.is_none(),
-        "validation errors should not include data"
-    );
+    let data = error_data(&err, -32602, "validation_failed");
+    assert!(data["details"].as_str().unwrap().contains("content"));
     let _ = client.cancel().await;
 }
 
@@ -536,10 +544,8 @@ async fn lcm_describe_oversized_node_id_rejected_by_semantic_validator() {
     assert_eq!(err.code.0, -32602);
     let msg = format!("{}", err.message);
     assert!(msg.contains("node_id exceeds max length"), "got: {msg}");
-    assert!(
-        err.data.is_none(),
-        "validation errors should not include data"
-    );
+    let data = error_data(&err, -32602, "validation_failed");
+    assert!(data["details"].as_str().unwrap().contains("node_id"));
     let _ = client.cancel().await;
 }
 
@@ -556,10 +562,8 @@ async fn lock_mask_oversized_keywords_rejected_by_semantic_validator() {
     assert_eq!(err.code.0, -32602);
     let msg = format!("{}", err.message);
     assert!(msg.contains("keywords exceeds max count"), "got: {msg}");
-    assert!(
-        err.data.is_none(),
-        "validation errors should not include data"
-    );
+    let data = error_data(&err, -32602, "validation_failed");
+    assert!(data["details"].as_str().unwrap().contains("keywords"));
     let _ = client.cancel().await;
 }
 
