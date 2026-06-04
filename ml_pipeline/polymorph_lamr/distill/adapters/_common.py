@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, TextIO
+
+_PARSE_FAILED = object()
 
 
 def sanitize_field(value: str | None) -> str:
@@ -62,9 +65,14 @@ def stream_csv_to_txt(
     return written, skipped
 
 
+def _array_key_pattern(array_key: str) -> re.Pattern[str]:
+    """Match ``"{array_key}": [`` with optional whitespace (not a string value)."""
+    return re.compile(rf'"{re.escape(array_key)}"\s*:\s*\[')
+
+
 def _find_array_start(reader: TextIO, array_key: str) -> bool:
-    """Advance *reader* to the opening ``[`` of ``"{array_key}": [``."""
-    needle = f'"{array_key}"'
+    """Advance *reader* to the byte after the opening ``[`` of the target array."""
+    pattern = _array_key_pattern(array_key)
     tail = ""
     chunk_size = 65536
     while True:
@@ -72,19 +80,21 @@ def _find_array_start(reader: TextIO, array_key: str) -> bool:
         if not chunk:
             return False
         search = tail + chunk
-        idx = search.find(needle)
-        if idx == -1:
-            tail = search[-len(needle) :]
+        match = pattern.search(search)
+        if match is None:
+            tail = search[-64:]
             continue
-        rest = search[idx + len(needle) :]
-        bracket = rest.find("[")
-        if bracket == -1:
-            tail = rest
-            continue
-        # Preserve any bytes after '[' for the element iterator.
-        overflow = rest[bracket + 1 :]
+        overflow = search[match.end() :]
         reader._overflow = overflow  # type: ignore[attr-defined]
         return True
+
+
+def _loads_element(element_parts: list[str]) -> Any:
+    """Parse a complete JSON array element; return *_PARSE_FAILED* on bad JSON."""
+    try:
+        return json.loads("".join(element_parts))
+    except json.JSONDecodeError:
+        return _PARSE_FAILED
 
 
 def _iter_json_array_elements(reader: TextIO, array_key: str) -> Iterator[Any]:
@@ -128,7 +138,7 @@ def _iter_json_array_elements(reader: TextIO, array_key: str) -> Iterator[Any]:
                     element_depth = 0
                 i += 1
                 if element_depth == 0 and ch not in '"[{':
-                    yield json.loads("".join(element_parts))
+                    yield _loads_element(element_parts)
                     collecting = False
                     element_parts = []
                 continue
@@ -143,7 +153,7 @@ def _iter_json_array_elements(reader: TextIO, array_key: str) -> Iterator[Any]:
                 elif ch == '"':
                     in_string = False
                     if element_depth == 0:
-                        yield json.loads("".join(element_parts))
+                        yield _loads_element(element_parts)
                         collecting = False
                         element_parts = []
                 i += 1
@@ -160,7 +170,7 @@ def _iter_json_array_elements(reader: TextIO, array_key: str) -> Iterator[Any]:
             if ch in "]}":
                 element_depth -= 1
                 if element_depth == 0:
-                    yield json.loads("".join(element_parts))
+                    yield _loads_element(element_parts)
                     collecting = False
                     element_parts = []
                 i += 1
@@ -184,6 +194,9 @@ def stream_json_array_to_txt(
         "w", encoding="utf-8", newline="\n"
     ) as dst:
         for element in _iter_json_array_elements(src, array_key):
+            if element is _PARSE_FAILED:
+                skipped += 1
+                continue
             line = render_item(element)
             if line is None:
                 skipped += 1
