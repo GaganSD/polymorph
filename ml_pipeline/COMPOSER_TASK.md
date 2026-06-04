@@ -92,3 +92,82 @@ A JSON list; one object per corpus:
 When done, leave a short note (a `data/staged/STAGED.md` or a PR comment) with the
 manifest summary. Claude's stratified sampler then reads `MANIFEST.json` + the
 staged `.txt` files to build the distillation input. Do not run distillation.
+
+---
+
+# BATCH 2 — expand REAL-log diversity (2026-06-05)
+
+Batch 1 (above) is **merged** (PR #2). Batch 2 adds **12 new corpora** from 5 new
+sources. Claude already downloaded + assessed everything; your job is purely the
+mechanical adapter + staging work, same pattern as Batch 1 (`adapters/_common.py`,
+`stream_csv_to_txt`, one staged `.txt` + one MANIFEST entry per corpus, ≥90%
+test coverage, identical guardrails: local/free only, never touch `data/raw/`,
+stream large files, byte-reproducible).
+
+## DO NOT TOUCH these (assessed and dropped — leave the raw files, add no adapter)
+- `data/raw/k8s_structured/`, `data/raw/k8s_anomaly/` — CICFlowMeter *network-flow numeric features*, not k8s logs.
+- `data/raw/servicenow_incident/` — a 119,999-row subset of `it_incident` (use it_incident instead).
+- `data/raw/asterisk_otel/` — a 319-byte metadata stub, not a corpus.
+- `data/raw/cremev2/{label_accounting,label_traffic,label_syslog}.csv` — numeric/atop/flow/one-hot-featurized. Use ONLY `original_label_syslog.csv`.
+- `data/raw/aws_cloudtrail/dec12_18features.csv` — mangled (truncated timestamps/IPs). Use ONLY `nineteenFeaturesDf.csv`.
+
+## New single-output adapters (same contract as Batch 1: `SOURCE`, `STAGED_TXT`, `stage(repo_root)->(written,skipped)`)
+
+### a) `syslog_cremev2` — `data/raw/cremev2/original_label_syslog.csv`
+Cols: `Time,HostName,Component,PID_or_IP,Content,EventId,EventTemplate,ParameterList,Timestamp,Label,Tactic,Technique,SubTechnique,Label_lifecycle`
+Required: `Time,HostName,Component,Content`
+Line: `{Time} {HostName} {Component}[{PID_or_IP}]: {Content} tactic={Tactic} technique={Technique}`
+→ `data/staged/syslog_cremev2.txt`
+
+### b) `servicenow_itsm` — `data/raw/it_incident/incident_event_log.csv`  (NOT servicenow_incident)
+Required: `number,incident_state,sys_updated_at`
+Line: `{sys_updated_at} incident={number} state={incident_state} active={active} category={category} subcategory={subcategory} symptom={u_symptom} priority={priority} impact={impact} urgency={urgency} contact={contact_type} group={assignment_group} reassignments={reassignment_count} reopens={reopen_count} mods={sys_mod_count} sla={made_sla} notify={notify} closed_code={closed_code} location={location} ci={cmdb_ci}`
+→ `data/staged/servicenow_itsm.txt`   (values are anonymized like `Category 55` — keep as-is; `?` = missing, keep as-is.)
+
+### c) `cloudtrail_flaws` — `data/raw/aws_cloudtrail/nineteenFeaturesDf.csv`  (the 19-feature file ONLY)
+Required: `eventTime,eventName,eventSource`
+Line: `{eventTime} {eventName} {eventSource} region={awsRegion} identity_type={userIdentitytype} event_type={eventType} arn={userIdentityarn} user={userIdentityuserName} src_ip={sourceIPAddress} agent="{userAgent}" principal={userIdentityprincipalId} err={errorCode} err_msg="{errorMessage}" req_instance_type={requestParametersinstanceType}`
+→ `data/staged/cloudtrail_flaws.txt`
+
+### d) `python_tracebacks` — `data/raw/python_tracebacks/stacktraces.json`  (JSON, 418MB — DO NOT json.load the whole file)
+Structure: `{"infile": "...", "data": [[id, github_url, "cpython", "<traceback string>"], ...]}`. The traceback is element **index 3** of each `data` item; it uses `\r` / `\n` between frames.
+- Add a streaming helper to `_common.py`: `stream_json_array_to_txt(json_path, out_path, *, array_key, render_item)` that scans for `"{array_key}": [` then yields each top-level `[...]` element via **bracket-depth scanning that respects JSON string state** (track in-string + backslash-escape so `[`/`]`/`"` inside the traceback text don't break framing), `json.loads`-ing each element. Memory-bounded; never loads the whole file.
+- `render_item(item)`: take `item[3]`; skip (return None) if it's falsy or lacks any of `Traceback`/`File "`/`Error`; replace `\r`/`\n` with a single space and `collapse_whitespace` → one line per traceback.
+→ `data/staged/python_tracebacks.txt`   (~382k tracebacks expected)
+
+## New MULTI-output adapter: `security_synth` (8 vendor CSVs → 8 staged files + 8 MANIFEST entries)
+One module exposing `stage_corpora(repo_root) -> list[dict]` (one dict per vendor:
+`{"name","source","staged_path","written","skipped"}`). `stage.py` must call this and
+extend the staged-entries list (generalize the single-output loop, or special-case it).
+Each vendor = its own corpus name so the sampler balances them independently. Required
+columns = the first 3 listed in each render. Skip columns absent from the real header.
+
+- `okta_auth` ← `okta_system_log.csv`:
+  `{published} {severity} okta event={eventType} msg="{displayMessage}" actor={actor.displayName} actor_id={actor.alternateId} result={outcome.result} reason="{outcome.reason}" ip={client.ipAddress} city={client.geographicalContext.city} ua="{client.userAgent.rawUserAgent}"`
+  → `data/staged/okta_auth.txt`
+- `cisco_dns` ← `cisco_umbrella_dns.csv`:
+  `{Timestamp} cisco_umbrella identity={Identities} int_ip={InternalIp} ext_ip={ExternalIp} action={Action} qtype={QueryType} rcode={ResponseCode} domain={Domain} categories={Categories} verdict={Verdict} url={URL}`
+  → `data/staged/cisco_dns.txt`
+- `crowdstrike_network` ← `crowdstrike_network.csv`:
+  `{timestamp} crowdstrike {EventType} dir={ConnectionDirection} local={LocalAddressIP4}:{LocalPort} remote={RemoteAddressIP4}:{RemotePort} proto={Protocol} status={Status} image={ImageFileName} cmd="{CommandLine}" user={UserName} host={ComputerName} technique={Technique}`
+  → `data/staged/crowdstrike_network.txt`
+- `crowdstrike_process` ← `crowdstrike_process.csv`:
+  `{ProcessStartTime} crowdstrike {EventType} image={ImageFileName} cmd="{CommandLine}" parent={ParentBaseFileName} user={UserName} host={ComputerName} technique={Technique}`
+  → `data/staged/crowdstrike_process.txt`
+- `crowdstrike_registry` ← `crowdstrike_registry.csv`:
+  `{timestamp} crowdstrike {EventType} reg_obj={RegObjectName} reg_val={RegValueName} reg_str="{RegStringValue}" op={RegOperationType} image={ImageFileName} user={UserName} host={ComputerName} technique={Technique}`
+  → `data/staged/crowdstrike_registry.txt`
+- `proofpoint_email` ← `proofpoint_email.csv`:
+  `{time} proofpoint sender={sender} recipient={recipient} subject="{subject}" from={headerFrom} spam={spamScore} phish={phishScore} mlx_label={mlxLabel} action={action} malware={malwareName} sending_ip={sendingIp}`
+  → `data/staged/proofpoint_email.txt`
+- `zscaler_proxy` ← `zscaler_proxy.csv`:
+  `{timestamp} zscaler user={user} dept={department} loc={location} client_ip={clientip} server_ip={serverip} host={hostname} url={url} cat={urlcategory} action={action} method={requestmethod} status={responsecode} ctype={contenttype} ua="{useragent}" threat={threatname} rule={rulelabel} app={appname}`
+  → `data/staged/zscaler_proxy.txt`
+- `cloudtrail_synth` ← `aws_cloudtrail.csv`:
+  `{eventTime} {eventName} {eventSource} region={awsRegion} src_ip={sourceIPAddress} identity_type={userIdentity.type} principal={userIdentity.principalId} arn={userIdentity.arn} user={userIdentity.userName} agent="{userAgent}" err={errorCode} bucket={requestParameters.bucketName}`
+  → `data/staged/cloudtrail_synth.txt`
+
+## Wiring + acceptance (Batch 2)
+- Register all new corpora in `stage.py` and `manifest.py` so `MANIFEST.json` lists **all 19 corpora** (7 from Batch 1 + 12 here). `lamr-stage-corpora` prints the per-corpus line/skip/byte summary.
+- One `pytest` test per new adapter (tiny inline CSV/JSON fixture asserting the exact rendered line), ≥90% coverage on the adapters package, full suite green.
+- Same edge-case rules as Batch 1 (sanitize embedded newlines, collapse whitespace, utf-8, skip rows missing required columns, stream). The JSON helper additionally must not load the whole file.
