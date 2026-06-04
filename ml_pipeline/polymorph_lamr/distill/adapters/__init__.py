@@ -4,7 +4,18 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from . import alibaba_gpu, api_failures, cicd_failures, distsys_synth, win_events
+from . import (
+    alibaba_gpu,
+    api_failures,
+    cicd_failures,
+    cloudtrail_flaws,
+    distsys_synth,
+    python_tracebacks,
+    security_synth,
+    servicenow_itsm,
+    syslog_cremev2,
+    win_events,
+)
 
 if TYPE_CHECKING:
     from .stage import main, stage_all
@@ -13,7 +24,12 @@ __all__ = [
     "alibaba_gpu",
     "api_failures",
     "cicd_failures",
+    "cloudtrail_flaws",
     "distsys_synth",
+    "python_tracebacks",
+    "security_synth",
+    "servicenow_itsm",
+    "syslog_cremev2",
     "win_events",
     "main",
     "stage_all",
