@@ -11,3 +11,7 @@ ml_pipeline/**/*.egg-info/
 ml_pipeline/.pytest_cache/
 ml_pipeline/.coverage
 ml_pipeline/htmlcov/
+
+# datasets (large, fetched via scripts/fetch_datasets.sh) — track the card, not the corpora
+/data/*
+!/data/DATA_CARD.md
