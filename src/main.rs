@@ -16,6 +16,16 @@ fn main() -> Result<()> {
         return polymorph::selftest::run(&grammars_dir);
     }
 
+    if let Some(pos) = args.iter().position(|a| a == "--bench") {
+        let dir = args
+            .get(pos + 1)
+            .map(String::as_str)
+            .unwrap_or("data/raw");
+        let chunk_kb = args.get(pos + 2).and_then(|s| s.parse::<usize>().ok());
+        let max_mb = args.get(pos + 3).and_then(|s| s.parse::<usize>().ok());
+        return polymorph::bench::run(dir, chunk_kb, max_mb);
+    }
+
     let db_path = db::default_path()?;
     let db = db::open_pool(&db_path)?;
 

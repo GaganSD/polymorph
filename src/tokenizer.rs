@@ -9,6 +9,12 @@ fn bpe() -> Result<&'static CoreBPE> {
         .map_err(|e| anyhow!("failed to load cl100k_base: {e}"))
 }
 
+/// Count cl100k tokens in `text` without the byte-span reconstruction work.
+/// Used on hot paths (benchmarking) that only need a token count, not spans.
+pub fn count_tokens(text: &str) -> Result<usize> {
+    Ok(bpe()?.encode_ordinary(text).len())
+}
+
 /// Tokenize `text` and return both the token ID stream and a parallel array of
 /// (start_byte, end_byte) spans into the original input.
 ///
@@ -41,6 +47,14 @@ pub fn token_spans(text: &str) -> Result<(Vec<u32>, Vec<(usize, usize)>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn count_tokens_matches_span_count() {
+        let s = "hello world, this is a test";
+        let (ids, _) = token_spans(s).unwrap();
+        assert_eq!(count_tokens(s).unwrap(), ids.len());
+        assert_eq!(count_tokens("").unwrap(), 0);
+    }
 
     #[test]
     fn token_spans_round_trip_simple() {

@@ -1,7 +1,9 @@
 pub mod ast;
+pub mod bench;
 pub mod ccr;
 pub mod daac;
 pub mod db;
+pub mod dedup;
 pub mod demo;
 pub mod io_guard;
 pub mod lamr;
@@ -83,12 +85,22 @@ pub fn resolve_grammars_dir() -> std::path::PathBuf {
     std::path::PathBuf::from("grammars")
 }
 
-pub fn lock_payload(
+/// Shared structural-locking core: tokenize, scan keywords (DAAC), extract AST
+/// intervals, and intersect them into the per-token lock mask. Both
+/// `lock_payload` (mock pruner on) and `compress_deterministic` (pruner off)
+/// build on this, so the masking logic lives in one place.
+fn lock_core(
     text: &str,
     language: Language,
     keywords: &[String],
     grammars_dir: &std::path::Path,
-) -> anyhow::Result<LockResult> {
+) -> anyhow::Result<(
+    Vec<u32>,
+    Vec<(usize, usize)>,
+    Vec<(usize, usize)>,
+    Vec<(usize, usize)>,
+    Vec<bool>,
+)> {
     let (token_ids, token_spans) = tokenizer::token_spans(text)?;
     let mut scanner = daac::DaacScanner::build(keywords)?;
     let daac_token_intervals = scanner.scan(&token_ids);
@@ -99,8 +111,51 @@ pub fn lock_payload(
         &ast_intervals,
         &daac_token_intervals,
     );
+    Ok((
+        token_ids,
+        token_spans,
+        ast_intervals,
+        daac_token_intervals,
+        mask,
+    ))
+}
+
+pub fn lock_payload(
+    text: &str,
+    language: Language,
+    keywords: &[String],
+    grammars_dir: &std::path::Path,
+) -> anyhow::Result<LockResult> {
+    let (token_ids, token_spans, ast_intervals, daac_token_intervals, mask) =
+        lock_core(text, language, keywords, grammars_dir)?;
     let drop_mask = lamr::apply_lamr(&token_ids, &mask);
     let kept_tokens = drop_mask.iter().filter(|&&d| !d).count();
+    Ok(LockResult {
+        token_ids,
+        token_spans,
+        ast_intervals,
+        daac_token_intervals,
+        mask,
+        drop_mask,
+        kept_tokens,
+    })
+}
+
+/// Deterministic-only locking with the pruner OFF (Identity). `drop_mask` is
+/// all-`false`, so the only compression reflected here is structural locking
+/// (plus whatever upstream dedup/CCR already removed) — never the random mock
+/// drops. This is what the benchmark and the deterministic baseline measure;
+/// the full pluggable pruner seam (Identity/Mock/ONNX) is deferred (see TODOS.md).
+pub fn compress_deterministic(
+    text: &str,
+    language: Language,
+    keywords: &[String],
+    grammars_dir: &std::path::Path,
+) -> anyhow::Result<LockResult> {
+    let (token_ids, token_spans, ast_intervals, daac_token_intervals, mask) =
+        lock_core(text, language, keywords, grammars_dir)?;
+    let kept_tokens = token_ids.len();
+    let drop_mask = vec![false; mask.len()];
     Ok(LockResult {
         token_ids,
         token_spans,
@@ -149,6 +204,14 @@ mod tests {
         let res = lock_payload(r#"{"a":1}"#, Language::Json, &[], &dir).unwrap();
         assert_eq!(res.mask.len(), res.token_spans.len());
         assert_eq!(res.token_ids.len(), res.mask.len());
+    }
+
+    #[test]
+    fn compress_deterministic_drops_nothing() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("grammars");
+        let res = compress_deterministic(r#"{"a":1,"b":2}"#, Language::Json, &[], &dir).unwrap();
+        assert!(res.drop_mask.iter().all(|&d| !d), "Identity pruner drops nothing");
+        assert_eq!(res.kept_tokens, res.token_ids.len());
     }
 
     #[test]

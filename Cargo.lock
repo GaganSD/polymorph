@@ -908,6 +908,7 @@ dependencies = [
  "pretty_assertions",
  "rand",
  "rand_chacha",
+ "regex",
  "rmcp",
  "rusqlite",
  "schemars",
