@@ -138,10 +138,10 @@ def test_default_teachers_routing():
     assert ts["deepseek-v32"].model == "bedrock/deepseek.v3.2"
     assert ts["deepseek-v32"].api_base is None
     assert ts["deepseek-v32"].api_key_env is None
-    # kimi routes through OpenRouter (litellm-native, no custom base)
-    assert ts["kimi"].model.startswith("openrouter/")
-    assert ts["kimi"].api_base is None
-    assert ts["kimi"].api_key_env == "OPENROUTER_API_KEY"
+    # llama-33-70b is the 2nd teacher, also via AWS Bedrock (no key, AWS chain)
+    assert ts["llama-33-70b"].model == "bedrock/us.meta.llama3-3-70b-instruct-v1:0"
+    assert ts["llama-33-70b"].api_base is None
+    assert ts["llama-33-70b"].api_key_env is None
 
 
 # ----- run_distill helpers + pair mode --------------------------------------
@@ -151,10 +151,12 @@ def test_parse_teachers():
     from polymorph_lamr.distill.run_distill import _parse_teachers
 
     assert _parse_teachers(None)  # falls back to defaults
-    specs = _parse_teachers(["qwen=openrouter/qwen/q", "openrouter/x/y"])
-    assert specs[0].name == "qwen" and specs[0].model == "openrouter/qwen/q"
-    assert specs[0].api_key_env == "OPENROUTER_API_KEY"
-    assert specs[1].name == "y" and specs[1].model == "openrouter/x/y"
+    specs = _parse_teachers(["ds=bedrock/deepseek.v3.2", "vendor/passthrough-model"])
+    assert specs[0].name == "ds" and specs[0].model == "bedrock/deepseek.v3.2"
+    assert specs[0].api_key_env is None  # Bedrock uses the AWS credential chain
+    # a bare spec takes its last path segment as the label; unknown prefixes pass through
+    assert specs[1].name == "passthrough-model" and specs[1].model == "vendor/passthrough-model"
+    assert specs[1].api_key_env is None
 
 
 def test_parse_teachers_vercel_guard():
@@ -184,17 +186,18 @@ def test_run_distill_pair_mode(monkeypatch, tmp_path):
 
 def test_run_distill_ensemble_warns_without_key(monkeypatch, tmp_path, capsys):
     _fake_litellm(monkeypatch)
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("VERCEL_AI_GATEWAY_KEY", raising=False)
     from polymorph_lamr.distill.run_distill import main
 
     src = tmp_path / "s"
     src.mkdir()
     (src / "a.log").write_text("svc up\nsvc up\nsvc up\nsvc up\n")
     out = tmp_path / "o.jsonl"
+    # the (legacy) Vercel teacher needs VERCEL_AI_GATEWAY_KEY; absent -> warn, not fatal
     rc = main(["--in", str(src), "--out", str(out),
-               "--teachers", "a=openrouter/x/y", "--max-tokens", "32"])
+               "--teachers", "q=vercel/alibaba/qwen3.7-max", "--max-tokens", "32"])
     assert rc == 0
-    assert "OPENROUTER_API_KEY" in capsys.readouterr().err
+    assert "VERCEL_AI_GATEWAY_KEY" in capsys.readouterr().err
 
 
 # ----- chunker log mode -----------------------------------------------------
@@ -241,12 +244,14 @@ def test_resolve_routing_vercel_guard_rejects_other_models():
         resolve_routing("vercel/alibaba/qwen-2.5-72b-instruct")
 
 
-def test_resolve_routing_openrouter_and_passthrough():
+def test_resolve_routing_passthrough():
     from polymorph_lamr.distill.providers import resolve_routing
 
+    # OpenRouter was removed — an openrouter/ spec is no longer special-cased; it
+    # passes through unchanged (no api_key_env), like any other unknown prefix.
     r = resolve_routing("openrouter/moonshotai/kimi-k2.6:free")
     assert r.model == "openrouter/moonshotai/kimi-k2.6:free"
-    assert r.api_base is None and r.api_key_env == "OPENROUTER_API_KEY"
+    assert r.api_base is None and r.api_key_env is None
 
     p = resolve_routing("anthropic/claude-3-5-sonnet-latest")
     assert p.model == "anthropic/claude-3-5-sonnet-latest"

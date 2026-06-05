@@ -1,25 +1,23 @@
 """Provider routing for distillation teachers.
 
-Three providers are wired for the open-weight teacher ensemble (E3):
+Teachers run entirely on **AWS Bedrock** (the Vercel gateway is retained only as a
+legacy, strict-guarded escape hatch). OpenRouter was removed — the free pool was
+unreliable (persistent HTTP 429), and two strong Bedrock teachers give better,
+more dependable labels.
 
 * **AWS Bedrock** — litellm-native (`bedrock/<model>`), routed through the Bedrock
   Converse API. Credentials come from the standard AWS chain (env / profile / SSO
   login provider — the last needs ``botocore[crt]``). No API key env; the region
-  is resolved from ``AWS_REGION`` / ``AWS_DEFAULT_REGION`` (DeepSeek V3.2 is
-  ON_DEMAND in us-east-1, us-west-2, eu-north-1). This is the **primary teacher**
-  (`deepseek.v3.2`): strong, cheap (~17x cheaper than the old Vercel path), no
-  reasoning-token overhead.
-* **OpenRouter** — litellm-native (`openrouter/<vendor>/<model>`); key from
-  ``OPENROUTER_API_KEY``. Free open-weight teachers (e.g. Kimi). Free models share
-  an upstream pool and are frequently rate-limited (HTTP 429); the ensemble
-  tolerates this — a teacher that errors is dropped from per-chunk best-QC
-  selection. Kept as a zero-cost opportunistic secondary.
+  is resolved from ``AWS_REGION`` / ``AWS_DEFAULT_REGION``. The default ensemble is
+  two Bedrock teachers — `deepseek.v3.2` and `minimax.minimax-m2.1` — both ON_DEMAND
+  in us-east-1, us-west-2, eu-north-1; best-QC selection picks the better label per
+  chunk.
 * **Vercel AI Gateway** — an OpenAI-compatible endpoint (`vercel/<model>`), key
-  from ``VERCEL_AI_GATEWAY_KEY``. No longer a default teacher (superseded by
-  Bedrock) but retained as a routable option. STRICT RULE: the ONLY model
-  permitted through the Vercel gateway is ``alibaba/qwen3.7-max`` — any other is a
-  hard error at teacher-construction time, so a typo can never silently route or
-  bill a disallowed gateway model.
+  from ``VERCEL_AI_GATEWAY_KEY``. Not a default teacher (superseded by Bedrock) but
+  retained as a routable option. STRICT RULE: the ONLY model permitted through the
+  Vercel gateway is ``alibaba/qwen3.7-max`` — any other is a hard error at
+  teacher-construction time, so a typo can never silently route or bill a
+  disallowed gateway model.
 """
 
 from __future__ import annotations
@@ -36,12 +34,9 @@ VERCEL_AI_GATEWAY_KEY_ENV = "VERCEL_AI_GATEWAY_KEY"
 # The ONLY model allowed through the Vercel AI Gateway (project rule).
 VERCEL_ALLOWED_MODEL = "alibaba/qwen3.7-max"
 
-OPENROUTER_KEY_ENV = "OPENROUTER_API_KEY"
-
 # Spec-string prefixes the CLI/config accept.
 _BEDROCK_PREFIX = "bedrock/"
 _VERCEL_PREFIX = "vercel/"
-_OPENROUTER_PREFIX = "openrouter/"
 
 
 def bedrock_region() -> str | None:
@@ -81,7 +76,6 @@ def resolve_routing(spec_model: str) -> Routing:
     * ``vercel/<model>``   -> Vercel AI Gateway (OpenAI-compatible); STRICT-guarded
       to ``alibaba/qwen3.7-max`` only. The litellm id becomes ``openai/<model>``
       so litellm hits the custom ``api_base`` instead of api.openai.com.
-    * ``openrouter/<...>`` -> OpenRouter (litellm-native), key ``OPENROUTER_API_KEY``.
     * anything else        -> passed through unchanged; litellm uses its default
       provider/credential resolution.
     """
@@ -104,16 +98,17 @@ def resolve_routing(spec_model: str) -> Routing:
             api_base=VERCEL_AI_GATEWAY_BASE,
             api_key_env=VERCEL_AI_GATEWAY_KEY_ENV,
         )
-    if spec_model.startswith(_OPENROUTER_PREFIX):
-        return Routing(model=spec_model, api_base=None, api_key_env=OPENROUTER_KEY_ENV)
     return Routing(model=spec_model, api_base=None, api_key_env=None)
 
 
-# Default open-weight teacher ensemble. deepseek-v32 (Bedrock) is the reliable,
-# cheap workhorse; kimi (OpenRouter free) contributes opportunistically at zero
-# cost when the free pool has capacity. Order is not significant — best-QC
-# selection is per chunk.
+# Default teacher ensemble — two strong, NON-REASONING Bedrock open-weight models.
+# Both emit direct extractive output (no chain-of-thought overhead) and are
+# reliable pay-per-token endpoints; best-QC selection picks the better label per
+# chunk. (MiniMax M2.1 was evaluated and rejected: as a reasoning model it burns
+# the entire output budget on chain-of-thought and returns empty compressions for
+# this extractive task. Llama-3.3-70B is invoked via its us cross-region inference
+# profile.) Order is not significant — selection is per chunk.
 DEFAULT_TEACHER_SPECS: list[tuple[str, str]] = [
     ("deepseek-v32", "bedrock/deepseek.v3.2"),
-    ("kimi", "openrouter/moonshotai/kimi-k2.6:free"),
+    ("llama-33-70b", "bedrock/us.meta.llama3-3-70b-instruct-v1:0"),
 ]

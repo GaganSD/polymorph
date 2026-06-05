@@ -8,13 +8,12 @@ distill:
   # Open-weight teacher ensemble (E3), provider-prefixed (see distill/providers.py).
   # Per-chunk best-QC output (VR==0, lowest AG) is kept as the training target.
   #   bedrock/<model>    -> AWS Bedrock        (AWS credential chain + AWS_REGION)
-  #   openrouter/<model> -> OpenRouter         (needs OPENROUTER_API_KEY)
   #   vercel/<model>     -> Vercel AI Gateway  (needs VERCEL_AI_GATEWAY_KEY;
   #                         STRICT: only alibaba/qwen3.7-max permitted) [legacy]
-  # A teacher missing its key / rate-limited is dropped from selection, not fatal.
+  # A teacher that errors / is throttled is dropped from per-chunk selection, not fatal.
   teachers:
-    deepseek-v32: bedrock/deepseek.v3.2   # primary: strong, cheap, ON_DEMAND
-    kimi: openrouter/moonshotai/kimi-k2.6:free   # free opportunistic secondary
+    deepseek-v32: bedrock/deepseek.v3.2          # strong, cheap, ON_DEMAND
+    minimax-m21: bedrock/minimax.minimax-m2.1    # 2nd Bedrock teacher (best-QC pick)
   # legacy pair-mode models (only used with mode: pair)
   pair_models:
     max_compression: anthropic/claude-3-5-sonnet-latest

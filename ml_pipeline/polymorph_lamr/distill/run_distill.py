@@ -1,25 +1,26 @@
 """CLI: distill a directory tree of logs/traces into JSONL training pairs.
 
-Primary path is the open-weight multi-teacher ENSEMBLE (E3): each chunk is
-compressed by several teachers and the best-QC output is kept as the training
-target. Default teachers (see `providers.py`):
+Primary path is the multi-teacher ENSEMBLE (E3): each chunk is compressed by
+several teachers and the best-QC output is kept as the training target. Default
+teachers are two AWS Bedrock open-weight models (see `providers.py`):
 
-* deepseek-v32 via AWS Bedrock  -> AWS credential chain + AWS_REGION
-* kimi-k2.6:free via OpenRouter  -> needs OPENROUTER_API_KEY
+* deepseek-v32  via AWS Bedrock  -> AWS credential chain + AWS_REGION
+* minimax-m21   via AWS Bedrock  -> AWS credential chain + AWS_REGION
 
-    AWS_REGION=us-east-1 OPENROUTER_API_KEY=sk-or-... \
+    AWS_REGION=eu-north-1 \
         python -m polymorph_lamr.distill.run_distill \
-        --in data/raw --out data/distilled.jsonl --concurrency 8
+        --sampled data/sampled/v0_input.jsonl --out data/distilled/v0.jsonl --concurrency 8
 
-A teacher missing its key (or rate-limited) is dropped from per-chunk selection
-rather than failing the run. A legacy two-teacher (Claude + GPT-4o) mode is kept
-for back-compat: --mode pair.
+A teacher that errors (or is throttled) is dropped from per-chunk best-QC
+selection rather than failing the run. A legacy two-teacher (Claude + GPT-4o)
+mode is kept for back-compat: --mode pair.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import sys
 from pathlib import Path
@@ -66,11 +67,37 @@ def _load_items(files: list[Path], max_tokens: int) -> list[tuple[str, str, int]
     return items
 
 
+def _load_sampled(path: Path) -> list[tuple[str, str, int]]:
+    """Load pre-chunked items from a sampler JSONL (see ``distill.sampler``).
+
+    Each line is ``{"corpus","src_path","chunk_id","text"}``. The sampler has
+    already deduped, trash-filtered, chunked and format-balanced the corpora, so
+    its chunks feed straight through as ``(text, src, idx)`` — no file walking or
+    re-chunking. ``src`` carries the corpus name so per-chunk warnings/output stay
+    traceable to a format.
+    """
+    items: list[tuple[str, str, int]] = []
+    with path.open(encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            text = rec.get("text")
+            if not text:
+                continue
+            corpus = rec.get("corpus") or ""
+            src_path = rec.get("src_path") or corpus or str(path)
+            src = f"{corpus}:{src_path}" if corpus else src_path
+            items.append((text, src, int(rec.get("chunk_id", 0))))
+    return items
+
+
 def _parse_teachers(specs: list[str] | None) -> list[TeacherSpec]:
     """Parse `--teachers name=spec` entries into routed TeacherSpecs.
 
     The spec is provider-prefixed and routed via `TeacherSpec.from_spec`, e.g.
-    `--teachers qwen3=vercel/alibaba/qwen3.7-max kimi=openrouter/moonshotai/kimi-k2.6:free`.
+    `--teachers deepseek-v32=bedrock/deepseek.v3.2 minimax-m21=bedrock/minimax.minimax-m2.1`.
     A bare spec (no `=`) takes its last path segment as the label.
     """
     if not specs:
@@ -86,86 +113,105 @@ def _parse_teachers(specs: list[str] | None) -> list[TeacherSpec]:
 
 
 async def _run(args: argparse.Namespace) -> int:
-    files = _iter_files(Path(args.input), set(args.exts))
-    items = _load_items(files, max_tokens=args.max_tokens)
+    if args.sampled:
+        items = _load_sampled(Path(args.sampled))
+        source_desc = f"sampler JSONL {args.sampled}"
+    elif args.input:
+        files = _iter_files(Path(args.input), set(args.exts))
+        items = _load_items(files, max_tokens=args.max_tokens)
+        source_desc = f"{len(files)} files"
+    else:
+        print("provide either --sampled <jsonl> or --in <dir/file>", file=sys.stderr)
+        return 1
     if not items:
         print("no items found", file=sys.stderr)
         return 1
     if args.limit and args.limit > 0:
-        # Cap chunks for smoke runs / rate-limited free tiers (e.g. OpenRouter
-        # free models). Deterministic prefix — items are file/chunk-ordered.
+        # Cap chunks for smoke runs (cheap live-path validation before a full
+        # build). Deterministic prefix — items are file/chunk-ordered.
         items = items[: args.limit]
 
-    results: list = []
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    n = 0
     total_cost = 0.0
 
-    if args.mode == "ensemble":
-        teachers = _parse_teachers(args.teachers)
-        missing = sorted(
-            {
-                t.api_key_env
-                for t in teachers
-                if t.api_key_env and not os.environ.get(t.api_key_env)
-            }
-        )
-        if missing:
-            print(
-                f"[warn] missing API key(s) {', '.join(missing)}; the teacher(s) "
-                "needing them will error and be dropped from best-QC selection. "
-                "Export them before a real run.",
-                file=sys.stderr,
+    # Stream results to disk incrementally (flush every 25) so a long, paid build
+    # is crash-safe: a failure loses at most the last unflushed batch, not hours.
+    with out_path.open("w", encoding="utf-8") as out_fh:
+        if args.mode == "ensemble":
+            teachers = _parse_teachers(args.teachers)
+            missing = sorted(
+                {
+                    t.api_key_env
+                    for t in teachers
+                    if t.api_key_env and not os.environ.get(t.api_key_env)
+                }
             )
-        cfg = EnsembleConfig(
-            teachers=teachers,
-            prompt_template=LOG_TRACE_EXTRACTIVE,
-            num_retries=args.retries,
-            request_timeout_s=args.timeout,
-            max_tokens=args.output_max_tokens,
-            temperature=args.temperature,
-            failure_policy=args.failure_policy,
-        )
-        print(
-            f"distilling {len(items)} chunks from {len(files)} files via "
-            f"{len(teachers)} teachers "
-            f"({', '.join(t.name for t in teachers)}); concurrency={args.concurrency}"
-        )
-        async for r in distill_ensemble_many(items, cfg=cfg, concurrency=args.concurrency):
-            results.append(r)
-            total_cost += r.cost_usd
-            if r.errors:
-                print(f"[warn] {r.src_path}#{r.chunk_id}: {r.errors}", file=sys.stderr)
-            if len(results) % 25 == 0:
-                print(f"  progress: {len(results)}/{len(items)} cost=${total_cost:.4f}")
-    else:  # legacy pair
-        cfg = DistillConfig(
-            claude_model=args.claude_model,
-            gpt_model=args.gpt_model,
-            num_retries=args.retries,
-            request_timeout_s=args.timeout,
-            max_tokens=args.output_max_tokens,
-            temperature=args.temperature,
-            failure_policy=args.failure_policy,
-        )
-        print(f"distilling {len(items)} chunks (pair mode) from {len(files)} files")
-        async for r in distill_many(items, cfg=cfg, concurrency=args.concurrency):
-            results.append(r)
-            total_cost += r.cost_usd
-            if r.errors:
-                print(f"[warn] {r.src_path}#{r.chunk_id} errors: {r.errors}", file=sys.stderr)
+            if missing:
+                print(
+                    f"[warn] missing API key(s) {', '.join(missing)}; the teacher(s) "
+                    "needing them will error and be dropped from best-QC selection. "
+                    "Export them before a real run.",
+                    file=sys.stderr,
+                )
+            cfg = EnsembleConfig(
+                teachers=teachers,
+                prompt_template=LOG_TRACE_EXTRACTIVE,
+                num_retries=args.retries,
+                request_timeout_s=args.timeout,
+                max_tokens=args.output_max_tokens,
+                temperature=args.temperature,
+                failure_policy=args.failure_policy,
+            )
+            print(
+                f"distilling {len(items)} chunks from {source_desc} via "
+                f"{len(teachers)} teachers "
+                f"({', '.join(t.name for t in teachers)}); concurrency={args.concurrency}"
+            )
+            async for r in distill_ensemble_many(items, cfg=cfg, concurrency=args.concurrency):
+                out_fh.write(r.to_json() + "\n")
+                n += 1
+                total_cost += r.cost_usd
+                if r.errors:
+                    print(f"[warn] {r.src_path}#{r.chunk_id}: {r.errors}", file=sys.stderr)
+                if n % 25 == 0:
+                    out_fh.flush()
+                    print(f"  progress: {n}/{len(items)} cost=${total_cost:.4f}")
+        else:  # legacy pair
+            cfg = DistillConfig(
+                claude_model=args.claude_model,
+                gpt_model=args.gpt_model,
+                num_retries=args.retries,
+                request_timeout_s=args.timeout,
+                max_tokens=args.output_max_tokens,
+                temperature=args.temperature,
+                failure_policy=args.failure_policy,
+            )
+            print(f"distilling {len(items)} chunks (pair mode) from {source_desc}")
+            async for r in distill_many(items, cfg=cfg, concurrency=args.concurrency):
+                out_fh.write(r.to_json() + "\n")
+                n += 1
+                total_cost += r.cost_usd
+                if r.errors:
+                    print(f"[warn] {r.src_path}#{r.chunk_id} errors: {r.errors}", file=sys.stderr)
 
-    write_jsonl(results, Path(args.output))
-    print(f"wrote {len(results)} records to {args.output} (cost ${total_cost:.4f})")
+    print(f"wrote {n} records to {args.output} (cost ${total_cost:.4f})")
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Distill logs/traces into compressed training pairs.")
-    p.add_argument("--in", dest="input", required=True, help="source file or directory")
+    p.add_argument("--in", dest="input", default=None,
+                   help="source file or directory (walked + chunked); omit when using --sampled")
+    p.add_argument("--sampled", default=None,
+                   help="consume a pre-chunked sampler JSONL ({corpus,src_path,chunk_id,text}) "
+                        "from distill.sampler instead of walking --in")
     p.add_argument("--out", dest="output", required=True, help="output JSONL path")
     p.add_argument("--mode", choices=["ensemble", "pair"], default="ensemble",
                    help="ensemble = open-weight teachers (default); pair = legacy Claude+GPT-4o")
     p.add_argument("--teachers", nargs="*", default=None,
-                   help="ensemble teachers as name=spec (default: deepseek-v32 Bedrock + kimi OpenRouter)")
+                   help="ensemble teachers as name=spec (default: deepseek-v32 + minimax-m21, both Bedrock)")
     p.add_argument("--concurrency", type=int, default=8)
     p.add_argument("--limit", type=int, default=0,
                    help="cap number of chunks (0 = all); use for smoke runs and rate-limited free tiers")
