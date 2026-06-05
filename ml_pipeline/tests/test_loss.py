@@ -1,4 +1,4 @@
-"""joint_loss returns the single blended-CRF objective the model trains (post-C1)."""
+"""joint_loss returns the single-CRF per-token objective the model trains."""
 
 import torch
 
@@ -6,12 +6,9 @@ from polymorph_lamr.model.lamr import LaMRConfig, LaMRModel
 from polymorph_lamr.train.loss import joint_loss
 
 
-def test_joint_loss_returns_blended_crf_nll():
-    """The trained objective is the NLL of the blended CRF that inference decodes
-    — NOT a sum of the two per-head NLLs. Blending happens inside one CRF
-    partition (non-linear in the per-head NLLs), so the two are different
-    quantities; conflating them was the C1 train/infer mismatch.
-    """
+def test_joint_loss_returns_single_crf_nll():
+    """The wrapper returns the model's trained objective: the per-token NLL of the
+    single linear-chain CRF (the same CRF inference decodes)."""
     cfg = LaMRConfig(
         vocab_size=64,
         d_model=16,
@@ -29,20 +26,8 @@ def test_joint_loss_returns_blended_crf_nll():
     tags = torch.zeros((b, t), dtype=torch.long)
 
     out = model.joint_nll(ids, mask, tags)
-
-    # The wrapper returns the model's single trained objective.
     assert torch.equal(joint_loss(out), out["loss"])
 
-    # That objective is exactly the blended-CRF NLL (train == infer).
-    sem, dep, hw = model(ids, mask)
-    params = model.weighted_crf_parameters(sem, dep, hw)
-    expected = model.crf_semantic.nll_with_params(
-        params["emissions"],
-        tags,
-        mask,
-        params["transitions"],
-        params["start_transitions"],
-        params["end_transitions"],
-        reduction="token_mean",
-    )
+    emissions = model(ids, mask)
+    expected = model.crf.nll(emissions, tags, mask, reduction="token_mean")
     assert torch.isclose(out["loss"], expected, atol=1e-5)

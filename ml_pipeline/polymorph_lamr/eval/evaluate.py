@@ -43,21 +43,10 @@ def evaluate(model: LaMRModel, loader: DataLoader, device: torch.device, max_bat
         mask = batch["attention_mask"].to(device)
         tags = batch["tags"].to(device)
 
-        emi_sem, emi_dep, head_weights = model(ids, mask)
-        params = model.weighted_crf_parameters(emi_sem, emi_dep, head_weights)
-        preds = model.crf_semantic.decode_with_params(
-            emissions=params["emissions"],
-            mask=mask,
-            transitions=params["transitions"],
-            start_transitions=params["start_transitions"],
-            end_transitions=params["end_transitions"],
-        )
-        # Per-token NLL of the blended CRF (the clean, length-invariant loss).
-        nll_vec = model.crf_semantic.nll_with_params(
-            params["emissions"], tags, mask,
-            params["transitions"], params["start_transitions"], params["end_transitions"],
-            reduction="none",
-        )
+        emissions = model(ids, mask)
+        preds = model.crf.decode(emissions, mask)
+        # Per-token NLL of the CRF (the clean, length-invariant loss).
+        nll_vec = model.crf.nll(emissions, tags, mask, reduction="none")
         lens = mask.long().sum(dim=1)
         nll_sum += float(nll_vec.sum().item())
         tok_sum += int(lens.sum().item())

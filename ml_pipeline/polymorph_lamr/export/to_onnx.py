@@ -2,8 +2,8 @@
 
 Output layout:
     <out_dir>/
-        model.onnx          # backbone + head gate + two emission heads
-        transitions.npz     # {sem_trans, sem_start, sem_end, dep_trans, dep_start, dep_end}
+        model.onnx          # backbone + one emission head
+        transitions.npz     # {trans, start, end}
         transitions.json    # same keys/shapes as the .npz, plain JSON for the Rust runtime
         config.yaml         # mirrors the training config (for reproducibility)
         README.md           # how the Rust side loads this artifact
@@ -12,10 +12,10 @@ Output layout:
 The Rust runtime is expected to:
     1. Load model.onnx via tract or ort.
     2. Run the model over the FULL token sequence (matching how training tags
-       every token of the chunk).
-    3. Combine semantic/dependency emissions and CRF params with head_weights.
-    4. Run one Viterbi decode using the weighted CRF.
-    5. Map decoded tag-1 positions onto a full-length drop_mask, then force-keep
+       every token of the chunk) to get the `emissions` tensor.
+    3. Run one linear-chain Viterbi decode using `emissions` + the trans/start/end
+       params from transitions.json.
+    4. Map decoded tag-1 positions onto a full-length drop_mask, then force-keep
        locked positions (see enforce_lock_invariant in src/lamr.rs).
 """
 
@@ -76,22 +76,18 @@ def export(
     onnx_path = out_dir / "model.onnx"
     _export_static_graph(core, dummy_ids, dummy_mask, onnx_path, opset, prefer_dynamo=True)
 
-    # Transitions side-car.
-    sem = model.crf_semantic
-    dep = model.crf_dependency
+    # Transitions side-car (single CRF).
+    crf = model.crf
     transitions = {
-        "sem_trans": sem.transitions.detach().cpu().numpy(),
-        "sem_start": sem.start_transitions.detach().cpu().numpy(),
-        "sem_end": sem.end_transitions.detach().cpu().numpy(),
-        "dep_trans": dep.transitions.detach().cpu().numpy(),
-        "dep_start": dep.start_transitions.detach().cpu().numpy(),
-        "dep_end": dep.end_transitions.detach().cpu().numpy(),
+        "trans": crf.transitions.detach().cpu().numpy(),
+        "start": crf.start_transitions.detach().cpu().numpy(),
+        "end": crf.end_transitions.detach().cpu().numpy(),
     }
     np.savez(out_dir / "transitions.npz", **transitions)
     # Plain-JSON mirror of the .npz so the Rust runtime can parse the CRF
     # params with serde_json instead of pulling in an npz/zip-of-npy reader.
-    # Keys + shapes match transitions.npz exactly: *_trans are (2, 2) row-major
-    # where trans[i][j] = score(tag i -> tag j); *_start / *_end are length-2.
+    # Keys + shapes match transitions.npz exactly: `trans` is (2, 2) row-major
+    # where trans[i][j] = score(tag i -> tag j); `start` / `end` are length-2.
     (out_dir / "transitions.json").write_text(
         json.dumps({k: v.astype(float).tolist() for k, v in transitions.items()}, indent=2)
     )
@@ -128,13 +124,11 @@ def _export_static_graph(
 ) -> None:
     names = {
         "input_names": ["input_ids", "attention_mask"],
-        "output_names": ["emissions_sem", "emissions_dep", "head_weights"],
+        "output_names": ["emissions"],
         "dynamic_axes": {
             "input_ids": {0: "batch", 1: "seq"},
             "attention_mask": {0: "batch", 1: "seq"},
-            "emissions_sem": {0: "batch", 1: "seq"},
-            "emissions_dep": {0: "batch", 1: "seq"},
-            "head_weights": {0: "batch"},
+            "emissions": {0: "batch", 1: "seq"},
         },
         "opset_version": opset,
         "do_constant_folding": True,
@@ -164,27 +158,21 @@ def _check_parity(core: torch.nn.Module, sess, cfg: LaMRConfig, parity_seq_len: 
         (1, max(1, parity_seq_len // 2 + 1)),
         (2, max(2, min(parity_seq_len, 7))),
     ]
-    max_sem = 0.0
-    max_dep = 0.0
-    max_gate = 0.0
+    max_emi = 0.0
     for b, t in shapes:
         ids = torch.randint(0, cfg.vocab_size, (b, t), dtype=torch.long)
         mask = torch.ones((b, t), dtype=torch.bool)
         if t > 2:
             mask[-1, -1] = False
         with torch.no_grad():
-            torch_sem, torch_dep, torch_gate = core(ids, mask)
-        onnx_sem, onnx_dep, onnx_gate = sess.run(
-            ["emissions_sem", "emissions_dep", "head_weights"],
+            torch_emi = core(ids, mask)
+        (onnx_emi,) = sess.run(
+            ["emissions"],
             {"input_ids": ids.numpy(), "attention_mask": mask.numpy()},
         )
-        max_sem = max(max_sem, float(np.max(np.abs(torch_sem.numpy() - onnx_sem))))
-        max_dep = max(max_dep, float(np.max(np.abs(torch_dep.numpy() - onnx_dep))))
-        max_gate = max(max_gate, float(np.max(np.abs(torch_gate.numpy() - onnx_gate))))
+        max_emi = max(max_emi, float(np.max(np.abs(torch_emi.numpy() - onnx_emi))))
     return {
-        "max_abs_diff_sem": max_sem,
-        "max_abs_diff_dep": max_dep,
-        "max_abs_diff_head_weights": max_gate,
+        "max_abs_diff_emissions": max_emi,
         "checked_shapes": len(shapes),
     }
 
@@ -195,8 +183,8 @@ def _write_readme(out_dir: Path, cfg: LaMRConfig) -> None:
 Inference pipeline for Polymorph's Rust MCP runtime.
 
 ## Files
-- `model.onnx` — backbone + semantic/dependency head gate + 2 emission heads.
-- `transitions.npz` — CRF transitions per head (`{{sem,dep}}_{{trans,start,end}}`).
+- `model.onnx` — backbone + one emission head.
+- `transitions.npz` — CRF transitions (`trans`, `start`, `end`).
 - `transitions.json` — same keys/shapes as the `.npz`, plain JSON for the Rust runtime (no npz parser needed).
 - `config.yaml` — model architecture (must match the training run).
 - `parity.json` — max-abs diff between torch and onnxruntime at export time.
@@ -204,18 +192,15 @@ Inference pipeline for Polymorph's Rust MCP runtime.
 ## Inputs / outputs
 - input_ids: (B, T) int64, cl100k_base token ids
 - attention_mask: (B, T) bool
-- emissions_sem / emissions_dep: (B, T, 2) float, log-emissions for tags {{0: keep, 1: drop}}
-- head_weights: (B, 2) float, softmax weights for semantic and dependency CRFs
+- emissions: (B, T, 2) float, log-emissions for tags {{0: keep, 1: drop}}
 
 ## Decode (Rust side)
 0. Run the model over the FULL token sequence (matching training; locked tokens
    are NOT removed before the model — they are force-kept afterwards).
-1. Run ONNX session → 2 emission tensors + `head_weights`.
-2. Build one CRF per sequence:
-   `weighted = head_weights[0] * semantic + head_weights[1] * dependency`
-   for emissions, transitions, start transitions, and end transitions.
-3. Run one Viterbi decode over the weighted CRF.
-4. Map tag=1 decisions onto a full-length `drop_mask`, then force-keep locked
+1. Run ONNX session → the `emissions` tensor (B, T, 2).
+2. Run one linear-chain Viterbi decode using `emissions` + the `trans`/`start`/`end`
+   transition params from `transitions.json`.
+3. Map tag=1 decisions onto a full-length `drop_mask`, then force-keep locked
    positions (always `false`) via `enforce_lock_invariant` (see `src/lamr.rs`).
 
 ## Model config

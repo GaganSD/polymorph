@@ -1,8 +1,13 @@
-"""Full LaMR model: backbone + head gate + two emission heads + two CRFs.
+"""Full LaMR model: backbone + one emission head + one linear-chain CRF.
 
-The forward pass returns emissions and head weights. The CRFs live alongside so
-they can be trained jointly, but ONNX export will only graph the backbone, gate,
-and emission heads. Transitions ship as a side-car .npz at export time.
+The forward pass returns per-token tag emissions; ONNX export graphs the backbone
++ head, and the CRF transitions ship as a side-car at export time.
+
+An earlier design had two emission heads + a gate that blended them into one CRF.
+It was removed: the signal that would differentiate the two heads — the AST
+per-token weights — was never wired into the loss (reserved), so the gate added
+training instability (it oscillated between keep-all and over-drop) for no
+benefit. Re-introduce a dual head as v1 if/when those weights drive the loss.
 """
 
 from __future__ import annotations
@@ -14,7 +19,6 @@ import torch.nn as nn
 
 from .backbone import GatedDeltaNet2Stub, TransformerEncoderBackbone
 from .crf import NUM_TAGS, LinearChainCRF
-from .head_gate import HeadGate
 
 # Selectable backbones. "transformer" is the real bidirectional encoder (default);
 # "deltanet_stub" is the feed-forward placeholder kept for fallback/ablation.
@@ -36,9 +40,7 @@ class LaMRConfig:
 
 
 class LaMRBackboneForExport(nn.Module):
-    """Wraps backbone + gate + emission heads only — no CRFs. This is the
-    sub-module we export to ONNX.
-    """
+    """Backbone + emission head — the sub-module exported to ONNX (no CRF)."""
 
     def __init__(self, cfg: LaMRConfig):
         super().__init__()
@@ -56,109 +58,50 @@ class LaMRBackboneForExport(nn.Module):
             ff_mult=cfg.ff_mult,
             dropout=cfg.dropout,
         )
-        self.head_gate = HeadGate(d_model=cfg.d_model)
-        self.head_semantic = nn.Linear(cfg.d_model, NUM_TAGS)
-        self.head_dependency = nn.Linear(cfg.d_model, NUM_TAGS)
+        self.head = nn.Linear(cfg.d_model, NUM_TAGS)
 
     def forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         hidden = self.backbone(input_ids, attention_mask)
-        head_weights = self.head_gate(hidden, attention_mask)
-        return self.head_semantic(hidden), self.head_dependency(hidden), head_weights
+        return self.head(hidden)  # (B, T, NUM_TAGS)
 
 
 class LaMRModel(nn.Module):
-    """Training-time module. Adds two CRF heads on top of the export backbone."""
+    """Training-time module: the export core + one linear-chain CRF."""
 
     def __init__(self, cfg: LaMRConfig):
         super().__init__()
         self.cfg = cfg
         self.export_core = LaMRBackboneForExport(cfg)
-        self.crf_semantic = LinearChainCRF()
-        self.crf_dependency = LinearChainCRF()
+        self.crf = LinearChainCRF()
 
     def forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return self.export_core(input_ids, attention_mask)
-
-    def weighted_crf_parameters(
-        self,
-        emi_sem: torch.Tensor,
-        emi_dep: torch.Tensor,
-        head_weights: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        """Combine both CRF heads into one per-sequence weighted CRF.
-
-        Emissions and head_weights are upcast to fp32 before the blend so that
-        training (which may run under bf16/fp16 autocast) blends at the same
-        precision the Rust/ONNX inference path uses (fp32), keeping the optimized
-        objective numerically aligned with what Viterbi decodes.
-        """
-        emi_sem = emi_sem.float()
-        emi_dep = emi_dep.float()
-        head_weights = head_weights.float()
-        w_sem = head_weights[:, 0].view(-1, 1, 1)
-        w_dep = head_weights[:, 1].view(-1, 1, 1)
-        return {
-            "emissions": w_sem * emi_sem + w_dep * emi_dep,
-            "transitions": w_sem * self.crf_semantic.transitions + w_dep * self.crf_dependency.transitions,
-            "start_transitions": head_weights[:, 0:1] * self.crf_semantic.start_transitions
-            + head_weights[:, 1:2] * self.crf_dependency.start_transitions,
-            "end_transitions": head_weights[:, 0:1] * self.crf_semantic.end_transitions
-            + head_weights[:, 1:2] * self.crf_dependency.end_transitions,
-        }
+    ) -> torch.Tensor:
+        return self.export_core(input_ids, attention_mask)  # emissions (B, T, NUM_TAGS)
 
     def joint_nll(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         tags: torch.Tensor,                         # (B, T) gold labels (0=keep, 1=drop)
-        w_semantic: torch.Tensor | None = None,     # (B, T) reserved — see note
-        w_dependency: torch.Tensor | None = None,   # (B, T) reserved — see note
+        w_semantic: torch.Tensor | None = None,     # reserved (unused) — see note
+        w_dependency: torch.Tensor | None = None,   # reserved (unused) — see note
         lambda_sem: float = 1.0,                    # reserved; kept for call-site compatibility
         lambda_dep: float = 1.0,
     ) -> dict[str, torch.Tensor]:
-        """Training objective: NLL of the *blended* CRF that inference decodes.
+        """Training objective: per-token NLL of the single linear-chain CRF — the
+        exact CRF the Rust/ONNX path decodes with Viterbi (so train == infer).
 
-        The head gate emits per-sequence weights that blend the two CRF heads
-        (emissions + transitions) into a single per-sequence CRF — exactly the CRF
-        the Rust/ONNX path runs Viterbi over (see ``weighted_crf_parameters``). We
-        optimise the NLL of that same blended CRF, so training and inference share
-        one model. (Previously training summed two independent CRF NLLs while
-        inference decoded one blended CRF — a silent train/infer mismatch.)
-
-        ``w_semantic`` / ``w_dependency`` (AST hop-decay soft labels) are NOT
-        applied to the decoded CRF: inference has no access to them, so folding
-        them into the loss would re-introduce a train/infer gap. They stay in the
-        signature, reserved for a future token-level auxiliary loss. ``nll_sem`` /
-        ``nll_dep`` are reported for diagnostics only (do the heads diverge?).
+        ``w_semantic`` / ``w_dependency`` (AST hop-decay soft labels) and
+        ``lambda_*`` are reserved and unused; they stay in the signature for
+        call-site compatibility and a possible future token-level auxiliary loss.
         """
-        emi_sem, emi_dep, head_weights = self.forward(input_ids, attention_mask)
-        params = self.weighted_crf_parameters(emi_sem, emi_dep, head_weights)
-        # Per-token loss (nats/token): length-invariant + smooth, and it caps each
-        # token's gradient contribution so long sequences can't spike the loss/grad
-        # (the instability seen with the per-sequence loss).
-        loss = self.crf_semantic.nll_with_params(
-            params["emissions"],
-            tags,
-            attention_mask,
-            params["transitions"],
-            params["start_transitions"],
-            params["end_transitions"],
-            reduction="token_mean",
-        )
-        with torch.no_grad():
-            nll_sem = self.crf_semantic.nll(emi_sem, tags, attention_mask, reduction="token_mean")
-            nll_dep = self.crf_dependency.nll(emi_dep, tags, attention_mask, reduction="token_mean")
-        return {
-            "loss": loss,
-            "nll_sem": nll_sem,
-            "nll_dep": nll_dep,
-            "head_weights": head_weights,
-        }
+        emissions = self.forward(input_ids, attention_mask)
+        loss = self.crf.nll(emissions, tags, attention_mask, reduction="token_mean")
+        return {"loss": loss}

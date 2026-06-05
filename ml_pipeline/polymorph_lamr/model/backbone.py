@@ -71,7 +71,7 @@ class _MultiHeadSelfAttention(nn.Module):
     under fp16 autocast and turns an all-padding row's softmax into NaN). With
     the dtype-aware fill, valid queries put ~zero weight on padding so every
     valid position's output is independent of padding content (the property
-    ``test_head_gate_ignores_padding_values`` relies on), and an all-padding row
+    ``test_valid_positions_independent_of_padding_content`` relies on), and an all-padding row
     yields a finite uniform softmax instead of NaN. No causal mask: the task is
     bidirectional sequence labelling, so each token may attend both ways.
     """

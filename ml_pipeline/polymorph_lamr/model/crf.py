@@ -92,10 +92,10 @@ class LinearChainCRF(nn.Module):
         """CRF NLL using *explicit* (optionally per-sequence batched) transition
         params instead of this module's own ``self.transitions``.
 
-        This is the objective LaMR trains: the head gate blends the two CRF heads
-        into one per-sequence CRF (see ``LaMRModel.weighted_crf_parameters``), and
-        we optimise the NLL of exactly that blended CRF — the same one Viterbi
-        decodes at inference. fp32 like ``nll`` (logsumexp precision over long T).
+        A general utility for decoding/scoring with per-sequence CRF params. fp32
+        like ``nll`` (logsumexp precision over long T). The default LaMR objective
+        uses ``nll`` directly on the single CRF; this stays available for batched-
+        param scoring and is exercised by the tests.
         """
         emissions = emissions.float()
         transitions = transitions.float()

@@ -17,6 +17,7 @@ from ..model.lamr import LaMRModel
 class TrainState:
     step: int = 0
     best_loss: float = math.inf
+    best_val_f1: float = -1.0
 
 
 def _pick_device() -> torch.device:
@@ -112,10 +113,7 @@ def train(
                     dt = time.time() - t0
                     print(
                         f"step={state.step:6d} lr={cur_lr:.2e} "
-                        f"loss={out['loss'].item():.4f} "
-                        f"nll_sem={out['nll_sem'].item():.4f} "
-                        f"nll_dep={out['nll_dep'].item():.4f} "
-                        f"elapsed={dt:.1f}s"
+                        f"loss={out['loss'].item():.4f} elapsed={dt:.1f}s"
                     )
                 if state.step % ckpt_every == 0:
                     save_checkpoint(model, out_dir / f"ckpt-{state.step:06d}.pt", state)
@@ -129,6 +127,12 @@ def train(
                         f"drop_rate={m['pred_drop_rate']:.3f}/gold{m['gold_drop_rate']:.3f} "
                         f"nll/tok={m['per_token_nll']:.4f}"
                     )
+                    # Save the best-by-val checkpoint (the model oscillates, so the
+                    # final step is often not the best pruner).
+                    if m["drop_f1"] > state.best_val_f1:
+                        state.best_val_f1 = m["drop_f1"]
+                        save_checkpoint(model, out_dir / "ckpt-best.pt", state)
+                        print(f"  [val] new best drop_f1={m['drop_f1']:.4f} -> ckpt-best.pt")
                     model.train()
                 if state.step >= max_steps:
                     break
