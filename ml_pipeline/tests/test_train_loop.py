@@ -152,3 +152,24 @@ def test_train_cli_requires_shards_when_not_dry(tmp_path, capsys):
     rc = main(["--config", str(cfg_path)])
     assert rc != 0
     assert "shards" in capsys.readouterr().err.lower()
+
+
+def test_train_cycles_epochs_to_reach_max_steps(tmp_path, monkeypatch):
+    """Regression: the loop must re-iterate the data across epochs to reach
+    max_steps. A 1-record shard yields exactly 1 optimizer step per epoch, so
+    reaching step 5 proves cycling (the old single-pass loop stopped at step 1)."""
+    monkeypatch.setattr("polymorph_lamr.train.loop._pick_device", lambda: torch.device("cpu"))
+    shard = _make_shard(tmp_path)  # single record
+    lcfg = LaMRConfig(vocab_size=64, d_model=16, n_layers=1, n_heads=2, ff_mult=2, dropout=0.0)
+    model = LaMRModel(lcfg)
+    ds = LabeledShardDataset([shard], max_seq_len=8, seed=7)
+    from functools import partial
+    loader = DataLoader(ds, batch_size=1, collate_fn=partial(collate, pad_id=0), num_workers=0)
+    out_dir = tmp_path / "ck"
+    train(
+        model=model, loader=loader, out_dir=out_dir, max_steps=5,
+        grad_accum=1, lr=1e-3, weight_decay=0.0, warmup_steps=0, amp_dtype="fp32",
+        ckpt_every=1, log_every=1, lambda_sem=1.0, lambda_dep=1.0,
+    )
+    assert (out_dir / "ckpt-000005.pt").exists(), "loop did not cycle to max_steps=5"
+    assert (out_dir / "ckpt-final.pt").exists()

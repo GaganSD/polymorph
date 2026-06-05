@@ -68,50 +68,60 @@ def train(
     optim.zero_grad(set_to_none=True)
     t0 = time.time()
     micro_step = 0
-    for batch in loader:
-        for k, v in batch.items():
-            batch[k] = v.to(device)
+    # The dataset yields each example once per pass, so re-iterate the loader
+    # across epochs until max_steps — otherwise training would stop after ~1 epoch
+    # and never reach max_steps. A pass that yields no batches breaks the loop
+    # (guards an empty dataset from spinning forever).
+    while state.step < max_steps:
+        batches_this_epoch = 0
+        for batch in loader:
+            batches_this_epoch += 1
+            for k, v in batch.items():
+                batch[k] = v.to(device)
 
-        with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
-            # NOTE: w_semantic/w_dependency and lambda_sem/lambda_dep are currently
-            # RESERVED and do not affect the loss — joint_nll optimizes the single
-            # blended CRF (see its docstring). Threaded through for forward-compat.
-            out = model.joint_nll(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                tags=batch["tags"],
-                w_semantic=batch["w_semantic"],
-                w_dependency=batch["w_dependency"],
-                lambda_sem=lambda_sem,
-                lambda_dep=lambda_dep,
-            )
-        loss = out["loss"] / grad_accum
-        loss.backward()
-        micro_step += 1
-
-        if micro_step % grad_accum == 0:
-            # cosine LR.
-            cur_lr = _cosine_lr(state.step, warmup_steps, max_steps, lr)
-            for pg in optim.param_groups:
-                pg["lr"] = cur_lr
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optim.step()
-            optim.zero_grad(set_to_none=True)
-            state.step += 1
-
-            if state.step % log_every == 0:
-                dt = time.time() - t0
-                print(
-                    f"step={state.step:6d} lr={cur_lr:.2e} "
-                    f"loss={out['loss'].item():.4f} "
-                    f"nll_sem={out['nll_sem'].item():.4f} "
-                    f"nll_dep={out['nll_dep'].item():.4f} "
-                    f"elapsed={dt:.1f}s"
+            with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
+                # NOTE: w_semantic/w_dependency and lambda_sem/lambda_dep are currently
+                # RESERVED and do not affect the loss — joint_nll optimizes the single
+                # blended CRF (see its docstring). Threaded through for forward-compat.
+                out = model.joint_nll(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    tags=batch["tags"],
+                    w_semantic=batch["w_semantic"],
+                    w_dependency=batch["w_dependency"],
+                    lambda_sem=lambda_sem,
+                    lambda_dep=lambda_dep,
                 )
-            if state.step % ckpt_every == 0:
-                save_checkpoint(model, out_dir / f"ckpt-{state.step:06d}.pt", state)
-            if state.step >= max_steps:
-                break
+            loss = out["loss"] / grad_accum
+            loss.backward()
+            micro_step += 1
+
+            if micro_step % grad_accum == 0:
+                # cosine LR.
+                cur_lr = _cosine_lr(state.step, warmup_steps, max_steps, lr)
+                for pg in optim.param_groups:
+                    pg["lr"] = cur_lr
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optim.step()
+                optim.zero_grad(set_to_none=True)
+                state.step += 1
+
+                if state.step % log_every == 0:
+                    dt = time.time() - t0
+                    print(
+                        f"step={state.step:6d} lr={cur_lr:.2e} "
+                        f"loss={out['loss'].item():.4f} "
+                        f"nll_sem={out['nll_sem'].item():.4f} "
+                        f"nll_dep={out['nll_dep'].item():.4f} "
+                        f"elapsed={dt:.1f}s"
+                    )
+                if state.step % ckpt_every == 0:
+                    save_checkpoint(model, out_dir / f"ckpt-{state.step:06d}.pt", state)
+                if state.step >= max_steps:
+                    break
+        if batches_this_epoch == 0:
+            print("[train] dataloader produced no batches; stopping")
+            break
     save_checkpoint(model, out_dir / "ckpt-final.pt", state)
     return state
 
