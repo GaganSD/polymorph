@@ -53,6 +53,52 @@ def test_run_distill_end_to_end(monkeypatch, tmp_path):
         assert set(rec["qc"]) >= {"vr", "ag", "mr", "hr"}
 
 
+def test_load_sampled_reads_jsonl(tmp_path):
+    from polymorph_lamr.distill.run_distill import _load_sampled
+
+    p = tmp_path / "sampled.jsonl"
+    p.write_text(
+        '{"corpus":"apache_access","src_path":"data/staged/apache.txt","chunk_id":3,"text":"GET /x 200"}\n'
+        "\n"  # blank line skipped
+        '{"corpus":"cicd","src_path":"x","chunk_id":0,"text":""}\n'  # empty text skipped
+        '{"corpus":"k8s","src_path":"y","chunk_id":1,"text":"pod restarted"}\n'
+    )
+    items = _load_sampled(p)
+    assert items == [
+        ("GET /x 200", "apache_access:data/staged/apache.txt", 3),
+        ("pod restarted", "k8s:y", 1),
+    ]
+
+
+def test_run_distill_sampled_end_to_end(monkeypatch, tmp_path):
+    _install_fake_litellm(monkeypatch)
+    sampled = tmp_path / "sampled.jsonl"
+    sampled.write_text(
+        '{"corpus":"apache_access","src_path":"s","chunk_id":0,"text":"alpha beta gamma delta epsilon"}\n'
+        '{"corpus":"cicd","src_path":"s","chunk_id":1,"text":"one two three four five six"}\n'
+    )
+    out = tmp_path / "distilled.jsonl"
+    from polymorph_lamr.distill.run_distill import main
+
+    rc = main(["--sampled", str(sampled), "--out", str(out), "--concurrency", "2"])
+    assert rc == 0
+    lines = out.read_text().strip().split("\n")
+    assert len(lines) == 2
+    for line in lines:
+        rec = json.loads(line)
+        assert rec["original"] and "compressed" in rec
+        # src carries the corpus tag from the sampler record
+        assert rec["src_path"].split(":")[0] in {"apache_access", "cicd"}
+
+
+def test_run_distill_requires_input_or_sampled(tmp_path, capsys):
+    from polymorph_lamr.distill.run_distill import main
+
+    rc = main(["--out", str(tmp_path / "o.jsonl")])
+    assert rc != 0
+    assert "--sampled" in capsys.readouterr().err
+
+
 def test_run_distill_empty_dir_exits_nonzero(monkeypatch, tmp_path, capsys):
     _install_fake_litellm(monkeypatch)
     src = tmp_path / "empty"

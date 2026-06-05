@@ -196,9 +196,9 @@ def write_jsonl(results: list, out_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# OpenRouter multi-teacher ensemble (E3): fan out across open-weight teachers,
-# keep the per-chunk best-QC output. This is the primary distillation path; the
-# legacy `distill_pair` (Claude + GPT-4o) above is retained for back-compat.
+# Multi-teacher ensemble (E3): fan out across the Bedrock teachers and keep the
+# per-chunk best-QC output. This is the primary distillation path; the legacy
+# `distill_pair` (Claude + GPT-4o) above is retained for back-compat.
 # --------------------------------------------------------------------------- #
 
 
@@ -220,9 +220,9 @@ class TeacherSpec:
     @classmethod
     def from_spec(cls, name: str, spec_model: str) -> "TeacherSpec":
         """Build a teacher from a provider-prefixed spec-string (e.g.
-        ``bedrock/deepseek.v3.2``, ``vercel/alibaba/qwen3.7-max``, or
-        ``openrouter/moonshotai/kimi-k2.6:free``). Enforces the Vercel
-        strict-model guard via :func:`resolve_routing`."""
+        ``bedrock/deepseek.v3.2``, ``bedrock/minimax.minimax-m2.1``, or the legacy
+        ``vercel/alibaba/qwen3.7-max``). Enforces the Vercel strict-model guard
+        via :func:`resolve_routing`."""
         r = resolve_routing(spec_model)
         return cls(
             name=name,

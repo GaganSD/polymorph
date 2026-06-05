@@ -8,6 +8,7 @@ dependencies = [
     "numpy>=1.26",
     "tiktoken>=0.7",
     "litellm>=1.50",
+    "tenacity>=8",  # litellm's retry backend (num_retries) — required for resilient Bedrock runs
     "tree-sitter>=0.22",
     "tree-sitter-python>=0.23",
     "tree-sitter-json>=0.23",
