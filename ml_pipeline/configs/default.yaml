@@ -56,7 +56,9 @@ model:
   n_heads: 4
   ff_mult: 4
   dropout: 0.1
-  use_real_deltanet: false  # _TODO_REAL_DELTANET swap point
+  # Backbone encoder: transformer = real bidirectional pre-norm Transformer
+  # encoder (default, token-mixing); deltanet_stub = feed-forward placeholder.
+  backbone: transformer
 
 train:
   batch_size: 8

@@ -15,12 +15,17 @@ def joint_loss(
     lambda_sem: float = 1.0,
     lambda_dep: float = 1.0,
 ) -> torch.Tensor:
-    """Re-weight the per-head NLLs into a single scalar.
+    """Return the trained scalar objective: the blended-CRF NLL.
 
-    `model_outputs` is expected to be the dict from LaMRModel.joint_nll. We
-    return a fresh sum so callers can mix this loss with auxiliary terms
-    (e.g. router load-balance regularisers) without aliasing `loss`.
+    `model_outputs` is the dict from ``LaMRModel.joint_nll``. Since the C1 fix,
+    LaMR optimises a single blended CRF (the head gate routes the blend of both
+    heads' emissions + transitions; see ``LaMRModel.joint_nll``), so there is one
+    ``loss`` to return — it is NOT a re-weighted sum of the two per-head NLLs
+    (blending happens inside one CRF partition, which is non-linear in those
+    NLLs). ``lambda_sem``/``lambda_dep`` are retained for call-site/config
+    compatibility but no longer reweight per-head losses; the gate, learned
+    end-to-end, subsumes head weighting. This wrapper stays as the single place
+    to graft auxiliary terms (e.g. a router load-balance regulariser) without
+    aliasing ``loss``.
     """
-    if lambda_sem == 1.0 and lambda_dep == 1.0 and "loss" in model_outputs:
-        return model_outputs["loss"]
-    return lambda_sem * model_outputs["nll_sem"] + lambda_dep * model_outputs["nll_dep"]
+    return model_outputs["loss"]

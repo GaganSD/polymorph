@@ -80,12 +80,13 @@ def test_pick_device_returns_device():
     assert isinstance(dev, torch.device)
 
 
-def test_joint_loss_wrapper_sums_terms():
-    out = {"nll_sem": torch.tensor(2.0), "nll_dep": torch.tensor(3.0)}
-    total = joint_loss(out, lambda_sem=1.0, lambda_dep=1.0)
-    assert torch.isclose(total, torch.tensor(5.0))
-    weighted = joint_loss(out, lambda_sem=2.0, lambda_dep=0.5)
-    assert torch.isclose(weighted, torch.tensor(2.0 * 2.0 + 0.5 * 3.0))
+def test_joint_loss_wrapper_returns_blended_loss():
+    # Post-C1: the wrapper returns the model's single trained objective (the
+    # blended-CRF NLL in out["loss"]), NOT a lambda-weighted sum of the per-head
+    # NLLs. The lambda knobs are vestigial and must not change the result.
+    out = {"loss": torch.tensor(2.5), "nll_sem": torch.tensor(2.0), "nll_dep": torch.tensor(3.0)}
+    assert torch.equal(joint_loss(out, lambda_sem=1.0, lambda_dep=1.0), out["loss"])
+    assert torch.equal(joint_loss(out, lambda_sem=2.0, lambda_dep=0.5), out["loss"])
 
 
 def test_train_one_step_writes_checkpoint(tmp_path, monkeypatch):

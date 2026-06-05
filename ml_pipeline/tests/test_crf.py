@@ -102,3 +102,48 @@ def test_decode_with_batched_params_matches_single_batch():
             end[i : i + 1],
         )
         assert decoded[i] == single[0]
+
+
+def test_nll_with_params_handles_padding():
+    """C1 fix exercises nll_with_params with per-sequence batched params. Cover
+    the padding path: partial-mask rows are finite, all-pad rows contribute 0."""
+    torch.manual_seed(0)
+    crf = LinearChainCRF()
+    b, t = 2, 4
+    emissions = torch.randn(b, t, NUM_TAGS)
+    tags = torch.zeros(b, t, dtype=torch.long)
+    trans = crf.transitions.detach().unsqueeze(0).expand(b, -1, -1)
+    start = crf.start_transitions.detach().unsqueeze(0).expand(b, -1)
+    end = crf.end_transitions.detach().unsqueeze(0).expand(b, -1)
+
+    # Row 0 fully valid, row 1 has a padded tail.
+    mask = torch.tensor([[True, True, True, True], [True, True, False, False]])
+    nll = crf.nll_with_params(emissions, tags, mask, trans, start, end, reduction="none")
+    assert nll.shape == (b,)
+    assert torch.isfinite(nll).all()
+
+    # An all-pad row must contribute exactly 0 (not poison the batch).
+    mask2 = torch.tensor([[True, True, True, True], [False, False, False, False]])
+    nll2 = crf.nll_with_params(emissions, tags, mask2, trans, start, end, reduction="none")
+    assert nll2[1].item() == 0.0
+
+
+def test_viterbi_golden_matches_rust_decode():
+    """Cross-language golden: identical params + expected output to the Rust
+    test viterbi_golden_mixed_path in src/lamr.rs, pinning Rust<->Python decode
+    agreement. start favors tag0, transitions favor switching, flat emissions
+    -> alternating best path [0, 1, 0]."""
+    crf = LinearChainCRF()
+    emissions = torch.zeros(1, 3, NUM_TAGS)
+    mask = torch.ones(1, 3, dtype=torch.bool)
+    trans = torch.tensor([[[-0.5, 1.0], [1.0, -0.5]]])
+    start = torch.tensor([[1.0, 0.0]])
+    end = torch.tensor([[0.0, 0.0]])
+    decoded = crf.decode_with_params(
+        emissions=emissions,
+        mask=mask,
+        transitions=trans,
+        start_transitions=start,
+        end_transitions=end,
+    )
+    assert decoded == [[0, 1, 0]]
