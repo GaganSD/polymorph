@@ -4,9 +4,10 @@
 //!   * a deterministic RNG **mock** (`dummy_lamr_forward_pass`), kept as the
 //!     fallback so callers/tests work without an exported model, and
 //!   * the **real** ONNX-backed pruner (`apply_lamr_onnx`), which loads the
-//!     LaMR model exported by `polymorph_lamr/export/to_onnx.py`, blends the two
-//!     emission heads + CRF transition params by `head_weights`, and runs a
-//!     linear-chain Viterbi decode in Rust to produce the per-token drop bits.
+//!     LaMR model exported by `polymorph_lamr/export/to_onnx.py` (backbone + one
+//!     emission head → an `emissions` tensor), pairs it with the single
+//!     linear-chain CRF transition set from `transitions.json`, and runs a
+//!     Viterbi decode in Rust to produce the per-token drop bits.
 //!
 //! Both backends run the model over the **full** token sequence (matching how
 //! the labeler tags every token at training time), then funnel through
@@ -111,17 +112,14 @@ pub fn enforce_lock_invariant(lock_mask: &[bool], drop_bits: &[bool]) -> Vec<boo
 // CRF transition params (side-car JSON)
 // ---------------------------------------------------------------------------
 
-/// Mirror of `transitions.json` emitted by `to_onnx.py`. Each `*_trans` is a
-/// 2x2 row-major matrix where `trans[i][j]` is the score of moving from tag `i`
-/// to tag `j`; `*_start` / `*_end` are length-2 vectors.
+/// Mirror of `transitions.json` emitted by `to_onnx.py` for the single CRF.
+/// `trans` is a 2x2 row-major matrix where `trans[i][j]` is the score of moving
+/// from tag `i` to tag `j`; `start` / `end` are length-2 vectors.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Transitions {
-    pub sem_trans: Vec<Vec<f32>>,
-    pub sem_start: Vec<f32>,
-    pub sem_end: Vec<f32>,
-    pub dep_trans: Vec<Vec<f32>>,
-    pub dep_start: Vec<f32>,
-    pub dep_end: Vec<f32>,
+    pub trans: Vec<Vec<f32>>,
+    pub start: Vec<f32>,
+    pub end: Vec<f32>,
 }
 
 impl Transitions {
@@ -135,51 +133,42 @@ impl Transitions {
     }
 
     fn validate(&self) -> anyhow::Result<()> {
-        let check_mat = |name: &str, m: &[Vec<f32>]| -> anyhow::Result<()> {
-            anyhow::ensure!(
-                m.len() == NUM_TAGS && m.iter().all(|r| r.len() == NUM_TAGS),
-                "{name} must be {NUM_TAGS}x{NUM_TAGS}"
-            );
-            Ok(())
-        };
-        let check_vec = |name: &str, v: &[f32]| -> anyhow::Result<()> {
-            anyhow::ensure!(v.len() == NUM_TAGS, "{name} must have len {NUM_TAGS}");
-            Ok(())
-        };
-        check_mat("sem_trans", &self.sem_trans)?;
-        check_mat("dep_trans", &self.dep_trans)?;
-        check_vec("sem_start", &self.sem_start)?;
-        check_vec("sem_end", &self.sem_end)?;
-        check_vec("dep_start", &self.dep_start)?;
-        check_vec("dep_end", &self.dep_end)?;
+        anyhow::ensure!(
+            self.trans.len() == NUM_TAGS && self.trans.iter().all(|r| r.len() == NUM_TAGS),
+            "trans must be {NUM_TAGS}x{NUM_TAGS}"
+        );
+        anyhow::ensure!(self.start.len() == NUM_TAGS, "start must have len {NUM_TAGS}");
+        anyhow::ensure!(self.end.len() == NUM_TAGS, "end must have len {NUM_TAGS}");
         Ok(())
     }
 }
 
-/// One blended linear-chain CRF parameter set, ready for Viterbi.
+/// One linear-chain CRF parameter set, ready for Viterbi.
 #[derive(Debug, Clone)]
-pub struct BlendedCrf {
+pub struct Crf {
     /// `transitions[i][j]` = score(tag i -> tag j).
     pub transitions: [[f32; NUM_TAGS]; NUM_TAGS],
     pub start: [f32; NUM_TAGS],
     pub end: [f32; NUM_TAGS],
 }
 
-impl BlendedCrf {
-    /// Blend the two heads' transition params by `head_weights = [w_sem, w_dep]`.
-    /// Mirrors `LaMRModel.weighted_crf_parameters` in `model/lamr.py`.
-    pub fn blend(t: &Transitions, w_sem: f32, w_dep: f32) -> Self {
+impl Crf {
+    /// Pack a validated [`Transitions`] (variable-length Vecs) into fixed-size
+    /// arrays for the decoder. Callers must pass a `Transitions` that has been
+    /// shape-checked (`from_json_path` guarantees this); indexing assumes the
+    /// `NUM_TAGS`x`NUM_TAGS` shape.
+    pub fn from_transitions(t: &Transitions) -> Self {
         let mut transitions = [[0.0f32; NUM_TAGS]; NUM_TAGS];
         let mut start = [0.0f32; NUM_TAGS];
         let mut end = [0.0f32; NUM_TAGS];
         for i in 0..NUM_TAGS {
             for j in 0..NUM_TAGS {
-                transitions[i][j] = w_sem * t.sem_trans[i][j] + w_dep * t.dep_trans[i][j];
+                transitions[i][j] = t.trans[i][j];
             }
-            start[i] = w_sem * t.sem_start[i] + w_dep * t.dep_start[i];
-            end[i] = w_sem * t.sem_end[i] + w_dep * t.dep_end[i];
+            start[i] = t.start[i];
+            end[i] = t.end[i];
         }
-        BlendedCrf {
+        Crf {
             transitions,
             start,
             end,
@@ -193,7 +182,7 @@ impl BlendedCrf {
 
 /// Linear-chain Viterbi MAP decode over `NUM_TAGS` tags.
 ///
-/// `emissions[t][k]` is the (blended) log-emission for tag `k` at position `t`.
+/// `emissions[t][k]` is the log-emission for tag `k` at position `t`.
 /// Returns the best tag sequence of length `emissions.len()`. Tag 1 = drop.
 ///
 /// Matches the reference decode in `polymorph_lamr/model/crf.py::_viterbi`:
@@ -201,10 +190,7 @@ impl BlendedCrf {
 ///   * for each subsequent position, `best_prev[k] = argmax_p (score[p] +
 ///     transitions[p][k])`, then `score[k] = best_score[k] + emissions[t][k]`
 ///   * add `end[k]`, take the argmax as the last tag, backtrack.
-pub fn viterbi_decode(
-    emissions: &[[f32; NUM_TAGS]],
-    crf: &BlendedCrf,
-) -> Vec<u8> {
+pub fn viterbi_decode(emissions: &[[f32; NUM_TAGS]], crf: &Crf) -> Vec<u8> {
     let t = emissions.len();
     if t == 0 {
         return Vec::new();
@@ -276,7 +262,7 @@ pub fn viterbi_decode(
 /// back wrapped in an `Arc`, and `run()` takes `&Arc<Self>`.
 pub struct LamrOnnx {
     model: std::sync::Arc<TypedRunnableModel>,
-    transitions: Transitions,
+    crf: Crf,
 }
 
 impl LamrOnnx {
@@ -295,6 +281,7 @@ impl LamrOnnx {
         transitions_path: &Path,
     ) -> anyhow::Result<Self> {
         let transitions = Transitions::from_json_path(transitions_path)?;
+        let crf = Crf::from_transitions(&transitions);
         let model = tract_onnx::onnx()
             .model_for_path(model_path)
             .map_err(|e| anyhow::anyhow!("loading {}: {e}", model_path.display()))?
@@ -302,12 +289,12 @@ impl LamrOnnx {
             .map_err(|e| anyhow::anyhow!("optimizing {}: {e}", model_path.display()))?
             .into_runnable()
             .map_err(|e| anyhow::anyhow!("making {} runnable: {e}", model_path.display()))?;
-        Ok(LamrOnnx { model, transitions })
+        Ok(LamrOnnx { model, crf })
     }
 
     /// Run the model on a single sequence of token ids and produce the per-token
-    /// drop bit (true = drop) via blended-CRF Viterbi. Returns one bit per input
-    /// token, in order.
+    /// drop bit (true = drop) via CRF Viterbi. Returns one bit per input token,
+    /// in order.
     pub fn forward_drop_bits(&self, token_ids: &[u32]) -> anyhow::Result<Vec<bool>> {
         if token_ids.is_empty() {
             return Ok(Vec::new());
@@ -332,47 +319,31 @@ impl LamrOnnx {
             .run(tvec!(ids_tensor.into(), mask_tensor.into()))
             .map_err(|e| anyhow::anyhow!("onnx run failed: {e}"))?;
         anyhow::ensure!(
-            outputs.len() >= 3,
-            "expected 3 onnx outputs (emissions_sem, emissions_dep, head_weights), got {}",
+            !outputs.is_empty(),
+            "expected 1 onnx output (emissions), got {}",
             outputs.len()
         );
 
-        // Outputs are in declared order: emissions_sem, emissions_dep,
-        // head_weights. `to_plain_array_view` returns an `ArrayViewD<f32>` over
-        // the contiguous tensor buffer.
-        let emi_sem = outputs[0].to_plain_array_view::<f32>()?;
-        let emi_dep = outputs[1].to_plain_array_view::<f32>()?;
-        let head_w = outputs[2].to_plain_array_view::<f32>()?;
-
-        // emissions: [1, T, 2]; head_weights: [1, 2].
+        // Single output: emissions [1, T, 2]. `to_plain_array_view` returns an
+        // `ArrayViewD<f32>` over the contiguous tensor buffer.
+        let emi = outputs[0].to_plain_array_view::<f32>()?;
         anyhow::ensure!(
-            emi_sem.shape() == [1, t, NUM_TAGS].as_slice()
-                && emi_dep.shape() == [1, t, NUM_TAGS].as_slice(),
-            "emission shape mismatch: sem={:?} dep={:?} expected [1,{t},{NUM_TAGS}]",
-            emi_sem.shape(),
-            emi_dep.shape()
-        );
-        anyhow::ensure!(
-            head_w.shape() == [1, NUM_TAGS].as_slice(),
-            "head_weights shape mismatch: {:?} expected [1,{NUM_TAGS}]",
-            head_w.shape()
+            emi.shape() == [1, t, NUM_TAGS].as_slice(),
+            "emission shape mismatch: {:?} expected [1,{t},{NUM_TAGS}]",
+            emi.shape()
         );
 
-        let w_sem = head_w[[0, 0]];
-        let w_dep = head_w[[0, 1]];
-        let crf = BlendedCrf::blend(&self.transitions, w_sem, w_dep);
-
-        // Blend the per-token emissions and pack into the Viterbi input layout.
-        let mut blended: Vec<[f32; NUM_TAGS]> = Vec::with_capacity(t);
+        // Pack the per-token emissions into the Viterbi input layout.
+        let mut rows: Vec<[f32; NUM_TAGS]> = Vec::with_capacity(t);
         for pos in 0..t {
             let mut row = [0.0f32; NUM_TAGS];
             for k in 0..NUM_TAGS {
-                row[k] = w_sem * emi_sem[[0, pos, k]] + w_dep * emi_dep[[0, pos, k]];
+                row[k] = emi[[0, pos, k]];
             }
-            blended.push(row);
+            rows.push(row);
         }
 
-        let tags = viterbi_decode(&blended, &crf);
+        let tags = viterbi_decode(&rows, &self.crf);
         Ok(tags.into_iter().map(|tag| tag == 1).collect())
     }
 }
@@ -451,8 +422,8 @@ pub fn apply_lamr_mock(token_ids: &[u32], lock_mask: &[bool]) -> Vec<bool> {
 }
 
 /// Real ONNX path with an explicit model path. Loads the model + transitions,
-/// runs inference over the full token sequence, decodes the blended CRF with
-/// Viterbi, and projects the lock constraint via [`enforce_lock_invariant`].
+/// runs inference over the full token sequence, decodes the CRF with Viterbi,
+/// and projects the lock constraint via [`enforce_lock_invariant`].
 pub fn apply_lamr_onnx(
     token_ids: &[u32],
     lock_mask: &[bool],
@@ -569,8 +540,8 @@ mod tests {
 
     // ---- Viterbi ----
 
-    fn flat_crf() -> BlendedCrf {
-        BlendedCrf {
+    fn flat_crf() -> Crf {
+        Crf {
             transitions: [[0.0, 0.0], [0.0, 0.0]],
             start: [0.0, 0.0],
             end: [0.0, 0.0],
@@ -610,7 +581,7 @@ mod tests {
         //   [1,0]: 0 + 0   + t10(0)  + e1_0(0)  + 0 = 0
         //   [1,1]: 0 + 0   + t11(0)  + e1_1(1)  + 0 = 1   <-- max
         // Best path = [1, 1].
-        let crf = BlendedCrf {
+        let crf = Crf {
             transitions: [[0.0, -10.0], [0.0, 0.0]],
             start: [0.0, 0.0],
             end: [0.0, 0.0],
@@ -628,7 +599,7 @@ mod tests {
         //   [1,0]: 0 + 0 + 0 = 0
         //   [1,1]: 0 + 0 + 5 = 5
         // Best path = [0, 1].
-        let crf = BlendedCrf {
+        let crf = Crf {
             transitions: [[0.0, 0.0], [0.0, 0.0]],
             start: [5.0, 0.0],
             end: [0.0, 5.0],
@@ -640,7 +611,7 @@ mod tests {
     #[test]
     fn viterbi_single_token() {
         // T=1: just start + emission + end.
-        let crf = BlendedCrf {
+        let crf = Crf {
             transitions: [[0.0, 0.0], [0.0, 0.0]],
             start: [0.0, 1.0],
             end: [0.0, 0.0],
@@ -649,20 +620,29 @@ mod tests {
     }
 
     #[test]
-    fn blend_is_convex_combination() {
+    fn from_transitions_packs_arrays() {
+        // The side-car's variable-length Vecs are packed verbatim into the
+        // fixed-size decode arrays (no blending — single CRF).
         let t = Transitions {
-            sem_trans: vec![vec![1.0, 2.0], vec![3.0, 4.0]],
-            sem_start: vec![1.0, 0.0],
-            sem_end: vec![0.0, 1.0],
-            dep_trans: vec![vec![5.0, 6.0], vec![7.0, 8.0]],
-            dep_start: vec![0.0, 1.0],
-            dep_end: vec![1.0, 0.0],
+            trans: vec![vec![1.0, 2.0], vec![3.0, 4.0]],
+            start: vec![1.0, 0.0],
+            end: vec![0.0, 1.0],
         };
-        let c = BlendedCrf::blend(&t, 0.25, 0.75);
-        assert!((c.transitions[0][0] - (0.25 * 1.0 + 0.75 * 5.0)).abs() < 1e-6);
-        assert!((c.transitions[1][1] - (0.25 * 4.0 + 0.75 * 8.0)).abs() < 1e-6);
-        assert!((c.start[0] - 0.25).abs() < 1e-6);
-        assert!((c.end[1] - 0.25).abs() < 1e-6);
+        let c = Crf::from_transitions(&t);
+        assert_eq!(c.transitions, [[1.0, 2.0], [3.0, 4.0]]);
+        assert_eq!(c.start, [1.0, 0.0]);
+        assert_eq!(c.end, [0.0, 1.0]);
+    }
+
+    #[test]
+    fn transitions_validate_rejects_wrong_shape() {
+        // A 1x2 trans matrix must be rejected by validate().
+        let bad = Transitions {
+            trans: vec![vec![0.0, 0.0]],
+            start: vec![0.0, 0.0],
+            end: vec![0.0, 0.0],
+        };
+        assert!(bad.validate().is_err());
     }
 
     #[test]
@@ -672,7 +652,7 @@ mod tests {
         // test_viterbi_golden_matches_rust_decode), pinning Rust<->Python decode
         // agreement. start favors tag0, transitions favor switching, emissions
         // flat -> best path alternates: [0, 1, 0].
-        let crf = BlendedCrf {
+        let crf = Crf {
             transitions: [[-0.5, 1.0], [1.0, -0.5]],
             start: [1.0, 0.0],
             end: [0.0, 0.0],
@@ -753,8 +733,9 @@ mod tests {
         let tpath = path.parent().unwrap().join("transitions.json");
         let t = Transitions::from_json_path(&tpath).expect("load transitions.json");
         // Shapes validated by from_json_path; sanity-check the tag dimension.
-        assert_eq!(t.sem_trans.len(), NUM_TAGS);
-        assert_eq!(t.dep_start.len(), NUM_TAGS);
+        assert_eq!(t.trans.len(), NUM_TAGS);
+        assert_eq!(t.start.len(), NUM_TAGS);
+        assert_eq!(t.end.len(), NUM_TAGS);
     }
 
     #[test]
