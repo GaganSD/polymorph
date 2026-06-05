@@ -30,6 +30,7 @@ train = [
 ]
 
 [project.scripts]
+lamr-pipeline = "polymorph_lamr.pipeline:main"
 lamr-distill = "polymorph_lamr.distill.run_distill:main"
 lamr-train = "polymorph_lamr.train.train:main"
 lamr-export = "polymorph_lamr.export.to_onnx:main"
