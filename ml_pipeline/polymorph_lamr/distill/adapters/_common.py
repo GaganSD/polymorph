@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import csv
+import json
+import re
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable, Iterator, TextIO
+
+_PARSE_FAILED = object()
 
 
 def sanitize_field(value: str | None) -> str:
@@ -19,6 +23,13 @@ def collapse_whitespace(line: str) -> str:
 
 def has_required_columns(row: dict[str, str | None], columns: Iterable[str]) -> bool:
     return all(col in row for col in columns)
+
+
+def row_field(row: dict[str, str | None], column: str) -> str:
+    """Return a sanitized field value, or empty string if the column is absent."""
+    if column not in row:
+        return ""
+    return sanitize_field(row.get(column))
 
 
 def stream_csv_to_txt(
@@ -45,6 +56,148 @@ def stream_csv_to_txt(
                 skipped += 1
                 continue
             line = render_row(row)
+            if line is None:
+                skipped += 1
+                continue
+            dst.write(line + "\n")
+            written += 1
+
+    return written, skipped
+
+
+def _array_key_pattern(array_key: str) -> re.Pattern[str]:
+    """Match ``"{array_key}": [`` with optional whitespace (not a string value)."""
+    return re.compile(rf'"{re.escape(array_key)}"\s*:\s*\[')
+
+
+def _find_array_start(reader: TextIO, array_key: str) -> bool:
+    """Advance *reader* to the byte after the opening ``[`` of the target array."""
+    pattern = _array_key_pattern(array_key)
+    tail = ""
+    chunk_size = 65536
+    while True:
+        chunk = reader.read(chunk_size)
+        if not chunk:
+            return False
+        search = tail + chunk
+        match = pattern.search(search)
+        if match is None:
+            tail = search[-64:]
+            continue
+        overflow = search[match.end() :]
+        reader._overflow = overflow  # type: ignore[attr-defined]
+        return True
+
+
+def _loads_element(element_parts: list[str]) -> Any:
+    """Parse a complete JSON array element; return *_PARSE_FAILED* on bad JSON."""
+    try:
+        return json.loads("".join(element_parts))
+    except json.JSONDecodeError:
+        return _PARSE_FAILED
+
+
+def _iter_json_array_elements(reader: TextIO, array_key: str) -> Iterator[Any]:
+    """Yield each top-level element of a JSON array keyed by *array_key*."""
+    if not _find_array_start(reader, array_key):
+        return
+
+    overflow: str = getattr(reader, "_overflow", "")
+    del reader._overflow  # type: ignore[attr-defined]
+
+    in_string = False
+    escape = False
+    collecting = False
+    element_depth = 0
+    element_parts: list[str] = []
+    pending = overflow
+
+    while True:
+        chunk = pending if pending else reader.read(65536)
+        pending = ""
+        if not chunk:
+            return
+
+        i = 0
+        while i < len(chunk):
+            ch = chunk[i]
+            if not collecting:
+                if ch in " \t\r\n,":
+                    i += 1
+                    continue
+                if ch == "]":
+                    return
+                collecting = True
+                element_parts = [ch]
+                if ch == '"':
+                    in_string = True
+                    element_depth = 0
+                elif ch in "[{":
+                    element_depth = 1
+                else:
+                    element_depth = 0
+                i += 1
+                if element_depth == 0 and ch not in '"[{':
+                    yield _loads_element(element_parts)
+                    collecting = False
+                    element_parts = []
+                continue
+
+            element_parts.append(ch)
+
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                    if element_depth == 0:
+                        yield _loads_element(element_parts)
+                        collecting = False
+                        element_parts = []
+                i += 1
+                continue
+
+            if ch == '"':
+                in_string = True
+                i += 1
+                continue
+            if ch in "[{":
+                element_depth += 1
+                i += 1
+                continue
+            if ch in "]}":
+                element_depth -= 1
+                if element_depth == 0:
+                    yield _loads_element(element_parts)
+                    collecting = False
+                    element_parts = []
+                i += 1
+                continue
+            i += 1
+
+
+def stream_json_array_to_txt(
+    json_path: Path,
+    out_path: Path,
+    *,
+    array_key: str,
+    render_item: Callable[[Any], str | None],
+) -> tuple[int, int]:
+    """Stream elements from a large JSON object's array field to log lines."""
+    written = 0
+    skipped = 0
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with json_path.open(encoding="utf-8") as src, out_path.open(
+        "w", encoding="utf-8", newline="\n"
+    ) as dst:
+        for element in _iter_json_array_elements(src, array_key):
+            if element is _PARSE_FAILED:
+                skipped += 1
+                continue
+            line = render_item(element)
             if line is None:
                 skipped += 1
                 continue

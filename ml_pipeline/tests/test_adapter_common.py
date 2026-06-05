@@ -6,7 +6,9 @@ from pathlib import Path
 from polymorph_lamr.distill.adapters._common import (
     collapse_whitespace,
     has_required_columns,
+    row_field,
     sanitize_field,
+    stream_json_array_to_txt,
 )
 from polymorph_lamr.distill.adapters.manifest import build_manifest, write_manifest
 
@@ -24,6 +26,71 @@ def test_has_required_columns():
     row = {"a": "1", "b": "2"}
     assert has_required_columns(row, ["a", "b"])
     assert not has_required_columns(row, ["a", "c"])
+
+
+def test_row_field_missing_column():
+    assert row_field({"a": "1"}, "a") == "1"
+    assert row_field({"a": "1"}, "missing") == ""
+
+
+def test_stream_json_array_to_txt(tmp_path: Path):
+    json_path = tmp_path / "data.json"
+    json_path.write_text(
+        '{"meta": 1, "data": [[1, "ok"], [2, "skip"]]}',
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "out.txt"
+
+    def render(item):
+        if item[1] == "ok":
+            return f"line={item[0]}"
+        return None
+
+    written, skipped = stream_json_array_to_txt(
+        json_path, out_path, array_key="data", render_item=render
+    )
+    assert written == 1
+    assert skipped == 1
+    assert out_path.read_text(encoding="utf-8").strip() == "line=1"
+
+
+def test_stream_json_array_skips_unparseable_element(tmp_path: Path):
+    json_path = tmp_path / "data.json"
+    json_path.write_text(
+        '{"data": [[1, "ok"], [2,], [3, "ok3"]]}',
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "out.txt"
+
+    def render(item):
+        return f"line={item[0]}"
+
+    written, skipped = stream_json_array_to_txt(
+        json_path, out_path, array_key="data", render_item=render
+    )
+    assert written == 2
+    assert skipped == 1
+    assert out_path.read_text(encoding="utf-8").splitlines() == ["line=1", "line=3"]
+
+
+def test_stream_json_array_ignores_string_data_key(tmp_path: Path):
+    """A string-valued ``"data"`` field must not be mistaken for the log array."""
+    json_path = tmp_path / "data.json"
+    json_path.write_text(
+        '{"data": "not an array", "meta": 1, "data": [[1, "ok"]]}',
+        encoding="utf-8",
+    )
+    out_path = tmp_path / "out.txt"
+
+    written, skipped = stream_json_array_to_txt(
+        json_path,
+        out_path,
+        array_key="data",
+        render_item=lambda item: f"line={item[0]}",
+    )
+    assert written == 1
+    assert skipped == 0
+    assert out_path.read_text(encoding="utf-8").strip() == "line=1"
 
 
 def test_build_manifest_staged_and_referenced(tmp_path: Path):

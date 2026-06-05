@@ -5,33 +5,56 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from . import alibaba_gpu, api_failures, cicd_failures, distsys_synth, win_events
+from . import (
+    alibaba_gpu,
+    api_failures,
+    cicd_failures,
+    cloudtrail_flaws,
+    distsys_synth,
+    python_tracebacks,
+    security_synth,
+    servicenow_itsm,
+    syslog_cremev2,
+    win_events,
+)
 from .manifest import build_manifest, write_manifest
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 
-_ADAPTERS = (
+_SINGLE_ADAPTERS = (
     ("distsys_synth", distsys_synth),
     ("api_failures", api_failures),
     ("alibaba_gpu", alibaba_gpu),
     ("cicd_failures", cicd_failures),
     ("win_events", win_events),
+    ("syslog_cremev2", syslog_cremev2),
+    ("servicenow_itsm", servicenow_itsm),
+    ("cloudtrail_flaws", cloudtrail_flaws),
+    ("python_tracebacks", python_tracebacks),
 )
+
+
+def _append_single_adapter(
+    staged_entries: list[dict[str, object]], name: str, module: object, repo_root: Path
+) -> None:
+    written, skipped = module.stage(repo_root)
+    source = getattr(module, "SOURCE_CSV", None) or getattr(module, "SOURCE_JSON", None)
+    staged_entries.append(
+        {
+            "name": name,
+            "source": source,
+            "staged_path": module.STAGED_TXT,
+            "written_rows": written,
+            "skipped_rows": skipped,
+        }
+    )
 
 
 def stage_all(repo_root: Path = REPO_ROOT) -> list[dict[str, object]]:
     staged_entries: list[dict[str, object]] = []
-    for name, module in _ADAPTERS:
-        written, skipped = module.stage(repo_root)
-        staged_entries.append(
-            {
-                "name": name,
-                "source": module.SOURCE_CSV,
-                "staged_path": module.STAGED_TXT,
-                "written_rows": written,
-                "skipped_rows": skipped,
-            }
-        )
+    for name, module in _SINGLE_ADAPTERS:
+        _append_single_adapter(staged_entries, name, module, repo_root)
+    staged_entries.extend(security_synth.stage_corpora(repo_root))
     return staged_entries
 
 
