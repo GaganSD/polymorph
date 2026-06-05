@@ -43,6 +43,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", type=Path, default=Path("artifacts/checkpoints"))
     p.add_argument("--dry-run", action="store_true", help="report device + param count + memory and exit")
     p.add_argument("--max-steps", type=int, default=None, help="override config max_steps")
+    # Loss/optimizer overrides for experiment sweeps (None => use config value).
+    p.add_argument("--lr", type=float, default=None, help="override config train.lr")
+    p.add_argument("--warmup-steps", type=int, default=None, help="override config train.warmup_steps")
+    p.add_argument("--aux-ce-weight", type=float, default=None,
+                   help="override config train.aux_ce_weight (class-weighted CE strength)")
+    p.add_argument("--drop-class-weight", type=float, default=None,
+                   help="override config train.drop_class_weight (drop-class upweight in the aux CE)")
     return p
 
 
@@ -106,15 +113,31 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     max_steps = args.max_steps if args.max_steps is not None else int(cfg["train"]["max_steps"])
+    # CLI overrides win over config (None => config). Lets sweeps run without
+    # editing the committed default.yaml.
+    lr = args.lr if args.lr is not None else float(cfg["train"]["lr"])
+    warmup_steps = args.warmup_steps if args.warmup_steps is not None else int(cfg["train"]["warmup_steps"])
+    aux_ce_weight = (
+        args.aux_ce_weight if args.aux_ce_weight is not None
+        else float(cfg["train"].get("aux_ce_weight", 0.0))
+    )
+    drop_class_weight = (
+        args.drop_class_weight if args.drop_class_weight is not None
+        else float(cfg["train"].get("drop_class_weight", 1.0))
+    )
+    print(
+        f"[train] lr={lr} warmup={warmup_steps} max_steps={max_steps} "
+        f"aux_ce_weight={aux_ce_weight} drop_class_weight={drop_class_weight}"
+    )
     train(
         model=model,
         loader=loader,
         out_dir=args.out,
         max_steps=max_steps,
         grad_accum=int(cfg["train"]["grad_accum"]),
-        lr=float(cfg["train"]["lr"]),
+        lr=lr,
         weight_decay=float(cfg["train"]["weight_decay"]),
-        warmup_steps=int(cfg["train"]["warmup_steps"]),
+        warmup_steps=warmup_steps,
         amp_dtype=str(cfg["train"]["amp_dtype"]),
         ckpt_every=int(cfg["train"]["ckpt_every"]),
         log_every=int(cfg["train"]["log_every"]),
@@ -123,8 +146,8 @@ def main(argv: list[str] | None = None) -> int:
         lambda_sem=float(cfg["train"].get("lambda_sem", 1.0)),
         lambda_dep=float(cfg["train"].get("lambda_dep", 1.0)),
         # Class-imbalance fix: class-weighted token-CE auxiliary on the emissions.
-        aux_ce_weight=float(cfg["train"].get("aux_ce_weight", 0.0)),
-        drop_class_weight=float(cfg["train"].get("drop_class_weight", 1.0)),
+        aux_ce_weight=aux_ce_weight,
+        drop_class_weight=drop_class_weight,
         val_loader=val_loader,
         eval_every=int(cfg["train"].get("eval_every", 0)),
     )

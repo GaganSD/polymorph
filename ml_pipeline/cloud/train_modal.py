@@ -42,7 +42,15 @@ vol = modal.Volume.from_name("polymorph-lamr-v0", create_if_missing=True)
 
 
 @app.function(image=image, gpu=GPU, volumes={"/data": vol}, timeout=2 * 60 * 60)
-def train(max_steps: int = 2000, out_subdir: str = "v0") -> dict:
+def train(
+    max_steps: int = 2000,
+    out_subdir: str = "v0",
+    # Loss/optimizer overrides for sweeps (negative sentinel => use config value).
+    lr: float = -1.0,
+    warmup_steps: int = -1,
+    aux_ce_weight: float = -1.0,
+    drop_class_weight: float = -1.0,
+) -> dict:
     import os
     import sys
     from pathlib import Path
@@ -67,6 +75,15 @@ def train(max_steps: int = 2000, out_subdir: str = "v0") -> dict:
             "--max-steps", str(max_steps)]
     if Path(val_jsonl).is_file():
         argv += ["--val-shards", val_jsonl]  # periodic val acc/F1/drop-rate during training
+    # Forward sweep overrides only when set (negative sentinel => use config).
+    if lr >= 0:
+        argv += ["--lr", str(lr)]
+    if warmup_steps >= 0:
+        argv += ["--warmup-steps", str(warmup_steps)]
+    if aux_ce_weight >= 0:
+        argv += ["--aux-ce-weight", str(aux_ce_weight)]
+    if drop_class_weight >= 0:
+        argv += ["--drop-class-weight", str(drop_class_weight)]
     rc = train_main(argv)
     if rc != 0:
         raise SystemExit(f"training failed rc={rc}")
@@ -92,7 +109,21 @@ def train(max_steps: int = 2000, out_subdir: str = "v0") -> dict:
 
 
 @app.local_entrypoint()
-def main(max_steps: int = 2000, out_subdir: str = "v0"):
-    result = train.remote(max_steps=max_steps, out_subdir=out_subdir)
+def main(
+    max_steps: int = 2000,
+    out_subdir: str = "v0",
+    lr: float = -1.0,
+    warmup_steps: int = -1,
+    aux_ce_weight: float = -1.0,
+    drop_class_weight: float = -1.0,
+):
+    result = train.remote(
+        max_steps=max_steps,
+        out_subdir=out_subdir,
+        lr=lr,
+        warmup_steps=warmup_steps,
+        aux_ce_weight=aux_ce_weight,
+        drop_class_weight=drop_class_weight,
+    )
     print("RESULT:", result)
     print(f"download with: modal volume get polymorph-lamr-v0 /out/{out_subdir} data/modal_out/{out_subdir}")
