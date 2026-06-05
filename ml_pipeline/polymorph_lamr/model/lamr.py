@@ -12,9 +12,16 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from .backbone import GatedDeltaNet2Stub
+from .backbone import GatedDeltaNet2Stub, TransformerEncoderBackbone
 from .crf import NUM_TAGS, LinearChainCRF
 from .head_gate import HeadGate
+
+# Selectable backbones. "transformer" is the real bidirectional encoder (default);
+# "deltanet_stub" is the feed-forward placeholder kept for fallback/ablation.
+_BACKBONES = {
+    "transformer": TransformerEncoderBackbone,
+    "deltanet_stub": GatedDeltaNet2Stub,
+}
 
 
 @dataclass
@@ -25,6 +32,7 @@ class LaMRConfig:
     n_heads: int = 4
     ff_mult: int = 4
     dropout: float = 0.1
+    backbone: str = "transformer"
 
 
 class LaMRBackboneForExport(nn.Module):
@@ -35,7 +43,12 @@ class LaMRBackboneForExport(nn.Module):
     def __init__(self, cfg: LaMRConfig):
         super().__init__()
         self.cfg = cfg
-        self.backbone = GatedDeltaNet2Stub(
+        backbone_cls = _BACKBONES.get(cfg.backbone)
+        if backbone_cls is None:
+            raise ValueError(
+                f"unknown backbone {cfg.backbone!r}; choose from {sorted(_BACKBONES)}"
+            )
+        self.backbone = backbone_cls(
             vocab_size=cfg.vocab_size,
             d_model=cfg.d_model,
             n_layers=cfg.n_layers,
@@ -80,7 +93,16 @@ class LaMRModel(nn.Module):
         emi_dep: torch.Tensor,
         head_weights: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """Combine both CRF heads into one per-sequence weighted CRF."""
+        """Combine both CRF heads into one per-sequence weighted CRF.
+
+        Emissions and head_weights are upcast to fp32 before the blend so that
+        training (which may run under bf16/fp16 autocast) blends at the same
+        precision the Rust/ONNX inference path uses (fp32), keeping the optimized
+        objective numerically aligned with what Viterbi decodes.
+        """
+        emi_sem = emi_sem.float()
+        emi_dep = emi_dep.float()
+        head_weights = head_weights.float()
         w_sem = head_weights[:, 0].view(-1, 1, 1)
         w_dep = head_weights[:, 1].view(-1, 1, 1)
         return {
@@ -96,20 +118,41 @@ class LaMRModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        tags: torch.Tensor,          # (B, T) — same gold labels for both heads
-        w_semantic: torch.Tensor,    # (B, T)
-        w_dependency: torch.Tensor,  # (B, T)
-        lambda_sem: float = 1.0,
+        tags: torch.Tensor,                         # (B, T) gold labels (0=keep, 1=drop)
+        w_semantic: torch.Tensor | None = None,     # (B, T) reserved — see note
+        w_dependency: torch.Tensor | None = None,   # (B, T) reserved — see note
+        lambda_sem: float = 1.0,                    # reserved; kept for call-site compatibility
         lambda_dep: float = 1.0,
     ) -> dict[str, torch.Tensor]:
+        """Training objective: NLL of the *blended* CRF that inference decodes.
+
+        The head gate emits per-sequence weights that blend the two CRF heads
+        (emissions + transitions) into a single per-sequence CRF — exactly the CRF
+        the Rust/ONNX path runs Viterbi over (see ``weighted_crf_parameters``). We
+        optimise the NLL of that same blended CRF, so training and inference share
+        one model. (Previously training summed two independent CRF NLLs while
+        inference decoded one blended CRF — a silent train/infer mismatch.)
+
+        ``w_semantic`` / ``w_dependency`` (AST hop-decay soft labels) are NOT
+        applied to the decoded CRF: inference has no access to them, so folding
+        them into the loss would re-introduce a train/infer gap. They stay in the
+        signature, reserved for a future token-level auxiliary loss. ``nll_sem`` /
+        ``nll_dep`` are reported for diagnostics only (do the heads diverge?).
+        """
         emi_sem, emi_dep, head_weights = self.forward(input_ids, attention_mask)
-        nll_sem_vec = self.crf_semantic.nll(emi_sem, tags, attention_mask, w_semantic, reduction="none")
-        nll_dep_vec = self.crf_dependency.nll(emi_dep, tags, attention_mask, w_dependency, reduction="none")
-        weighted = lambda_sem * head_weights[:, 0] * nll_sem_vec + lambda_dep * head_weights[:, 1] * nll_dep_vec
-        valid = (attention_mask.long().sum(dim=1) > 0).to(weighted.dtype)
-        loss = (weighted * valid).sum() / valid.sum().clamp(min=1.0)
-        nll_sem = (nll_sem_vec * valid).sum() / valid.sum().clamp(min=1.0)
-        nll_dep = (nll_dep_vec * valid).sum() / valid.sum().clamp(min=1.0)
+        params = self.weighted_crf_parameters(emi_sem, emi_dep, head_weights)
+        loss = self.crf_semantic.nll_with_params(
+            params["emissions"],
+            tags,
+            attention_mask,
+            params["transitions"],
+            params["start_transitions"],
+            params["end_transitions"],
+            reduction="mean",
+        )
+        with torch.no_grad():
+            nll_sem = self.crf_semantic.nll(emi_sem, tags, attention_mask, reduction="mean")
+            nll_dep = self.crf_dependency.nll(emi_dep, tags, attention_mask, reduction="mean")
         return {
             "loss": loss,
             "nll_sem": nll_sem,

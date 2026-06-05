@@ -73,6 +73,9 @@ def train(
             batch[k] = v.to(device)
 
         with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
+            # NOTE: w_semantic/w_dependency and lambda_sem/lambda_dep are currently
+            # RESERVED and do not affect the loss — joint_nll optimizes the single
+            # blended CRF (see its docstring). Threaded through for forward-compat.
             out = model.joint_nll(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],

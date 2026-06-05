@@ -56,7 +56,10 @@ pub struct LockResult {
     pub daac_token_intervals: Vec<(usize, usize)>,
     /// M1: per-token lock mask. `true` = structural/keyword, must not be dropped.
     pub mask: Vec<bool>,
-    /// M2: mock-LaMR drop mask. `true` = drop. Always `false` where `mask[i]` is `true`.
+    /// M2: LaMR drop mask. `true` = drop. Always `false` where `mask[i]` is
+    /// `true`. Produced by the ONNX-backed pruner when an exported model is
+    /// available (env `POLYMORPH_LAMR_MODEL` or the default artifact path),
+    /// otherwise by the deterministic mock fallback.
     pub drop_mask: Vec<bool>,
     /// Convenience: count of tokens kept after the drop mask is applied.
     pub kept_tokens: usize,

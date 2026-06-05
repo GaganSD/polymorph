@@ -4,16 +4,19 @@ Output layout:
     <out_dir>/
         model.onnx          # backbone + head gate + two emission heads
         transitions.npz     # {sem_trans, sem_start, sem_end, dep_trans, dep_start, dep_end}
+        transitions.json    # same keys/shapes as the .npz, plain JSON for the Rust runtime
         config.yaml         # mirrors the training config (for reproducibility)
         README.md           # how the Rust side loads this artifact
         parity.json         # max-abs diff between torch and onnxruntime
 
 The Rust runtime is expected to:
     1. Load model.onnx via tract or ort.
-    2. Combine semantic/dependency emissions and CRF params with head_weights.
-    3. Run one Viterbi decode using the weighted CRF.
-    4. Map decoded tag-1 positions back to the unlocked-token indices and
-       return a drop_mask parallel to the lock_mask (see src/lamr.rs).
+    2. Run the model over the FULL token sequence (matching how training tags
+       every token of the chunk).
+    3. Combine semantic/dependency emissions and CRF params with head_weights.
+    4. Run one Viterbi decode using the weighted CRF.
+    5. Map decoded tag-1 positions onto a full-length drop_mask, then force-keep
+       locked positions (see enforce_lock_invariant in src/lamr.rs).
 """
 
 from __future__ import annotations
@@ -76,14 +79,21 @@ def export(
     # Transitions side-car.
     sem = model.crf_semantic
     dep = model.crf_dependency
-    np.savez(
-        out_dir / "transitions.npz",
-        sem_trans=sem.transitions.detach().cpu().numpy(),
-        sem_start=sem.start_transitions.detach().cpu().numpy(),
-        sem_end=sem.end_transitions.detach().cpu().numpy(),
-        dep_trans=dep.transitions.detach().cpu().numpy(),
-        dep_start=dep.start_transitions.detach().cpu().numpy(),
-        dep_end=dep.end_transitions.detach().cpu().numpy(),
+    transitions = {
+        "sem_trans": sem.transitions.detach().cpu().numpy(),
+        "sem_start": sem.start_transitions.detach().cpu().numpy(),
+        "sem_end": sem.end_transitions.detach().cpu().numpy(),
+        "dep_trans": dep.transitions.detach().cpu().numpy(),
+        "dep_start": dep.start_transitions.detach().cpu().numpy(),
+        "dep_end": dep.end_transitions.detach().cpu().numpy(),
+    }
+    np.savez(out_dir / "transitions.npz", **transitions)
+    # Plain-JSON mirror of the .npz so the Rust runtime can parse the CRF
+    # params with serde_json instead of pulling in an npz/zip-of-npy reader.
+    # Keys + shapes match transitions.npz exactly: *_trans are (2, 2) row-major
+    # where trans[i][j] = score(tag i -> tag j); *_start / *_end are length-2.
+    (out_dir / "transitions.json").write_text(
+        json.dumps({k: v.astype(float).tolist() for k, v in transitions.items()}, indent=2)
     )
 
     # Mirror config for downstream reproducibility.
@@ -187,6 +197,7 @@ Inference pipeline for Polymorph's Rust MCP runtime.
 ## Files
 - `model.onnx` — backbone + semantic/dependency head gate + 2 emission heads.
 - `transitions.npz` — CRF transitions per head (`{{sem,dep}}_{{trans,start,end}}`).
+- `transitions.json` — same keys/shapes as the `.npz`, plain JSON for the Rust runtime (no npz parser needed).
 - `config.yaml` — model architecture (must match the training run).
 - `parity.json` — max-abs diff between torch and onnxruntime at export time.
 
@@ -197,12 +208,15 @@ Inference pipeline for Polymorph's Rust MCP runtime.
 - head_weights: (B, 2) float, softmax weights for semantic and dependency CRFs
 
 ## Decode (Rust side)
+0. Run the model over the FULL token sequence (matching training; locked tokens
+   are NOT removed before the model — they are force-kept afterwards).
 1. Run ONNX session → 2 emission tensors + `head_weights`.
 2. Build one CRF per sequence:
    `weighted = head_weights[0] * semantic + head_weights[1] * dependency`
    for emissions, transitions, start transitions, and end transitions.
 3. Run one Viterbi decode over the weighted CRF.
-4. Scatter tag=1 decisions back to the full token stream. Locked positions are always `false` in `drop_mask` (see `src/lamr.rs`).
+4. Map tag=1 decisions onto a full-length `drop_mask`, then force-keep locked
+   positions (always `false`) via `enforce_lock_invariant` (see `src/lamr.rs`).
 
 ## Model config
 - vocab_size: {cfg.vocab_size}

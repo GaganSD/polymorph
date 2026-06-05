@@ -29,6 +29,7 @@ def build_model(cfg: dict) -> LaMRModel:
         n_heads=int(mcfg["n_heads"]),
         ff_mult=int(mcfg["ff_mult"]),
         dropout=float(mcfg["dropout"]),
+        backbone=str(mcfg.get("backbone", "transformer")),
     )
     return LaMRModel(lcfg)
 
@@ -101,8 +102,10 @@ def main(argv: list[str] | None = None) -> int:
         amp_dtype=str(cfg["train"]["amp_dtype"]),
         ckpt_every=int(cfg["train"]["ckpt_every"]),
         log_every=int(cfg["train"]["log_every"]),
-        lambda_sem=float(cfg["train"]["lambda_sem"]),
-        lambda_dep=float(cfg["train"]["lambda_dep"]),
+        # Reserved/inert under the blended-CRF objective (see LaMRModel.joint_nll);
+        # .get() so pruning these config keys never breaks training.
+        lambda_sem=float(cfg["train"].get("lambda_sem", 1.0)),
+        lambda_dep=float(cfg["train"].get("lambda_dep", 1.0)),
     )
     return 0
 

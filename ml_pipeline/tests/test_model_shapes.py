@@ -70,6 +70,35 @@ def test_joint_loss_flows_gradients():
     assert _has_grad(model.crf_dependency)
 
 
+def test_joint_nll_trains_the_decoded_blended_crf():
+    """C1 regression: the optimized loss must be the NLL of the SAME blended CRF
+    that inference decodes (weighted_crf_parameters) — not a sum of two separate
+    CRF losses. Guards against silently training one model and shipping another.
+    """
+    cfg = _tiny_cfg()
+    torch.manual_seed(0)
+    model = LaMRModel(cfg)
+    model.eval()
+    b, t = 2, 7
+    ids = torch.randint(0, cfg.vocab_size, (b, t))
+    mask = torch.ones((b, t), dtype=torch.bool)
+    tags = torch.randint(0, 2, (b, t))
+    with torch.no_grad():
+        out = model.joint_nll(ids, mask, tags)
+        sem, dep, hw = model(ids, mask)
+        params = model.weighted_crf_parameters(sem, dep, hw)
+        expected = model.crf_semantic.nll_with_params(
+            params["emissions"],
+            tags,
+            mask,
+            params["transitions"],
+            params["start_transitions"],
+            params["end_transitions"],
+            reduction="mean",
+        )
+    assert torch.allclose(out["loss"], expected, atol=1e-5)
+
+
 def test_weighted_crf_parameters_shapes_and_decode_parity():
     cfg = _tiny_cfg()
     torch.manual_seed(0)

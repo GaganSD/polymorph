@@ -74,6 +74,41 @@ class LinearChainCRF(nn.Module):
             return nll.sum() / denom
         raise ValueError(f"unknown reduction: {reduction}")
 
+    def nll_with_params(
+        self,
+        emissions: torch.Tensor,           # (B, T, NUM_TAGS)
+        tags: torch.Tensor,                # (B, T) int64 in [0, NUM_TAGS)
+        mask: torch.Tensor,                # (B, T) bool — True = valid position
+        transitions: torch.Tensor,         # (NUM_TAGS, NUM_TAGS) or (B, NUM_TAGS, NUM_TAGS)
+        start_transitions: torch.Tensor,   # (NUM_TAGS,) or (B, NUM_TAGS)
+        end_transitions: torch.Tensor,     # (NUM_TAGS,) or (B, NUM_TAGS)
+        reduction: str = "mean",
+    ) -> torch.Tensor:
+        """CRF NLL using *explicit* (optionally per-sequence batched) transition
+        params instead of this module's own ``self.transitions``.
+
+        This is the objective LaMR trains: the head gate blends the two CRF heads
+        into one per-sequence CRF (see ``LaMRModel.weighted_crf_parameters``), and
+        we optimise the NLL of exactly that blended CRF — the same one Viterbi
+        decodes at inference. fp32 like ``nll`` (logsumexp precision over long T).
+        """
+        emissions = emissions.float()
+        transitions = transitions.float()
+        start_transitions = start_transitions.float()
+        end_transitions = end_transitions.float()
+        score = self._gold_score(emissions, tags, mask, transitions, start_transitions, end_transitions)
+        partition = self._partition(emissions, mask, transitions, start_transitions, end_transitions)
+        nll = partition - score
+        valid = (mask.long().sum(dim=1) > 0).to(nll.dtype)
+        nll = nll * valid
+        if reduction == "none":
+            return nll
+        if reduction == "sum":
+            return nll.sum()
+        if reduction == "mean":
+            return nll.sum() / valid.sum().clamp(min=1.0)
+        raise ValueError(f"unknown reduction: {reduction}")
+
     def decode(
         self,
         emissions: torch.Tensor,  # (B, T, NUM_TAGS)
