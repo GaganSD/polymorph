@@ -33,6 +33,7 @@ train = [
 lamr-pipeline = "polymorph_lamr.pipeline:main"
 lamr-distill = "polymorph_lamr.distill.run_distill:main"
 lamr-train = "polymorph_lamr.train.train:main"
+lamr-eval = "polymorph_lamr.eval.evaluate:main"
 lamr-export = "polymorph_lamr.export.to_onnx:main"
 lamr-stage-corpora = "polymorph_lamr.distill.adapters.stage:main"
 
