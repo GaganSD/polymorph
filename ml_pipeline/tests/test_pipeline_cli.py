@@ -8,8 +8,8 @@ CLI, and asserts:
   * every emitted line matches the shard schema AND round-trips through
     LabeledShardDataset / collate
   * the hallucinated pair was dropped by QC
-  * the split is deterministic (same seed -> identical assignment) and leak-free
-    (no src_path in both splits)
+  * the split is deterministic (same seed -> byte-identical shards) and produces
+    a non-empty val set (chunk-level ~val-frac sample)
 """
 
 import json
@@ -48,8 +48,8 @@ def _extractive(text: str) -> str:
 
 def _write_distilled(path: Path) -> None:
     records = [_HALLUCINATED]
-    # One .py source (two chunks, same src_path) to exercise the AST path and the
-    # "all chunks of one source stay together" leak-free invariant.
+    # One .py source (two chunks, same src_path) to exercise the AST path. Chunks
+    # of one source may land in different splits now (chunk-level split).
     for cid in range(2):
         records.append(
             {
@@ -109,7 +109,7 @@ def test_pipeline_cli_end_to_end(tmp_path, capsys):
     out_dir = tmp_path / "shards"
     _write_distilled(distilled)
 
-    rc = main(["--distilled", str(distilled), "--out-dir", str(out_dir), "--seed", "42"])
+    rc = main(["--distilled", str(distilled), "--out-dir", str(out_dir), "--seed", "42", "--val-frac", "0.3"])
     assert rc == 0
 
     train_path = out_dir / "train.jsonl"
@@ -145,10 +145,10 @@ def test_pipeline_cli_end_to_end(tmp_path, capsys):
     assert batch["input_ids"].dtype == torch.long
     assert set(batch) >= {"input_ids", "tags", "w_semantic", "w_dependency", "attention_mask"}
 
-    # Leak-free: no src_path appears in both splits.
-    train_srcs = {r["src_path"] for r in train}
-    val_srcs = {r["src_path"] for r in val}
-    assert train_srcs.isdisjoint(val_srcs)
+    # Chunk-level split must distribute into BOTH train and val — regression guard
+    # for the empty-val bug a source-level split produced on few-source corpora.
+    assert train, "train split is empty"
+    assert val, "val split is empty"
 
     # Capsys: the QC drop count + summary were printed.
     out = capsys.readouterr().out
@@ -160,20 +160,18 @@ def test_pipeline_split_is_deterministic(tmp_path):
     distilled = tmp_path / "distilled.jsonl"
     _write_distilled(distilled)
 
-    def run(out_name: str) -> dict[str, set[str]]:
+    def run(out_name: str) -> tuple[str, str]:
         out_dir = tmp_path / out_name
-        rc = main(["--distilled", str(distilled), "--out-dir", str(out_dir), "--seed", "42"])
+        rc = main(
+            ["--distilled", str(distilled), "--out-dir", str(out_dir), "--seed", "42", "--val-frac", "0.3"]
+        )
         assert rc == 0
-        train = _read_shard(out_dir / "train.jsonl")
-        val = _read_shard(out_dir / "val.jsonl")
-        return {
-            "train": {r["src_path"] for r in train},
-            "val": {r["src_path"] for r in val},
-        }
+        return (
+            (out_dir / "train.jsonl").read_text(),
+            (out_dir / "val.jsonl").read_text(),
+        )
 
-    first = run("run1")
-    second = run("run2")
-    assert first == second, "same seed must yield identical split assignment"
+    assert run("run1") == run("run2"), "same seed must yield byte-identical shards"
 
 
 def test_pipeline_no_lang_detect_forces_prose(tmp_path):

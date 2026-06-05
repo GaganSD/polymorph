@@ -14,9 +14,9 @@ Steps:
      and AST hop-decay soft weights (``label.ast_split.split_labels``). Language is
      inferred from ``src_path`` (.py -> python, .json -> json, else None) unless
      ``--lang-detect`` is off.
-  4. Deterministic, leak-free train/val split: hash the *source identity*
-     (``src_path``, not ``chunk_id``) with hashlib so every chunk of one source lands
-     in the same split and the assignment is stable across runs/interpreters.
+  4. Deterministic train/val split: hash ``src_path:chunk_id`` with hashlib for a
+     stable ~val-frac chunk-level sample, stratified across formats (real corpora
+     have few distinct sources, so a source-level split yields an empty val set).
   5. Write ``<out-dir>/train.jsonl`` and ``<out-dir>/val.jsonl`` in the exact shard
      schema ``train.dataset.LabeledShardDataset`` consumes:
         {input_ids, tags(0=keep,1=drop), w_semantic, w_dependency, is_code, src_path}
@@ -51,6 +51,7 @@ class DistilledPair:
     original: str
     compressed: str
     src_path: str
+    chunk_id: int = 0
 
 
 def _load_distilled(path: Path) -> list[DistilledPair]:
@@ -84,6 +85,7 @@ def _load_distilled(path: Path) -> list[DistilledPair]:
                     original=original,
                     compressed=compressed,
                     src_path=src_path,
+                    chunk_id=int(rec.get("chunk_id", 0)),
                 )
             )
     if bad_lines:
@@ -109,19 +111,23 @@ def _infer_lang(src_path: str) -> str | None:
     return None
 
 
-def _split_bucket(src_path: str, val_frac: float, seed: int) -> str:
-    """Deterministically assign a *source* to "train" or "val".
+def _split_bucket(src_path: str, chunk_id: int, val_frac: float, seed: int) -> str:
+    """Deterministically assign one chunk to "train" or "val".
 
-    Hashes ``src_path`` (the corpus/file identity, NOT chunk_id) so every chunk of
-    one source lands in the same split — no leakage. Uses hashlib (stable across
-    runs and interpreters), not Python's salted ``hash()``.
+    Hashes ``src_path:chunk_id`` for a stable ~``val_frac`` sample at the CHUNK
+    level. We split per chunk, not per source: real corpora have only a handful of
+    distinct sources (one staged file per log format), so a source-level split
+    rounds to an empty val set. Chunk-level splitting stratifies naturally — each
+    source has many chunks, so ~``val_frac`` of every format lands in val — and
+    measures the deployment case: generalization to held-out chunks of the same
+    formats. Uses hashlib (stable across runs/interpreters), not salted ``hash()``.
     """
     if val_frac <= 0.0:
         return "train"
-    key = f"{seed}:{src_path}".encode("utf-8")
+    key = f"{seed}:{src_path}:{chunk_id}".encode("utf-8")
     digest = hashlib.sha256(key).hexdigest()
-    # Map the leading HEX_WIDTH hex digits to a fraction in [0, 1). The divisor
-    # is derived from the slice width so the two can't drift out of lockstep.
+    # Leading hex digits -> fraction in [0, 1); divisor derived from the slice
+    # width so the two can't drift out of lockstep.
     bucket = int(digest[:_SPLIT_HEX_WIDTH], 16) / float(1 << (4 * _SPLIT_HEX_WIDTH))
     return "val" if bucket < val_frac else "train"
 
@@ -239,7 +245,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.min_tokens and len(shard["input_ids"]) < args.min_tokens:
                 skipped_short += 1
                 continue
-            bucket = _split_bucket(pair.src_path, args.val_frac, args.seed)
+            bucket = _split_bucket(pair.src_path, pair.chunk_id, args.val_frac, args.seed)
             handles[bucket].write(json.dumps(shard) + "\n")
             counts[bucket] += 1
             emitted += 1
