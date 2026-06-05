@@ -59,6 +59,7 @@ def train(
     lambda_dep: float = 1.0,
     aux_ce_weight: float = 0.0,
     drop_class_weight: float = 1.0,
+    crf_nll_weight: float = 1.0,
     val_loader: DataLoader | None = None,
     eval_every: int = 0,
 ) -> TrainState:
@@ -99,6 +100,7 @@ def train(
                     lambda_dep=lambda_dep,
                     aux_ce_weight=aux_ce_weight,
                     drop_class_weight=drop_class_weight,
+                    crf_nll_weight=crf_nll_weight,
                 )
             loss = out["loss"] / grad_accum
             loss.backward()

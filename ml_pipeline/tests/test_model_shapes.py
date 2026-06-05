@@ -96,6 +96,45 @@ def test_joint_nll_adds_class_weighted_ce():
     assert torch.allclose(out["loss"], expected, atol=1e-5)
 
 
+def test_crf_nll_weight_scales_and_zeroes_crf_term():
+    """crf_nll_weight scales the CRF NLL in the total; at 0 the objective is the
+    pure class-weighted CE (transitions get no gradient, stay flat)."""
+    cfg = _tiny_cfg()
+    torch.manual_seed(0)
+    model = LaMRModel(cfg)
+    model.eval()
+    b, t = 2, 7
+    ids = torch.randint(0, cfg.vocab_size, (b, t))
+    mask = torch.ones((b, t), dtype=torch.bool)
+    tags = torch.randint(0, 2, (b, t))
+    with torch.no_grad():
+        out = model.joint_nll(ids, mask, tags, aux_ce_weight=1.0, drop_class_weight=2.5, crf_nll_weight=0.0)
+        # crf_nll still reported (for logging) but contributes 0 to the loss.
+        assert torch.allclose(out["loss"], out["aux_ce"], atol=1e-5)
+        # A half-weighted CRF lands halfway between pure-CE and full.
+        half = model.joint_nll(ids, mask, tags, aux_ce_weight=1.0, drop_class_weight=2.5, crf_nll_weight=0.5)
+        expected_half = 0.5 * out["crf_nll"] + out["aux_ce"]
+        assert torch.allclose(half["loss"], expected_half, atol=1e-5)
+
+
+def test_crf_nll_weight_zero_freezes_transitions():
+    """With crf_nll_weight=0 the CRF transitions receive no gradient (only the
+    emissions learn), so a flat-init CRF stays flat -> Viterbi = argmax."""
+    cfg = _tiny_cfg()
+    torch.manual_seed(0)
+    model = LaMRModel(cfg)
+    b, t = 2, 6
+    ids = torch.randint(0, cfg.vocab_size, (b, t))
+    mask = torch.ones((b, t), dtype=torch.bool)
+    tags = torch.randint(0, 2, (b, t))
+    out = model.joint_nll(ids, mask, tags, aux_ce_weight=1.0, drop_class_weight=2.5, crf_nll_weight=0.0)
+    out["loss"].backward()
+    # Emissions head learns; CRF transition params get no gradient.
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.export_core.head.parameters())
+    for p in model.crf.parameters():
+        assert p.grad is None or p.grad.abs().sum() == 0
+
+
 def test_drop_class_weight_scales_drop_token_loss():
     """Up-weighting the drop class raises the aux CE when the gold tokens are drop —
     the lever that pulls the model off the keep-all collapse."""

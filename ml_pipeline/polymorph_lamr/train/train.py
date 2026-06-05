@@ -50,6 +50,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="override config train.aux_ce_weight (class-weighted CE strength)")
     p.add_argument("--drop-class-weight", type=float, default=None,
                    help="override config train.drop_class_weight (drop-class upweight in the aux CE)")
+    p.add_argument("--crf-nll-weight", type=float, default=None,
+                   help="override config train.crf_nll_weight (CRF NLL strength; 0 => transitions stay flat)")
     return p
 
 
@@ -125,9 +127,14 @@ def main(argv: list[str] | None = None) -> int:
         args.drop_class_weight if args.drop_class_weight is not None
         else float(cfg["train"].get("drop_class_weight", 1.0))
     )
+    crf_nll_weight = (
+        args.crf_nll_weight if args.crf_nll_weight is not None
+        else float(cfg["train"].get("crf_nll_weight", 1.0))
+    )
     print(
         f"[train] lr={lr} warmup={warmup_steps} max_steps={max_steps} "
-        f"aux_ce_weight={aux_ce_weight} drop_class_weight={drop_class_weight}"
+        f"aux_ce_weight={aux_ce_weight} drop_class_weight={drop_class_weight} "
+        f"crf_nll_weight={crf_nll_weight}"
     )
     train(
         model=model,
@@ -145,9 +152,11 @@ def main(argv: list[str] | None = None) -> int:
         # keys never breaks training.
         lambda_sem=float(cfg["train"].get("lambda_sem", 1.0)),
         lambda_dep=float(cfg["train"].get("lambda_dep", 1.0)),
-        # Class-imbalance fix: class-weighted token-CE auxiliary on the emissions.
+        # Class-imbalance fix: class-weighted token-CE auxiliary on the emissions,
+        # plus a CRF-NLL weight to keep transitions from collapsing to keep-all.
         aux_ce_weight=aux_ce_weight,
         drop_class_weight=drop_class_weight,
+        crf_nll_weight=crf_nll_weight,
         val_loader=val_loader,
         eval_every=int(cfg["train"].get("eval_every", 0)),
     )

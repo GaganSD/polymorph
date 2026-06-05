@@ -96,20 +96,30 @@ class LaMRModel(nn.Module):
         lambda_dep: float = 1.0,
         aux_ce_weight: float = 0.0,
         drop_class_weight: float = 1.0,
+        crf_nll_weight: float = 1.0,
     ) -> dict[str, torch.Tensor]:
-        """Training objective: the per-token NLL of the single linear-chain CRF
-        (the exact CRF the Rust/ONNX path decodes with Viterbi, so train == infer),
-        optionally plus a class-weighted token cross-entropy on the same emissions.
+        """Training objective: a weighted sum of the single linear-chain CRF's
+        per-token NLL and a class-weighted token cross-entropy, both on the same
+        emissions the Rust/ONNX path decodes with Viterbi (train == infer):
 
-        Why the aux CE: the keep/drop split is ~71/29, and an unweighted CRF NLL
-        collapses to the majority class — it predicts keep almost everywhere (high
-        drop precision, near-zero drop recall, accuracy pinned at the keep-all
-        baseline). A class-weighted CE on the emissions, with drop up-weighted by
-        ``drop_class_weight`` (~ the keep/drop frequency ratio), counters that
-        collapse directly at the emission level, while the CRF still learns the
-        keep/drop transition structure and owns the decode. Total objective is
-        ``crf_nll + aux_ce_weight * weighted_ce``; with ``aux_ce_weight == 0`` it
-        reduces to the pure single-CRF NLL (and the dict carries no ``aux_ce``).
+            loss = crf_nll_weight * crf_nll + aux_ce_weight * weighted_ce
+
+        Why the aux CE: the keep/drop split is ~71/29, and the CRF NLL alone
+        collapses to keep-all (high drop precision, ~0 recall, acc pinned at the
+        baseline). The class-weighted CE (drop up-weighted by ``drop_class_weight``
+        ~ the keep/drop frequency ratio) pushes balanced per-token supervision into
+        the *emissions*.
+
+        Why ``crf_nll_weight``: the CE only shapes emissions; the CRF *transitions*
+        are trained solely by the CRF NLL, which on the imbalanced corpus drives a
+        dominant keep->keep self-loop that suppresses drops at Viterbi decode — a
+        transition-side collapse no emission-side knob can fix (observed: every run
+        collapses at ~2 epochs regardless of CE/LR). Down-weighting the CRF NLL
+        keeps the transitions near their flat init (flat transitions => Viterbi =
+        per-token argmax of the balanced emissions), so the decode can't collapse.
+        ``crf_nll_weight=0`` trains a pure class-weighted token classifier with the
+        CRF acting as an identity smoother; ``=1`` (default) recovers prior
+        behavior. With ``aux_ce_weight == 0`` the dict carries no ``aux_ce``.
 
         ``w_semantic`` / ``w_dependency`` (AST hop-decay soft labels) and
         ``lambda_*`` are reserved and unused; they stay in the signature for
@@ -117,11 +127,13 @@ class LaMRModel(nn.Module):
         """
         emissions = self.forward(input_ids, attention_mask)
         crf_nll = self.crf.nll(emissions, tags, attention_mask, reduction="token_mean")
-        out = {"loss": crf_nll, "crf_nll": crf_nll}
+        loss = crf_nll_weight * crf_nll
+        out = {"crf_nll": crf_nll}
         if aux_ce_weight > 0.0:
             aux_ce = self._weighted_token_ce(emissions, tags, attention_mask, drop_class_weight)
             out["aux_ce"] = aux_ce
-            out["loss"] = crf_nll + aux_ce_weight * aux_ce
+            loss = loss + aux_ce_weight * aux_ce
+        out["loss"] = loss
         return out
 
     @staticmethod

@@ -81,6 +81,12 @@ train:
   # aux_ce_weight: 0.0 to recover the pure single-CRF objective.
   aux_ce_weight: 1.0
   drop_class_weight: 2.5  # ~= keep/drop frequency ratio (0.714 / 0.286)
+  # CRF NLL strength. The transitions are trained ONLY by the CRF NLL, and on the
+  # imbalanced corpus that NLL drives a keep->keep self-loop that collapses the
+  # Viterbi decode to keep-all (~2 epochs in, independent of the CE/LR knobs).
+  # Down-weight it so transitions stay near their flat init (flat => Viterbi =
+  # argmax of the balanced emissions). 0 => pure class-weighted token classifier.
+  crf_nll_weight: 1.0
   seed: 1337
 
 export:

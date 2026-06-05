@@ -50,6 +50,7 @@ def train(
     warmup_steps: int = -1,
     aux_ce_weight: float = -1.0,
     drop_class_weight: float = -1.0,
+    crf_nll_weight: float = -1.0,
 ) -> dict:
     import os
     import sys
@@ -84,6 +85,8 @@ def train(
         argv += ["--aux-ce-weight", str(aux_ce_weight)]
     if drop_class_weight >= 0:
         argv += ["--drop-class-weight", str(drop_class_weight)]
+    if crf_nll_weight >= 0:
+        argv += ["--crf-nll-weight", str(crf_nll_weight)]
     rc = train_main(argv)
     if rc != 0:
         raise SystemExit(f"training failed rc={rc}")
@@ -116,6 +119,7 @@ def main(
     warmup_steps: int = -1,
     aux_ce_weight: float = -1.0,
     drop_class_weight: float = -1.0,
+    crf_nll_weight: float = -1.0,
 ):
     result = train.remote(
         max_steps=max_steps,
@@ -124,6 +128,7 @@ def main(
         warmup_steps=warmup_steps,
         aux_ce_weight=aux_ce_weight,
         drop_class_weight=drop_class_weight,
+        crf_nll_weight=crf_nll_weight,
     )
     print("RESULT:", result)
     print(f"download with: modal volume get polymorph-lamr-v0 /out/{out_subdir} data/modal_out/{out_subdir}")
