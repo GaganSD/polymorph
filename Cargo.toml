@@ -32,6 +32,11 @@ rand_chacha = "0.3"
 uuid = { version = "1", features = ["v4"] }
 crossbeam-channel = "0.5"
 dirs = "5"
+# Pure-Rust ONNX inference for the LaMR pruner. Chosen over `ort` (onnxruntime
+# bindings) because `ort` pulls in a native C++ runtime / prebuilt binary, which
+# breaks a clean `cargo install` for an OSS compression engine; tract is pure
+# Rust with no system deps.
+tract-onnx = "0.23"
 
 [dev-dependencies]
 pretty_assertions = "1"
