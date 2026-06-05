@@ -56,6 +56,8 @@ def train(
     log_every: int = 50,
     lambda_sem: float = 1.0,
     lambda_dep: float = 1.0,
+    val_loader: DataLoader | None = None,
+    eval_every: int = 0,
 ) -> TrainState:
     device = _pick_device()
     model.to(device)
@@ -117,6 +119,17 @@ def train(
                     )
                 if state.step % ckpt_every == 0:
                     save_checkpoint(model, out_dir / f"ckpt-{state.step:06d}.pt", state)
+                if eval_every and val_loader is not None and state.step % eval_every == 0:
+                    from ..eval.evaluate import evaluate
+
+                    m = evaluate(model, val_loader, device)
+                    print(
+                        f"  [val] step={state.step} acc={m['accuracy']:.4f} "
+                        f"drop_f1={m['drop_f1']:.4f} (P{m['drop_precision']:.3f}/R{m['drop_recall']:.3f}) "
+                        f"drop_rate={m['pred_drop_rate']:.3f}/gold{m['gold_drop_rate']:.3f} "
+                        f"nll/tok={m['per_token_nll']:.4f}"
+                    )
+                    model.train()
                 if state.step >= max_steps:
                     break
         if batches_this_epoch == 0:

@@ -64,13 +64,14 @@ train:
   batch_size: 8
   grad_accum: 8           # virtual batch 64
   max_seq_len: 1024
-  lr: 1.0e-4              # was 3.0e-4 — peak LR too high; caused loss spikes right after warmup
+  lr: 2.0e-4              # per-token loss caps per-token grad, so a moderate LR is stable (3e-4 spiked under the old per-sequence loss)
   weight_decay: 0.01
-  warmup_steps: 300       # was 200 — longer warmup for a stable ramp
-  max_steps: 1000         # was 20000 (~60 epochs, overfit); ~3 epochs over the v0 corpus now that the loop cycles
+  warmup_steps: 300       # longer warmup for a stable ramp
+  max_steps: 1500         # ~4.6 epochs over the v0 corpus (loop cycles epochs; watch val F1 via eval_every)
   amp_dtype: bf16
   ckpt_every: 1000
   log_every: 50
+  eval_every: 200         # periodic val pass (acc/F1/drop-rate) when --val-shards is given
   lambda_sem: 1.0
   lambda_dep: 1.0
   seed: 1337

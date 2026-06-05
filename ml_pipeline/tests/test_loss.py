@@ -43,5 +43,6 @@ def test_joint_loss_returns_blended_crf_nll():
         params["transitions"],
         params["start_transitions"],
         params["end_transitions"],
+        reduction="token_mean",
     )
     assert torch.isclose(out["loss"], expected, atol=1e-5)

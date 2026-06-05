@@ -38,6 +38,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Train LaMR.")
     p.add_argument("--config", type=Path, required=True)
     p.add_argument("--shards", nargs="+", required=False, help="JSONL labeled shards")
+    p.add_argument("--val-shards", nargs="+", default=None,
+                   help="JSONL val shards; enables periodic val eval (acc/F1/drop-rate)")
     p.add_argument("--out", type=Path, default=Path("artifacts/checkpoints"))
     p.add_argument("--dry-run", action="store_true", help="report device + param count + memory and exit")
     p.add_argument("--max-steps", type=int, default=None, help="override config max_steps")
@@ -89,6 +91,20 @@ def main(argv: list[str] | None = None) -> int:
         num_workers=0,  # IterableDataset; bump for production
     )
 
+    val_loader = None
+    if args.val_shards:
+        val_ds = LabeledShardDataset(
+            shard_paths=[Path(p) for p in args.val_shards],
+            max_seq_len=int(cfg["train"]["max_seq_len"]),
+            shuffle_files=False,
+        )
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=int(cfg["train"]["batch_size"]),
+            collate_fn=partial(collate, pad_id=0),
+            num_workers=0,
+        )
+
     max_steps = args.max_steps if args.max_steps is not None else int(cfg["train"]["max_steps"])
     train(
         model=model,
@@ -106,6 +122,8 @@ def main(argv: list[str] | None = None) -> int:
         # .get() so pruning these config keys never breaks training.
         lambda_sem=float(cfg["train"].get("lambda_sem", 1.0)),
         lambda_dep=float(cfg["train"].get("lambda_dep", 1.0)),
+        val_loader=val_loader,
+        eval_every=int(cfg["train"].get("eval_every", 0)),
     )
     return 0
 

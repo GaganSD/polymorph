@@ -141,6 +141,9 @@ class LaMRModel(nn.Module):
         """
         emi_sem, emi_dep, head_weights = self.forward(input_ids, attention_mask)
         params = self.weighted_crf_parameters(emi_sem, emi_dep, head_weights)
+        # Per-token loss (nats/token): length-invariant + smooth, and it caps each
+        # token's gradient contribution so long sequences can't spike the loss/grad
+        # (the instability seen with the per-sequence loss).
         loss = self.crf_semantic.nll_with_params(
             params["emissions"],
             tags,
@@ -148,11 +151,11 @@ class LaMRModel(nn.Module):
             params["transitions"],
             params["start_transitions"],
             params["end_transitions"],
-            reduction="mean",
+            reduction="token_mean",
         )
         with torch.no_grad():
-            nll_sem = self.crf_semantic.nll(emi_sem, tags, attention_mask, reduction="mean")
-            nll_dep = self.crf_dependency.nll(emi_dep, tags, attention_mask, reduction="mean")
+            nll_sem = self.crf_semantic.nll(emi_sem, tags, attention_mask, reduction="token_mean")
+            nll_dep = self.crf_dependency.nll(emi_dep, tags, attention_mask, reduction="token_mean")
         return {
             "loss": loss,
             "nll_sem": nll_sem,

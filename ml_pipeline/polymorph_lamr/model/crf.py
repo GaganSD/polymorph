@@ -72,6 +72,11 @@ class LinearChainCRF(nn.Module):
         if reduction == "mean":
             denom = valid.sum().clamp(min=1.0)
             return nll.sum() / denom
+        if reduction == "token_mean":
+            # Per-token NLL (nats/token): length-invariant and smooth, and weights
+            # every token equally rather than every sequence (a long sequence no
+            # longer dominates the loss just by being long).
+            return nll.sum() / mask.long().sum().clamp(min=1).to(nll.dtype)
         raise ValueError(f"unknown reduction: {reduction}")
 
     def nll_with_params(
@@ -107,6 +112,8 @@ class LinearChainCRF(nn.Module):
             return nll.sum()
         if reduction == "mean":
             return nll.sum() / valid.sum().clamp(min=1.0)
+        if reduction == "token_mean":
+            return nll.sum() / mask.long().sum().clamp(min=1).to(nll.dtype)
         raise ValueError(f"unknown reduction: {reduction}")
 
     def decode(

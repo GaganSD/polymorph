@@ -94,7 +94,7 @@ def test_joint_nll_trains_the_decoded_blended_crf():
             params["transitions"],
             params["start_transitions"],
             params["end_transitions"],
-            reduction="mean",
+            reduction="token_mean",
         )
     assert torch.allclose(out["loss"], expected, atol=1e-5)
 

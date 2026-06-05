@@ -56,16 +56,18 @@ def train(max_steps: int = 2000) -> dict:
     print(f"[modal] torch={torch.__version__} cuda={torch.cuda.is_available()} dev={dev}")
 
     train_jsonl = "/data/shards/v0/train.jsonl"
+    val_jsonl = "/data/shards/v0/val.jsonl"
     out = "/data/out/v0"
     Path(out).mkdir(parents=True, exist_ok=True)
-    print(f"[modal] train={train_jsonl} out={out} max_steps={max_steps}")
+    print(f"[modal] train={train_jsonl} val={val_jsonl} out={out} max_steps={max_steps}")
 
     from polymorph_lamr.train.train import main as train_main
 
-    rc = train_main(
-        ["--config", "configs/default.yaml", "--shards", train_jsonl, "--out", out,
-         "--max-steps", str(max_steps)]
-    )
+    argv = ["--config", "configs/default.yaml", "--shards", train_jsonl, "--out", out,
+            "--max-steps", str(max_steps)]
+    if Path(val_jsonl).is_file():
+        argv += ["--val-shards", val_jsonl]  # periodic val acc/F1/drop-rate during training
+    rc = train_main(argv)
     if rc != 0:
         raise SystemExit(f"training failed rc={rc}")
 

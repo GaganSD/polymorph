@@ -147,3 +147,15 @@ def test_viterbi_golden_matches_rust_decode():
         end_transitions=end,
     )
     assert decoded == [[0, 1, 0]]
+
+
+def test_token_mean_reduction_is_total_nll_over_tokens():
+    """token_mean = sum(NLL) / total valid tokens (nats/token) — the per-token loss."""
+    torch.manual_seed(0)
+    crf = LinearChainCRF()
+    emissions = torch.randn(2, 4, NUM_TAGS)
+    tags = torch.zeros(2, 4, dtype=torch.long)
+    mask = torch.tensor([[True, True, True, True], [True, True, False, False]])
+    none = crf.nll(emissions, tags, mask, reduction="none")
+    tm = crf.nll(emissions, tags, mask, reduction="token_mean")
+    assert torch.isclose(tm, none.sum() / mask.long().sum())

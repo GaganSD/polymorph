@@ -173,3 +173,23 @@ def test_train_cycles_epochs_to_reach_max_steps(tmp_path, monkeypatch):
     )
     assert (out_dir / "ckpt-000005.pt").exists(), "loop did not cycle to max_steps=5"
     assert (out_dir / "ckpt-final.pt").exists()
+
+
+def test_train_runs_periodic_val_eval(tmp_path, monkeypatch, capsys):
+    """eval_every + a val_loader triggers a periodic val pass that prints [val]."""
+    monkeypatch.setattr("polymorph_lamr.train.loop._pick_device", lambda: torch.device("cpu"))
+    shard = _make_shard(tmp_path)
+    lcfg = LaMRConfig(vocab_size=64, d_model=16, n_layers=1, n_heads=2, ff_mult=2, dropout=0.0)
+    model = LaMRModel(lcfg)
+    from functools import partial
+    ds = LabeledShardDataset([shard], max_seq_len=8, seed=7)
+    loader = DataLoader(ds, batch_size=1, collate_fn=partial(collate, pad_id=0), num_workers=0)
+    val_ds = LabeledShardDataset([shard], max_seq_len=8, shuffle_files=False)
+    val_loader = DataLoader(val_ds, batch_size=1, collate_fn=partial(collate, pad_id=0), num_workers=0)
+    train(
+        model=model, loader=loader, out_dir=tmp_path / "ck", max_steps=2,
+        grad_accum=1, lr=1e-3, weight_decay=0.0, warmup_steps=0, amp_dtype="fp32",
+        ckpt_every=10, log_every=10, lambda_sem=1.0, lambda_dep=1.0,
+        val_loader=val_loader, eval_every=1,
+    )
+    assert "[val]" in capsys.readouterr().out
