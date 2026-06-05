@@ -57,6 +57,8 @@ def train(
     log_every: int = 50,
     lambda_sem: float = 1.0,
     lambda_dep: float = 1.0,
+    aux_ce_weight: float = 0.0,
+    drop_class_weight: float = 1.0,
     val_loader: DataLoader | None = None,
     eval_every: int = 0,
 ) -> TrainState:
@@ -83,9 +85,10 @@ def train(
                 batch[k] = v.to(device)
 
             with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
-                # NOTE: w_semantic/w_dependency and lambda_sem/lambda_dep are currently
-                # RESERVED and do not affect the loss — joint_nll optimizes the single
-                # blended CRF (see its docstring). Threaded through for forward-compat.
+                # aux_ce_weight/drop_class_weight are LIVE: they add a class-weighted
+                # token-CE to the CRF NLL to counter keep/drop majority-class collapse
+                # (see LaMRModel.joint_nll). w_semantic/w_dependency and lambda_sem/
+                # lambda_dep remain RESERVED (inert) — threaded for forward-compat.
                 out = model.joint_nll(
                     input_ids=batch["input_ids"],
                     attention_mask=batch["attention_mask"],
@@ -94,6 +97,8 @@ def train(
                     w_dependency=batch["w_dependency"],
                     lambda_sem=lambda_sem,
                     lambda_dep=lambda_dep,
+                    aux_ce_weight=aux_ce_weight,
+                    drop_class_weight=drop_class_weight,
                 )
             loss = out["loss"] / grad_accum
             loss.backward()
@@ -111,9 +116,11 @@ def train(
 
                 if state.step % log_every == 0:
                     dt = time.time() - t0
+                    crf_str = f" crf={out['crf_nll'].item():.4f}" if "crf_nll" in out else ""
+                    ce_str = f" ce={out['aux_ce'].item():.4f}" if "aux_ce" in out else ""
                     print(
                         f"step={state.step:6d} lr={cur_lr:.2e} "
-                        f"loss={out['loss'].item():.4f} elapsed={dt:.1f}s"
+                        f"loss={out['loss'].item():.4f}{crf_str}{ce_str} elapsed={dt:.1f}s"
                     )
                 if state.step % ckpt_every == 0:
                     save_checkpoint(model, out_dir / f"ckpt-{state.step:06d}.pt", state)

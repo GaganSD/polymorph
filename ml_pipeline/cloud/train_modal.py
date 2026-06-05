@@ -42,7 +42,7 @@ vol = modal.Volume.from_name("polymorph-lamr-v0", create_if_missing=True)
 
 
 @app.function(image=image, gpu=GPU, volumes={"/data": vol}, timeout=2 * 60 * 60)
-def train(max_steps: int = 2000) -> dict:
+def train(max_steps: int = 2000, out_subdir: str = "v0") -> dict:
     import os
     import sys
     from pathlib import Path
@@ -57,7 +57,7 @@ def train(max_steps: int = 2000) -> dict:
 
     train_jsonl = "/data/shards/v0/train.jsonl"
     val_jsonl = "/data/shards/v0/val.jsonl"
-    out = "/data/out/v0"
+    out = f"/data/out/{out_subdir}"
     Path(out).mkdir(parents=True, exist_ok=True)
     print(f"[modal] train={train_jsonl} val={val_jsonl} out={out} max_steps={max_steps}")
 
@@ -73,18 +73,26 @@ def train(max_steps: int = 2000) -> dict:
 
     from polymorph_lamr.export.to_onnx import export
 
+    # Export the BEST-by-val checkpoint, not the final one: the model can oscillate
+    # back into keep-all collapse late in training, so ckpt-final is often worse than
+    # the ckpt-best the val loop captured. Fall back to final only if best is absent
+    # (e.g. eval disabled).
+    best = Path(out) / "ckpt-best.pt"
+    final = Path(out) / "ckpt-final.pt"
+    ckpt = best if best.is_file() else final
+    print(f"[modal] exporting {ckpt.name}")
     parity = export(
-        checkpoint=Path(out) / "ckpt-final.pt",
+        checkpoint=ckpt,
         out_dir=Path(out) / "onnx",
         config_path=Path("configs/default.yaml"),
     )
     print(f"[modal] export parity: {parity}")
     vol.commit()  # persist /data writes so `modal volume get` sees them
-    return {"parity": parity, "out": out}
+    return {"parity": parity, "out": out, "exported_ckpt": ckpt.name}
 
 
 @app.local_entrypoint()
-def main(max_steps: int = 2000):
-    result = train.remote(max_steps=max_steps)
+def main(max_steps: int = 2000, out_subdir: str = "v0"):
+    result = train.remote(max_steps=max_steps, out_subdir=out_subdir)
     print("RESULT:", result)
-    print("download with: modal volume get polymorph-lamr-v0 /out/v0 data/modal_out/v0")
+    print(f"download with: modal volume get polymorph-lamr-v0 /out/{out_subdir} data/modal_out/{out_subdir}")

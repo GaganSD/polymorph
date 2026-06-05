@@ -118,10 +118,13 @@ def main(argv: list[str] | None = None) -> int:
         amp_dtype=str(cfg["train"]["amp_dtype"]),
         ckpt_every=int(cfg["train"]["ckpt_every"]),
         log_every=int(cfg["train"]["log_every"]),
-        # Reserved/inert under the blended-CRF objective (see LaMRModel.joint_nll);
-        # .get() so pruning these config keys never breaks training.
+        # Reserved/inert (see LaMRModel.joint_nll); .get() so pruning these config
+        # keys never breaks training.
         lambda_sem=float(cfg["train"].get("lambda_sem", 1.0)),
         lambda_dep=float(cfg["train"].get("lambda_dep", 1.0)),
+        # Class-imbalance fix: class-weighted token-CE auxiliary on the emissions.
+        aux_ce_weight=float(cfg["train"].get("aux_ce_weight", 0.0)),
+        drop_class_weight=float(cfg["train"].get("drop_class_weight", 1.0)),
         val_loader=val_loader,
         eval_every=int(cfg["train"].get("eval_every", 0)),
     )

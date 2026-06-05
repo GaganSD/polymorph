@@ -74,6 +74,13 @@ train:
   eval_every: 200         # periodic val pass (acc/F1/drop-rate) when --val-shards is given
   lambda_sem: 1.0
   lambda_dep: 1.0
+  # Class-imbalance fix. The keep/drop split is ~71/29, so an unweighted CRF NLL
+  # collapses to keep-all (high drop precision, ~0 recall, acc stuck at the 0.714
+  # baseline). A class-weighted token-CE auxiliary on the emissions counters the
+  # collapse; total loss = crf_nll + aux_ce_weight * weighted_ce. Set
+  # aux_ce_weight: 0.0 to recover the pure single-CRF objective.
+  aux_ce_weight: 1.0
+  drop_class_weight: 2.5  # ~= keep/drop frequency ratio (0.714 / 0.286)
   seed: 1337
 
 export:
