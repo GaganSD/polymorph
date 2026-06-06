@@ -7,10 +7,11 @@ exportable with a dynamic ``T`` axis:
 * ``TransformerEncoderBackbone`` (default) — a real bidirectional pre-norm
   Transformer encoder. Bidirectional self-attention is the correct inductive
   bias here: LaMR tags every token keep/drop over a *fully observed* log chunk
-  (not autoregressive generation), then a linear-chain CRF decodes the
-  sequence — the textbook encoder->CRF sequence-labelling stack. At T<=1024 full
-  O(T^2) attention is cheap, and the graph is plain MatMul/Softmax/LayerNorm so
-  ONNX export stays clean (no custom recurrent scan to go brittle).
+  (not autoregressive generation), then a per-token drop head scores each
+  token — the textbook bidirectional-encoder sequence-labelling stack. At
+  T<=1024 full O(T^2) attention is cheap, and the graph is plain
+  MatMul/Softmax/LayerNorm so ONNX export stays clean (no custom recurrent scan
+  to go brittle).
 
 * ``GatedDeltaNet2Stub`` — the original feed-forward placeholder, kept for the
   ``backbone: deltanet_stub`` config path and as a fallback. It does no token
@@ -22,7 +23,7 @@ Why a Transformer encoder rather than a literal Gated DeltaNet-2 (the old
 RNN aimed at long-context generation. Using it for this task would mean a
 bidirectional two-pass wrapper plus exporting a custom scan to ONNX — trading
 robustness for exoticness with no quality upside at this sequence length. The
-encoder is the defensible SOTA choice for sequence labelling into a CRF.
+encoder is the defensible SOTA choice for per-token sequence labelling.
 """
 
 from __future__ import annotations
@@ -71,7 +72,7 @@ class _MultiHeadSelfAttention(nn.Module):
     under fp16 autocast and turns an all-padding row's softmax into NaN). With
     the dtype-aware fill, valid queries put ~zero weight on padding so every
     valid position's output is independent of padding content (the property
-    ``test_head_gate_ignores_padding_values`` relies on), and an all-padding row
+    ``test_valid_positions_independent_of_padding_content`` relies on), and an all-padding row
     yields a finite uniform softmax instead of NaN. No causal mask: the task is
     bidirectional sequence labelling, so each token may attend both ways.
     """
@@ -139,6 +140,7 @@ class TransformerEncoderBackbone(nn.Module):
         n_heads: int = 4,
         ff_mult: int = 4,
         dropout: float = 0.1,
+        **_kwargs,  # tolerate backbone-specific kwargs (e.g. encoder_name) from the factory
     ):
         super().__init__()
         self.d_model = d_model
@@ -170,7 +172,7 @@ class TransformerEncoderBackbone(nn.Module):
         x = self.norm(x)
 
         if attention_mask is not None:
-            # Scrub padded positions to 0 (cosmetic; CRF/gate mask them anyway).
+            # Scrub padded positions to 0 (cosmetic; the loss/decode mask them anyway).
             x = torch.where(attention_mask.bool().unsqueeze(-1), x, torch.zeros_like(x))
         return x
 
@@ -197,6 +199,7 @@ class GatedDeltaNet2Stub(nn.Module):
         n_heads: int = 4,
         ff_mult: int = 4,
         dropout: float = 0.1,
+        **_kwargs,  # tolerate backbone-specific kwargs from the factory
     ):
         super().__init__()
         self.d_model = d_model
@@ -219,3 +222,69 @@ class GatedDeltaNet2Stub(nn.Module):
             if attention_mask is not None:
                 x = x * attention_mask.to(x.dtype).unsqueeze(-1)
         return self.norm(x)
+
+
+class ModernBertBackbone(nn.Module):
+    """Pretrained ModernBERT encoder as the backbone (``backbone: modernbert``).
+
+    The SOTA lever for #33: replace the from-scratch 100k-row cl100k embedding
+    (25.7M of 28.8M params, the dominant capacity sink) with a pretrained
+    bidirectional encoder that already understands token structure. The drop head
+    sits on top of ``last_hidden_state`` unchanged.
+
+    Interface contract (same as the other backbones): ``(B, T)`` token ids ->
+    ``(B, T, hidden_size)`` hidden states, optional ``(B, T)`` mask (True/1 =
+    valid). NOTE the tokenizer caveat: ModernBERT does NOT use cl100k — input_ids
+    must be ModernBERT-tokenizer ids, so the training shards and the Rust runtime
+    tokenization both switch with this backbone (tracked in #33).
+
+    Exportability: loaded with ``attn_implementation="eager"`` and
+    ``reference_compile=False`` so ONNX tracing produces a tract-compatible graph.
+    The dynamic-seq export hits a Flatten shape-analysis failure in tract — export
+    at a FIXED window length (see to_onnx + the #33 de-risk finding).
+    """
+
+    def __init__(
+        self,
+        vocab_size: int | None = None,
+        d_model: int = 768,
+        n_layers: int | None = None,
+        n_heads: int | None = None,
+        ff_mult: int | None = None,
+        dropout: float = 0.0,
+        encoder_name: str = "answerdotai/ModernBERT-base",
+        **_kwargs,
+    ):
+        super().__init__()
+        try:
+            from transformers import AutoModel
+        except ImportError as e:  # pragma: no cover - optional dep
+            raise ImportError(
+                "backbone='modernbert' needs `transformers` (pip install "
+                "'polymorph-lamr[encoder]' or `uv pip install transformers`)."
+            ) from e
+        self.encoder = AutoModel.from_pretrained(encoder_name, attn_implementation="eager")
+        if hasattr(self.encoder.config, "reference_compile"):
+            # torch.compile of submodules breaks ONNX tracing; off for export parity.
+            self.encoder.config.reference_compile = False
+        hidden = int(self.encoder.config.hidden_size)
+        if hidden != d_model:
+            raise ValueError(
+                f"config d_model={d_model} must equal the {encoder_name} hidden_size={hidden}; "
+                f"set model.d_model: {hidden} for this encoder."
+            )
+        self.d_model = hidden
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(input_ids.dtype)
+        out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
+        h = out.last_hidden_state
+        if attention_mask is not None:
+            # Scrub padded positions (cosmetic; the loss/decode mask them anyway).
+            h = torch.where(attention_mask.bool().unsqueeze(-1), h, torch.zeros_like(h))
+        return h

@@ -80,11 +80,10 @@ def test_pick_device_returns_device():
     assert isinstance(dev, torch.device)
 
 
-def test_joint_loss_wrapper_returns_blended_loss():
-    # Post-C1: the wrapper returns the model's single trained objective (the
-    # blended-CRF NLL in out["loss"]), NOT a lambda-weighted sum of the per-head
-    # NLLs. The lambda knobs are vestigial and must not change the result.
-    out = {"loss": torch.tensor(2.5), "nll_sem": torch.tensor(2.0), "nll_dep": torch.tensor(3.0)}
+def test_joint_loss_wrapper_returns_model_loss():
+    # The wrapper returns the model's single trained objective (the per-token BCE
+    # in out["loss"]). The lambda knobs are vestigial and must not change the result.
+    out = {"loss": torch.tensor(2.5), "bce": torch.tensor(2.5)}
     assert torch.equal(joint_loss(out, lambda_sem=1.0, lambda_dep=1.0), out["loss"])
     assert torch.equal(joint_loss(out, lambda_sem=2.0, lambda_dep=0.5), out["loss"])
 
@@ -152,3 +151,44 @@ def test_train_cli_requires_shards_when_not_dry(tmp_path, capsys):
     rc = main(["--config", str(cfg_path)])
     assert rc != 0
     assert "shards" in capsys.readouterr().err.lower()
+
+
+def test_train_cycles_epochs_to_reach_max_steps(tmp_path, monkeypatch):
+    """Regression: the loop must re-iterate the data across epochs to reach
+    max_steps. A 1-record shard yields exactly 1 optimizer step per epoch, so
+    reaching step 5 proves cycling (the old single-pass loop stopped at step 1)."""
+    monkeypatch.setattr("polymorph_lamr.train.loop._pick_device", lambda: torch.device("cpu"))
+    shard = _make_shard(tmp_path)  # single record
+    lcfg = LaMRConfig(vocab_size=64, d_model=16, n_layers=1, n_heads=2, ff_mult=2, dropout=0.0)
+    model = LaMRModel(lcfg)
+    ds = LabeledShardDataset([shard], max_seq_len=8, seed=7)
+    from functools import partial
+    loader = DataLoader(ds, batch_size=1, collate_fn=partial(collate, pad_id=0), num_workers=0)
+    out_dir = tmp_path / "ck"
+    train(
+        model=model, loader=loader, out_dir=out_dir, max_steps=5,
+        grad_accum=1, lr=1e-3, weight_decay=0.0, warmup_steps=0, amp_dtype="fp32",
+        ckpt_every=1, log_every=1, lambda_sem=1.0, lambda_dep=1.0,
+    )
+    assert (out_dir / "ckpt-000005.pt").exists(), "loop did not cycle to max_steps=5"
+    assert (out_dir / "ckpt-final.pt").exists()
+
+
+def test_train_runs_periodic_val_eval(tmp_path, monkeypatch, capsys):
+    """eval_every + a val_loader triggers a periodic val pass that prints [val]."""
+    monkeypatch.setattr("polymorph_lamr.train.loop._pick_device", lambda: torch.device("cpu"))
+    shard = _make_shard(tmp_path)
+    lcfg = LaMRConfig(vocab_size=64, d_model=16, n_layers=1, n_heads=2, ff_mult=2, dropout=0.0)
+    model = LaMRModel(lcfg)
+    from functools import partial
+    ds = LabeledShardDataset([shard], max_seq_len=8, seed=7)
+    loader = DataLoader(ds, batch_size=1, collate_fn=partial(collate, pad_id=0), num_workers=0)
+    val_ds = LabeledShardDataset([shard], max_seq_len=8, shuffle_files=False)
+    val_loader = DataLoader(val_ds, batch_size=1, collate_fn=partial(collate, pad_id=0), num_workers=0)
+    train(
+        model=model, loader=loader, out_dir=tmp_path / "ck", max_steps=2,
+        grad_accum=1, lr=1e-3, weight_decay=0.0, warmup_steps=0, amp_dtype="fp32",
+        ckpt_every=10, log_every=10, lambda_sem=1.0, lambda_dep=1.0,
+        val_loader=val_loader, eval_every=1,
+    )
+    assert "[val]" in capsys.readouterr().out

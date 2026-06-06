@@ -4,13 +4,19 @@
 //!   * a deterministic RNG **mock** (`dummy_lamr_forward_pass`), kept as the
 //!     fallback so callers/tests work without an exported model, and
 //!   * the **real** ONNX-backed pruner (`apply_lamr_onnx`), which loads the
-//!     LaMR model exported by `polymorph_lamr/export/to_onnx.py`, blends the two
-//!     emission heads + CRF transition params by `head_weights`, and runs a
-//!     linear-chain Viterbi decode in Rust to produce the per-token drop bits.
+//!     LaMR model exported by `polymorph_lamr/export/to_onnx.py` (backbone + one
+//!     drop head → a `logits` tensor of per-token drop logits), applies
+//!     `sigmoid` to get a drop-probability per token, and decodes by a
+//!     **target-rate threshold**: among the unlocked tokens it drops the top
+//!     `round(target_rate * n_unlocked)` by probability. There is no CRF and no
+//!     Viterbi — the earlier 2-tag CRF was degenerate (stable ranking, only the
+//!     global bias oscillated), so decode became a calibrated threshold and the
+//!     transitions side-car went away.
 //!
 //! Both backends run the model over the **full** token sequence (matching how
-//! the labeler tags every token at training time), then funnel through
-//! [`enforce_lock_invariant`], which projects the deterministic lock constraint:
+//! the labeler tags every token at training time). The mock funnels through
+//! [`enforce_lock_invariant`]; the ONNX path uses [`target_rate_drop_bits`],
+//! which is itself lock-aware. Both honour the invariant:
 //! `lock_mask[i] == true  =>  drop_mask[i] == false`.
 
 use std::path::{Path, PathBuf};
@@ -27,13 +33,10 @@ use tract_onnx::prelude::*;
 /// available; the real model swaps in via [`apply_lamr_onnx`].
 pub const LAMR_SEED: u64 = 0xA5C3_B6D2_E91F_4471;
 
-/// Target drop rate for the mock. The mock returns true (drop) with this
-/// probability for each unlocked token.
+/// Default target drop rate. The mock returns true (drop) with ~this probability
+/// per unlocked token; the ONNX path drops this fraction of unlocked tokens when
+/// `decode.json` doesn't specify one.
 pub const DEFAULT_DROP_RATE: f64 = 0.30;
-
-/// Number of CRF tags. Tag 0 = keep, tag 1 = drop. Fixed by the exported model
-/// (see `polymorph_lamr/model/crf.py`, `NUM_TAGS = 2`).
-const NUM_TAGS: usize = 2;
 
 /// Env var pointing at the exported `model.onnx`. If set and the file exists,
 /// [`apply_lamr`] uses the real ONNX path; otherwise it falls back to the mock.
@@ -84,14 +87,12 @@ pub fn dummy_lamr_forward_pass_seeded(
 // Lock-invariant projection (shared handoff point — DO NOT weaken the invariant)
 // ---------------------------------------------------------------------------
 
-/// Project the lock constraint onto the model's per-token drop decisions.
+/// Project the lock constraint onto a full-length per-token drop decision.
 ///
-/// The neural model runs over the **full** token sequence — exactly as it was
-/// trained (the labeler tags every token of the chunk), so the encoder sees the
-/// same context at train and inference time. `drop_bits[i]` is the model's
-/// decision for token `i` (`true` = drop). A locked token is then force-kept
-/// here: the deterministic lock is a hard must-keep constraint applied *after*
-/// the model and never shown to it.
+/// `drop_bits[i]` is the model's decision for token `i` (`true` = drop). A
+/// locked token is force-kept here: the deterministic lock is a hard must-keep
+/// constraint applied *after* the model and never shown to it. Used by the mock
+/// path (the ONNX path uses the lock-aware [`target_rate_drop_bits`]).
 ///
 /// Invariant: `lock_mask[i] == true  =>  drop_mask[i] == false`.
 pub fn enforce_lock_invariant(lock_mask: &[bool], drop_bits: &[bool]) -> Vec<bool> {
@@ -108,167 +109,110 @@ pub fn enforce_lock_invariant(lock_mask: &[bool], drop_bits: &[bool]) -> Vec<boo
 }
 
 // ---------------------------------------------------------------------------
-// CRF transition params (side-car JSON)
+// Target-rate threshold decode
 // ---------------------------------------------------------------------------
 
-/// Mirror of `transitions.json` emitted by `to_onnx.py`. Each `*_trans` is a
-/// 2x2 row-major matrix where `trans[i][j]` is the score of moving from tag `i`
-/// to tag `j`; `*_start` / `*_end` are length-2 vectors.
+/// Numerically-stable logistic sigmoid: `1 / (1 + e^-x)` → P(drop).
+#[inline]
+fn sigmoid(x: f32) -> f32 {
+    if x >= 0.0 {
+        1.0 / (1.0 + (-x).exp())
+    } else {
+        let e = x.exp();
+        e / (1.0 + e)
+    }
+}
+
+/// Decode per-token drop bits from per-token drop *probabilities* by a
+/// target-rate cut. Among the UNLOCKED tokens, the top
+/// `round(target_rate * n_unlocked)` by probability are marked drop; locked
+/// tokens are never dropped. Returns the final, lock-respecting drop mask.
+///
+/// This is the calibrated-threshold decode: the compression ratio is a runtime
+/// knob (`target_rate`) rather than a fixed 0.5 argmax, which sidesteps the
+/// global-bias oscillation that made the old argmax decode look like it
+/// collapsed. Deterministic: ties in probability break by original token order
+/// (stable sort).
+pub fn target_rate_drop_bits(drop_probs: &[f32], lock_mask: &[bool], target_rate: f64) -> Vec<bool> {
+    assert_eq!(
+        drop_probs.len(),
+        lock_mask.len(),
+        "drop_probs must be full-length (one per token), parallel to lock_mask"
+    );
+    let n = drop_probs.len();
+    let mut drop = vec![false; n];
+    let unlocked: Vec<usize> = (0..n).filter(|&i| !lock_mask[i]).collect();
+    if unlocked.is_empty() {
+        return drop;
+    }
+    let rate = target_rate.clamp(0.0, 1.0);
+    let k = ((rate * unlocked.len() as f64).round() as usize).min(unlocked.len());
+    if k == 0 {
+        return drop;
+    }
+    // Stable sort unlocked indices by drop-prob descending; mark the top k.
+    let mut by_prob = unlocked;
+    by_prob.sort_by(|&a, &b| {
+        drop_probs[b]
+            .partial_cmp(&drop_probs[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for &idx in by_prob.iter().take(k) {
+        drop[idx] = true;
+    }
+    debug_assert!(
+        drop.iter().zip(lock_mask).all(|(&d, &l)| !(d && l)),
+        "target-rate decode must never drop a locked token"
+    );
+    drop
+}
+
+// ---------------------------------------------------------------------------
+// Decode-config side-car (decode.json)
+// ---------------------------------------------------------------------------
+
+/// Mirror of the `decode.json` emitted by `to_onnx.py`. Only `default_target_rate`
+/// is consumed at runtime; the other fields document the contract. Missing file
+/// or fields fall back to [`DEFAULT_DROP_RATE`].
 #[derive(Debug, Clone, Deserialize)]
-pub struct Transitions {
-    pub sem_trans: Vec<Vec<f32>>,
-    pub sem_start: Vec<f32>,
-    pub sem_end: Vec<f32>,
-    pub dep_trans: Vec<Vec<f32>>,
-    pub dep_start: Vec<f32>,
-    pub dep_end: Vec<f32>,
+pub struct DecodeConfig {
+    #[serde(default = "default_target_rate")]
+    pub default_target_rate: f64,
 }
 
-impl Transitions {
-    pub fn from_json_path(path: &Path) -> anyhow::Result<Self> {
-        let raw = std::fs::read_to_string(path)
-            .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
-        let t: Transitions = serde_json::from_str(&raw)
-            .map_err(|e| anyhow::anyhow!("parsing {}: {e}", path.display()))?;
-        t.validate()?;
-        Ok(t)
-    }
-
-    fn validate(&self) -> anyhow::Result<()> {
-        let check_mat = |name: &str, m: &[Vec<f32>]| -> anyhow::Result<()> {
-            anyhow::ensure!(
-                m.len() == NUM_TAGS && m.iter().all(|r| r.len() == NUM_TAGS),
-                "{name} must be {NUM_TAGS}x{NUM_TAGS}"
-            );
-            Ok(())
-        };
-        let check_vec = |name: &str, v: &[f32]| -> anyhow::Result<()> {
-            anyhow::ensure!(v.len() == NUM_TAGS, "{name} must have len {NUM_TAGS}");
-            Ok(())
-        };
-        check_mat("sem_trans", &self.sem_trans)?;
-        check_mat("dep_trans", &self.dep_trans)?;
-        check_vec("sem_start", &self.sem_start)?;
-        check_vec("sem_end", &self.sem_end)?;
-        check_vec("dep_start", &self.dep_start)?;
-        check_vec("dep_end", &self.dep_end)?;
-        Ok(())
-    }
+fn default_target_rate() -> f64 {
+    DEFAULT_DROP_RATE
 }
 
-/// One blended linear-chain CRF parameter set, ready for Viterbi.
-#[derive(Debug, Clone)]
-pub struct BlendedCrf {
-    /// `transitions[i][j]` = score(tag i -> tag j).
-    pub transitions: [[f32; NUM_TAGS]; NUM_TAGS],
-    pub start: [f32; NUM_TAGS],
-    pub end: [f32; NUM_TAGS],
-}
-
-impl BlendedCrf {
-    /// Blend the two heads' transition params by `head_weights = [w_sem, w_dep]`.
-    /// Mirrors `LaMRModel.weighted_crf_parameters` in `model/lamr.py`.
-    pub fn blend(t: &Transitions, w_sem: f32, w_dep: f32) -> Self {
-        let mut transitions = [[0.0f32; NUM_TAGS]; NUM_TAGS];
-        let mut start = [0.0f32; NUM_TAGS];
-        let mut end = [0.0f32; NUM_TAGS];
-        for i in 0..NUM_TAGS {
-            for j in 0..NUM_TAGS {
-                transitions[i][j] = w_sem * t.sem_trans[i][j] + w_dep * t.dep_trans[i][j];
-            }
-            start[i] = w_sem * t.sem_start[i] + w_dep * t.dep_start[i];
-            end[i] = w_sem * t.sem_end[i] + w_dep * t.dep_end[i];
-        }
-        BlendedCrf {
-            transitions,
-            start,
-            end,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Linear-chain Viterbi decode
-// ---------------------------------------------------------------------------
-
-/// Linear-chain Viterbi MAP decode over `NUM_TAGS` tags.
-///
-/// `emissions[t][k]` is the (blended) log-emission for tag `k` at position `t`.
-/// Returns the best tag sequence of length `emissions.len()`. Tag 1 = drop.
-///
-/// Matches the reference decode in `polymorph_lamr/model/crf.py::_viterbi`:
-///   * `score[k] = start[k] + emissions[0][k]`
-///   * for each subsequent position, `best_prev[k] = argmax_p (score[p] +
-///     transitions[p][k])`, then `score[k] = best_score[k] + emissions[t][k]`
-///   * add `end[k]`, take the argmax as the last tag, backtrack.
-pub fn viterbi_decode(
-    emissions: &[[f32; NUM_TAGS]],
-    crf: &BlendedCrf,
-) -> Vec<u8> {
-    let t = emissions.len();
-    if t == 0 {
-        return Vec::new();
-    }
-
-    // score[k] = best path score ending in tag k at the current position.
-    let mut score = [0.0f32; NUM_TAGS];
-    for k in 0..NUM_TAGS {
-        score[k] = crf.start[k] + emissions[0][k];
-    }
-
-    // backpointers[i][k] = the tag at position i that leads into tag k at i+1.
-    // history has t-1 entries (one per transition step), matching the Python.
-    let mut history: Vec<[usize; NUM_TAGS]> = Vec::with_capacity(t.saturating_sub(1));
-
-    for pos in 1..t {
-        let mut next_score = [f32::NEG_INFINITY; NUM_TAGS];
-        let mut best_prev = [0usize; NUM_TAGS];
-        for cur in 0..NUM_TAGS {
-            // Pick the previous tag that maximises score[prev] + trans[prev][cur].
-            let mut best_p = 0usize;
-            let mut best_v = f32::NEG_INFINITY;
-            for prev in 0..NUM_TAGS {
-                let v = score[prev] + crf.transitions[prev][cur];
-                if v > best_v {
-                    best_v = v;
-                    best_p = prev;
+impl DecodeConfig {
+    /// Load `decode.json` if present; otherwise return the default. A malformed
+    /// file is treated as absent (logged) rather than fatal.
+    pub fn from_json_path_or_default(path: &Path) -> Self {
+        match std::fs::read_to_string(path) {
+            Ok(raw) => match serde_json::from_str::<DecodeConfig>(&raw) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!(
+                        "[lamr] malformed {}: {e}; using default target_rate {DEFAULT_DROP_RATE}",
+                        path.display()
+                    );
+                    DecodeConfig {
+                        default_target_rate: DEFAULT_DROP_RATE,
+                    }
                 }
-            }
-            best_prev[cur] = best_p;
-            next_score[cur] = best_v + emissions[pos][cur];
-        }
-        history.push(best_prev);
-        score = next_score;
-    }
-
-    // Add end transitions and pick the final tag.
-    let mut best_last = 0usize;
-    let mut best_last_v = f32::NEG_INFINITY;
-    for k in 0..NUM_TAGS {
-        let v = score[k] + crf.end[k];
-        if v > best_last_v {
-            best_last_v = v;
-            best_last = k;
+            },
+            Err(_) => DecodeConfig {
+                default_target_rate: DEFAULT_DROP_RATE,
+            },
         }
     }
-
-    // Backtrack.
-    let mut tags_rev: Vec<u8> = Vec::with_capacity(t);
-    let mut tag = best_last;
-    tags_rev.push(tag as u8);
-    for pos in (0..t - 1).rev() {
-        tag = history[pos][tag];
-        tags_rev.push(tag as u8);
-    }
-    tags_rev.reverse();
-    tags_rev
 }
 
 // ---------------------------------------------------------------------------
 // ONNX backend
 // ---------------------------------------------------------------------------
 
-/// A loaded LaMR ONNX model plus its CRF transition side-car. Construct once and
+/// A loaded LaMR ONNX model plus its decode target rate. Construct once and
 /// reuse across calls — model load + optimize is the expensive part.
 ///
 /// `TypedRunnableModel` is tract's optimized, executable plan type
@@ -276,25 +220,22 @@ pub fn viterbi_decode(
 /// back wrapped in an `Arc`, and `run()` takes `&Arc<Self>`.
 pub struct LamrOnnx {
     model: std::sync::Arc<TypedRunnableModel>,
-    transitions: Transitions,
+    target_rate: f64,
 }
 
 impl LamrOnnx {
-    /// Load `model.onnx` from `model_path` and `transitions.json` from the same
-    /// directory. External-weights files (`model.onnx.data`) are resolved by
-    /// tract relative to the model path.
+    /// Load `model.onnx` from `model_path` and `decode.json` from the same
+    /// directory (optional → default target rate). External-weights files
+    /// (`model.onnx.data`) are resolved by tract relative to the model path.
     pub fn load(model_path: &Path) -> anyhow::Result<Self> {
         let dir = model_path
             .parent()
             .ok_or_else(|| anyhow::anyhow!("model path has no parent dir: {}", model_path.display()))?;
-        Self::load_with_transitions(model_path, &dir.join("transitions.json"))
+        Self::load_with_decode(model_path, &dir.join("decode.json"))
     }
 
-    pub fn load_with_transitions(
-        model_path: &Path,
-        transitions_path: &Path,
-    ) -> anyhow::Result<Self> {
-        let transitions = Transitions::from_json_path(transitions_path)?;
+    pub fn load_with_decode(model_path: &Path, decode_path: &Path) -> anyhow::Result<Self> {
+        let decode = DecodeConfig::from_json_path_or_default(decode_path);
         let model = tract_onnx::onnx()
             .model_for_path(model_path)
             .map_err(|e| anyhow::anyhow!("loading {}: {e}", model_path.display()))?
@@ -302,13 +243,20 @@ impl LamrOnnx {
             .map_err(|e| anyhow::anyhow!("optimizing {}: {e}", model_path.display()))?
             .into_runnable()
             .map_err(|e| anyhow::anyhow!("making {} runnable: {e}", model_path.display()))?;
-        Ok(LamrOnnx { model, transitions })
+        Ok(LamrOnnx {
+            model,
+            target_rate: decode.default_target_rate,
+        })
     }
 
-    /// Run the model on a single sequence of token ids and produce the per-token
-    /// drop bit (true = drop) via blended-CRF Viterbi. Returns one bit per input
-    /// token, in order.
-    pub fn forward_drop_bits(&self, token_ids: &[u32]) -> anyhow::Result<Vec<bool>> {
+    /// The decode target drop rate this model was loaded with.
+    pub fn target_rate(&self) -> f64 {
+        self.target_rate
+    }
+
+    /// Run the model on a single sequence of token ids and produce a per-token
+    /// drop probability (`sigmoid(logit)`), one per input token, in order.
+    pub fn forward_drop_probs(&self, token_ids: &[u32]) -> anyhow::Result<Vec<f32>> {
         if token_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -332,48 +280,20 @@ impl LamrOnnx {
             .run(tvec!(ids_tensor.into(), mask_tensor.into()))
             .map_err(|e| anyhow::anyhow!("onnx run failed: {e}"))?;
         anyhow::ensure!(
-            outputs.len() >= 3,
-            "expected 3 onnx outputs (emissions_sem, emissions_dep, head_weights), got {}",
+            !outputs.is_empty(),
+            "expected 1 onnx output (logits), got {}",
             outputs.len()
         );
 
-        // Outputs are in declared order: emissions_sem, emissions_dep,
-        // head_weights. `to_plain_array_view` returns an `ArrayViewD<f32>` over
-        // the contiguous tensor buffer.
-        let emi_sem = outputs[0].to_plain_array_view::<f32>()?;
-        let emi_dep = outputs[1].to_plain_array_view::<f32>()?;
-        let head_w = outputs[2].to_plain_array_view::<f32>()?;
-
-        // emissions: [1, T, 2]; head_weights: [1, 2].
+        // Single output: logits [1, T] — per-token drop logit. `to_plain_array_view`
+        // returns an `ArrayViewD<f32>` over the contiguous tensor buffer.
+        let logits = outputs[0].to_plain_array_view::<f32>()?;
         anyhow::ensure!(
-            emi_sem.shape() == [1, t, NUM_TAGS].as_slice()
-                && emi_dep.shape() == [1, t, NUM_TAGS].as_slice(),
-            "emission shape mismatch: sem={:?} dep={:?} expected [1,{t},{NUM_TAGS}]",
-            emi_sem.shape(),
-            emi_dep.shape()
+            logits.shape() == [1, t].as_slice(),
+            "logits shape mismatch: {:?} expected [1,{t}]",
+            logits.shape()
         );
-        anyhow::ensure!(
-            head_w.shape() == [1, NUM_TAGS].as_slice(),
-            "head_weights shape mismatch: {:?} expected [1,{NUM_TAGS}]",
-            head_w.shape()
-        );
-
-        let w_sem = head_w[[0, 0]];
-        let w_dep = head_w[[0, 1]];
-        let crf = BlendedCrf::blend(&self.transitions, w_sem, w_dep);
-
-        // Blend the per-token emissions and pack into the Viterbi input layout.
-        let mut blended: Vec<[f32; NUM_TAGS]> = Vec::with_capacity(t);
-        for pos in 0..t {
-            let mut row = [0.0f32; NUM_TAGS];
-            for k in 0..NUM_TAGS {
-                row[k] = w_sem * emi_sem[[0, pos, k]] + w_dep * emi_dep[[0, pos, k]];
-            }
-            blended.push(row);
-        }
-
-        let tags = viterbi_decode(&blended, &crf);
-        Ok(tags.into_iter().map(|tag| tag == 1).collect())
+        Ok((0..t).map(|pos| sigmoid(logits[[0, pos]])).collect())
     }
 }
 
@@ -423,10 +343,9 @@ fn cached_model() -> Option<&'static LamrOnnx> {
 /// but the fallback is logged to stderr, since for an audit-log compressor
 /// silently swapping the trained pruner for a random one is data corruption.
 ///
-/// The model runs over the full token sequence; the model's per-token drop
-/// decision sets `drop_mask[i]`, except locked tokens (`lock_mask[i] == true`),
-/// which are always kept. Returns the parallel `drop_mask` of length
-/// `lock_mask.len()`.
+/// The model runs over the full token sequence; the calibrated target-rate
+/// decode then drops a fraction of the UNLOCKED tokens, never a locked one.
+/// Returns the parallel `drop_mask` of length `lock_mask.len()`.
 pub fn apply_lamr(token_ids: &[u32], lock_mask: &[bool]) -> Vec<bool> {
     debug_assert_eq!(token_ids.len(), lock_mask.len());
     if let Some(model) = cached_model() {
@@ -450,9 +369,9 @@ pub fn apply_lamr_mock(token_ids: &[u32], lock_mask: &[bool]) -> Vec<bool> {
     enforce_lock_invariant(lock_mask, &drop_bits)
 }
 
-/// Real ONNX path with an explicit model path. Loads the model + transitions,
-/// runs inference over the full token sequence, decodes the blended CRF with
-/// Viterbi, and projects the lock constraint via [`enforce_lock_invariant`].
+/// Real ONNX path with an explicit model path. Loads the model + decode config,
+/// runs inference over the full token sequence, and decodes by the calibrated
+/// target-rate threshold (lock-aware).
 pub fn apply_lamr_onnx(
     token_ids: &[u32],
     lock_mask: &[bool],
@@ -470,10 +389,10 @@ pub fn apply_lamr_with_model(
     model: &LamrOnnx,
 ) -> anyhow::Result<Vec<bool>> {
     debug_assert_eq!(token_ids.len(), lock_mask.len());
-    // The model sees the full token sequence (matching training); locked tokens
-    // are force-kept afterwards by enforce_lock_invariant.
-    let drop_bits = model.forward_drop_bits(token_ids)?;
-    Ok(enforce_lock_invariant(lock_mask, &drop_bits))
+    // The model sees the full token sequence (matching training); the target-rate
+    // decode marks the top fraction of UNLOCKED tokens as drop (lock-aware).
+    let probs = model.forward_drop_probs(token_ids)?;
+    Ok(target_rate_drop_bits(&probs, lock_mask, model.target_rate))
 }
 
 #[cfg(test)]
@@ -567,118 +486,79 @@ mod tests {
         assert!(drop_mask.iter().all(|&b| !b));
     }
 
-    // ---- Viterbi ----
+    // ---- sigmoid + target-rate decode ----
 
-    fn flat_crf() -> BlendedCrf {
-        BlendedCrf {
-            transitions: [[0.0, 0.0], [0.0, 0.0]],
-            start: [0.0, 0.0],
-            end: [0.0, 0.0],
-        }
+    #[test]
+    fn sigmoid_is_monotone_and_centered() {
+        assert!((sigmoid(0.0) - 0.5).abs() < 1e-6);
+        assert!(sigmoid(10.0) > 0.99);
+        assert!(sigmoid(-10.0) < 0.01);
+        assert!(sigmoid(1.0) > sigmoid(-1.0));
+        // No NaN/inf at the extremes.
+        assert!(sigmoid(1000.0).is_finite() && sigmoid(-1000.0).is_finite());
     }
 
     #[test]
-    fn viterbi_empty_is_empty() {
-        assert!(viterbi_decode(&[], &flat_crf()).is_empty());
+    fn target_rate_drops_top_fraction_of_unlocked() {
+        // 10 unlocked tokens, rate 0.30 -> drop the 3 highest-prob ones.
+        let probs = vec![0.1, 0.2, 0.9, 0.4, 0.95, 0.05, 0.8, 0.3, 0.6, 0.15];
+        let lock = vec![false; 10];
+        let drop = target_rate_drop_bits(&probs, &lock, 0.30);
+        assert_eq!(drop.iter().filter(|&&d| d).count(), 3);
+        // The three highest are indices 4 (0.95), 2 (0.9), 6 (0.8).
+        assert!(drop[4] && drop[2] && drop[6]);
+        assert!(!drop[0] && !drop[1] && !drop[3]);
     }
 
     #[test]
-    fn viterbi_picks_per_token_argmax_when_transitions_flat() {
-        // With all transitions/start/end = 0, the best path is just per-token
-        // argmax of the emissions.
-        let crf = flat_crf();
-        let emissions = vec![
-            [0.1, 0.9], // -> 1 (drop)
-            [0.8, 0.2], // -> 0 (keep)
-            [0.3, 0.7], // -> 1 (drop)
-        ];
-        assert_eq!(viterbi_decode(&emissions, &crf), vec![1, 0, 1]);
+    fn target_rate_never_drops_locked_and_counts_only_unlocked() {
+        // 6 tokens, 2 locked. Unlocked = 4, rate 0.5 -> drop top 2 of the unlocked.
+        let probs = vec![0.99, 0.1, 0.95, 0.2, 0.9, 0.3];
+        let lock = vec![true, false, false, false, true, false];
+        let drop = target_rate_drop_bits(&probs, &lock, 0.5);
+        // Locked (0, 4) never dropped even though they have the highest probs.
+        assert!(!drop[0] && !drop[4]);
+        // Unlocked are {1:0.1, 2:0.95, 3:0.2, 5:0.3}; top 2 = idx 2 and idx 5.
+        assert!(drop[2] && drop[5]);
+        assert!(!drop[1] && !drop[3]);
+        assert_eq!(drop.iter().filter(|&&d| d).count(), 2);
     }
 
     #[test]
-    fn viterbi_transition_overrides_weak_emission() {
-        // Hand-computed 2-state example.
-        //
-        // emissions:  pos0 = [0, 0],  pos1 = [0, 1]   (tag1 slightly favoured at pos1)
-        // start = [0, 0], end = [0, 0]
-        // transitions: strongly discourage 0->1 (-10), everything else 0.
-        //   trans[0][1] = -10, trans[0][0] = 0, trans[1][0] = 0, trans[1][1] = 0
-        //
-        // Candidate full-path scores (start+emit+trans+emit+end):
-        //   [0,0]: 0 + 0   + t00(0)  + e1_0(0)  + 0 = 0
-        //   [0,1]: 0 + 0   + t01(-10)+ e1_1(1)  + 0 = -9
-        //   [1,0]: 0 + 0   + t10(0)  + e1_0(0)  + 0 = 0
-        //   [1,1]: 0 + 0   + t11(0)  + e1_1(1)  + 0 = 1   <-- max
-        // Best path = [1, 1].
-        let crf = BlendedCrf {
-            transitions: [[0.0, -10.0], [0.0, 0.0]],
-            start: [0.0, 0.0],
-            end: [0.0, 0.0],
-        };
-        let emissions = vec![[0.0, 0.0], [0.0, 1.0]];
-        assert_eq!(viterbi_decode(&emissions, &crf), vec![1, 1]);
+    fn target_rate_zero_and_one_bounds() {
+        let probs = vec![0.1, 0.9, 0.5, 0.7];
+        let lock = vec![false, false, false, false];
+        // rate 0 -> drop nothing.
+        assert!(target_rate_drop_bits(&probs, &lock, 0.0).iter().all(|&d| !d));
+        // rate 1 -> drop every unlocked token.
+        assert!(target_rate_drop_bits(&probs, &lock, 1.0).iter().all(|&d| d));
+        // rate clamps above 1.
+        assert!(target_rate_drop_bits(&probs, &lock, 5.0).iter().all(|&d| d));
     }
 
     #[test]
-    fn viterbi_start_and_end_bias() {
-        // Verify start/end transitions enter the score.
-        // start = [5, 0], end = [0, 5]; emissions all zero; transitions zero.
-        //   [0,0]: 5 + 0 + 0 = 5
-        //   [0,1]: 5 + 0 + 5 = 10  <-- max
-        //   [1,0]: 0 + 0 + 0 = 0
-        //   [1,1]: 0 + 0 + 5 = 5
-        // Best path = [0, 1].
-        let crf = BlendedCrf {
-            transitions: [[0.0, 0.0], [0.0, 0.0]],
-            start: [5.0, 0.0],
-            end: [0.0, 5.0],
-        };
-        let emissions = vec![[0.0, 0.0], [0.0, 0.0]];
-        assert_eq!(viterbi_decode(&emissions, &crf), vec![0, 1]);
+    fn target_rate_is_deterministic_with_ties() {
+        // All-equal probs: stable sort keeps original order, so the SAME indices
+        // drop across runs (determinism for an audit-log compressor).
+        let probs = vec![0.5; 8];
+        let lock = vec![false; 8];
+        let a = target_rate_drop_bits(&probs, &lock, 0.5);
+        let b = target_rate_drop_bits(&probs, &lock, 0.5);
+        assert_eq!(a, b);
+        assert_eq!(a.iter().filter(|&&d| d).count(), 4);
     }
 
     #[test]
-    fn viterbi_single_token() {
-        // T=1: just start + emission + end.
-        let crf = BlendedCrf {
-            transitions: [[0.0, 0.0], [0.0, 0.0]],
-            start: [0.0, 1.0],
-            end: [0.0, 0.0],
-        };
-        assert_eq!(viterbi_decode(&[[0.0, 0.0]], &crf), vec![1]);
+    fn target_rate_all_locked_drops_nothing() {
+        let probs = vec![0.9, 0.9, 0.9];
+        let lock = vec![true, true, true];
+        assert!(target_rate_drop_bits(&probs, &lock, 0.5).iter().all(|&d| !d));
     }
 
     #[test]
-    fn blend_is_convex_combination() {
-        let t = Transitions {
-            sem_trans: vec![vec![1.0, 2.0], vec![3.0, 4.0]],
-            sem_start: vec![1.0, 0.0],
-            sem_end: vec![0.0, 1.0],
-            dep_trans: vec![vec![5.0, 6.0], vec![7.0, 8.0]],
-            dep_start: vec![0.0, 1.0],
-            dep_end: vec![1.0, 0.0],
-        };
-        let c = BlendedCrf::blend(&t, 0.25, 0.75);
-        assert!((c.transitions[0][0] - (0.25 * 1.0 + 0.75 * 5.0)).abs() < 1e-6);
-        assert!((c.transitions[1][1] - (0.25 * 4.0 + 0.75 * 8.0)).abs() < 1e-6);
-        assert!((c.start[0] - 0.25).abs() < 1e-6);
-        assert!((c.end[1] - 0.25).abs() < 1e-6);
-    }
-
-    #[test]
-    fn viterbi_golden_mixed_path() {
-        // Cross-language golden: the SAME params + expected output are asserted
-        // in the Python reference test (ml_pipeline tests/test_crf.py
-        // test_viterbi_golden_matches_rust_decode), pinning Rust<->Python decode
-        // agreement. start favors tag0, transitions favor switching, emissions
-        // flat -> best path alternates: [0, 1, 0].
-        let crf = BlendedCrf {
-            transitions: [[-0.5, 1.0], [1.0, -0.5]],
-            start: [1.0, 0.0],
-            end: [0.0, 0.0],
-        };
-        let emissions = vec![[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]];
-        assert_eq!(viterbi_decode(&emissions, &crf), vec![0, 1, 0]);
+    fn decode_config_defaults_when_absent() {
+        let c = DecodeConfig::from_json_path_or_default(Path::new("/nonexistent/decode.json"));
+        assert!((c.default_target_rate - DEFAULT_DROP_RATE).abs() < 1e-9);
     }
 
     #[test]
@@ -744,17 +624,32 @@ mod tests {
     }
 
     #[test]
-    fn onnx_transitions_json_loads() {
+    fn onnx_decode_json_loads() {
         let path = smoke_model_path();
         if !path.exists() {
-            eprintln!("skipping onnx transitions test: {} not found", path.display());
+            eprintln!("skipping onnx decode test: {} not found", path.display());
             return;
         }
-        let tpath = path.parent().unwrap().join("transitions.json");
-        let t = Transitions::from_json_path(&tpath).expect("load transitions.json");
-        // Shapes validated by from_json_path; sanity-check the tag dimension.
-        assert_eq!(t.sem_trans.len(), NUM_TAGS);
-        assert_eq!(t.dep_start.len(), NUM_TAGS);
+        let dpath = path.parent().unwrap().join("decode.json");
+        let c = DecodeConfig::from_json_path_or_default(&dpath);
+        // A valid target rate in [0, 1].
+        assert!(c.default_target_rate >= 0.0 && c.default_target_rate <= 1.0);
+    }
+
+    #[test]
+    fn onnx_forward_drop_probs_are_in_unit_interval() {
+        let path = smoke_model_path();
+        if !path.exists() {
+            eprintln!("skipping onnx prob-range test: {} not found", path.display());
+            return;
+        }
+        let model = LamrOnnx::load(&path).expect("load smoke model");
+        let token_ids: Vec<u32> = vec![100, 200, 300, 400, 500];
+        let probs = model.forward_drop_probs(&token_ids).expect("forward");
+        assert_eq!(probs.len(), token_ids.len());
+        for p in probs {
+            assert!((0.0..=1.0).contains(&p), "drop prob {p} out of [0,1]");
+        }
     }
 
     #[test]
@@ -772,7 +667,7 @@ mod tests {
     }
 
     #[test]
-    fn onnx_forward_drop_bits_rejects_oversize_sequence() {
+    fn onnx_forward_drop_probs_rejects_oversize_sequence() {
         // The interim length guard must refuse > MAX_INFERENCE_TOKENS rather than
         // crash/OOM on huge input (windowing is the real fix, TODO).
         let path = smoke_model_path();
@@ -783,7 +678,7 @@ mod tests {
         let model = LamrOnnx::load(&path).expect("load smoke model");
         let huge: Vec<u32> = vec![1u32; MAX_INFERENCE_TOKENS + 1];
         assert!(
-            model.forward_drop_bits(&huge).is_err(),
+            model.forward_drop_probs(&huge).is_err(),
             "oversize sequence must be rejected by the length guard"
         );
     }

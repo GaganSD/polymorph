@@ -38,9 +38,18 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Train LaMR.")
     p.add_argument("--config", type=Path, required=True)
     p.add_argument("--shards", nargs="+", required=False, help="JSONL labeled shards")
+    p.add_argument("--val-shards", nargs="+", default=None,
+                   help="JSONL val shards; enables periodic val eval (acc/F1/drop-rate)")
     p.add_argument("--out", type=Path, default=Path("artifacts/checkpoints"))
     p.add_argument("--dry-run", action="store_true", help="report device + param count + memory and exit")
     p.add_argument("--max-steps", type=int, default=None, help="override config max_steps")
+    # Loss/optimizer overrides for experiment sweeps (None => use config value).
+    p.add_argument("--lr", type=float, default=None, help="override config train.lr")
+    p.add_argument("--warmup-steps", type=int, default=None, help="override config train.warmup_steps")
+    p.add_argument("--drop-class-weight", type=float, default=None,
+                   help="override config train.drop_class_weight (drop-class pos_weight in the BCE)")
+    p.add_argument("--target-rate", type=float, default=None,
+                   help="override config eval.target_rate (drop rate the val decode threshold is calibrated to)")
     return p
 
 
@@ -89,23 +98,60 @@ def main(argv: list[str] | None = None) -> int:
         num_workers=0,  # IterableDataset; bump for production
     )
 
+    val_loader = None
+    if args.val_shards:
+        val_ds = LabeledShardDataset(
+            shard_paths=[Path(p) for p in args.val_shards],
+            max_seq_len=int(cfg["train"]["max_seq_len"]),
+            shuffle_files=False,
+        )
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=int(cfg["train"]["batch_size"]),
+            collate_fn=partial(collate, pad_id=0),
+            num_workers=0,
+        )
+
     max_steps = args.max_steps if args.max_steps is not None else int(cfg["train"]["max_steps"])
+    # CLI overrides win over config (None => config). Lets sweeps run without
+    # editing the committed default.yaml.
+    lr = args.lr if args.lr is not None else float(cfg["train"]["lr"])
+    warmup_steps = args.warmup_steps if args.warmup_steps is not None else int(cfg["train"]["warmup_steps"])
+    drop_class_weight = (
+        args.drop_class_weight if args.drop_class_weight is not None
+        else float(cfg["train"].get("drop_class_weight", 1.0))
+    )
+    target_rate = (
+        args.target_rate if args.target_rate is not None
+        else float(cfg.get("eval", {}).get("target_rate", 0.30))
+    )
+    print(
+        f"[train] lr={lr} warmup={warmup_steps} max_steps={max_steps} "
+        f"drop_class_weight={drop_class_weight} target_rate={target_rate}"
+    )
     train(
         model=model,
         loader=loader,
         out_dir=args.out,
         max_steps=max_steps,
         grad_accum=int(cfg["train"]["grad_accum"]),
-        lr=float(cfg["train"]["lr"]),
+        lr=lr,
         weight_decay=float(cfg["train"]["weight_decay"]),
-        warmup_steps=int(cfg["train"]["warmup_steps"]),
+        warmup_steps=warmup_steps,
         amp_dtype=str(cfg["train"]["amp_dtype"]),
         ckpt_every=int(cfg["train"]["ckpt_every"]),
         log_every=int(cfg["train"]["log_every"]),
-        # Reserved/inert under the blended-CRF objective (see LaMRModel.joint_nll);
-        # .get() so pruning these config keys never breaks training.
+        # Reserved/inert (see LaMRModel.loss); .get() so pruning these config
+        # keys never breaks training.
         lambda_sem=float(cfg["train"].get("lambda_sem", 1.0)),
         lambda_dep=float(cfg["train"].get("lambda_dep", 1.0)),
+        # Class-imbalance handling: drop-class pos_weight in the per-token BCE.
+        drop_class_weight=drop_class_weight,
+        # Target drop rate the periodic val decode threshold is calibrated to
+        # (also the metric the PR-AUC-selected ckpt-best is reported against).
+        target_rate=target_rate,
+        val_loader=val_loader,
+        eval_every=int(cfg["train"].get("eval_every", 0)),
     )
     return 0
 

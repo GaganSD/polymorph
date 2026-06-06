@@ -64,16 +64,32 @@ train:
   batch_size: 8
   grad_accum: 8           # virtual batch 64
   max_seq_len: 1024
-  lr: 3.0e-4
+  lr: 2.0e-4              # per-token loss caps per-token grad, so a moderate LR is stable (3e-4 spiked under the old per-sequence loss)
   weight_decay: 0.01
-  warmup_steps: 200
-  max_steps: 20000
+  warmup_steps: 300       # longer warmup for a stable ramp
+  max_steps: 1500         # ~4.6 epochs over the v0 corpus (loop cycles epochs; watch val F1 via eval_every)
   amp_dtype: bf16
   ckpt_every: 1000
   log_every: 50
+  eval_every: 200         # periodic val pass (acc/F1/drop-rate) when --val-shards is given
   lambda_sem: 1.0
   lambda_dep: 1.0
+  # Class-imbalance handling. The keep/drop split is ~71/29. The objective is a
+  # per-token binary cross-entropy on the drop logit (sigmoid head, no CRF);
+  # drop_class_weight is the BCE pos_weight, up-weighting the drop (positive)
+  # class so the drop-ranking separates. Absolute calibration is NOT done here —
+  # it is a decode-time threshold calibrated to eval.target_rate (see below).
+  drop_class_weight: 2.5  # ~= keep/drop frequency ratio (0.714 / 0.286)
   seed: 1337
+
+eval:
+  # Target drop rate the val decode threshold is calibrated to. The pruner is a
+  # ranker (sigmoid drop-prob per token); decode sorts by prob and cuts at the
+  # threshold that drops this fraction, so the compression ratio is a runtime
+  # knob. ckpt-best is selected by PR-AUC (threshold-free ranking quality), and
+  # F1/precision/recall are reported at this calibrated threshold. Also written
+  # to the exported decode.json as the runtime default.
+  target_rate: 0.30
 
 export:
   out_dir: artifacts/lamr-v0

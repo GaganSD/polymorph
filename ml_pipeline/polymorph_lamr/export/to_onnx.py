@@ -1,22 +1,26 @@
-"""Export the trained LaMR model to ONNX + side-car transition matrices.
+"""Export the trained LaMR pruner to ONNX.
 
 Output layout:
     <out_dir>/
-        model.onnx          # backbone + head gate + two emission heads
-        transitions.npz     # {sem_trans, sem_start, sem_end, dep_trans, dep_start, dep_end}
-        transitions.json    # same keys/shapes as the .npz, plain JSON for the Rust runtime
+        model.onnx          # backbone + drop head -> per-token drop logits (B, T)
+        decode.json         # decode contract: sigmoid + target-rate threshold
         config.yaml         # mirrors the training config (for reproducibility)
         README.md           # how the Rust side loads this artifact
         parity.json         # max-abs diff between torch and onnxruntime
 
+There is NO CRF and NO transitions side-car: the model emits one drop logit per
+token, and the runtime decodes by thresholding ``sigmoid(logit)`` at the cutoff
+that drops a target fraction of the (unlocked) tokens — see ``src/lamr.rs`` and
+``decode.json``.
+
 The Rust runtime is expected to:
     1. Load model.onnx via tract or ort.
     2. Run the model over the FULL token sequence (matching how training tags
-       every token of the chunk).
-    3. Combine semantic/dependency emissions and CRF params with head_weights.
-    4. Run one Viterbi decode using the weighted CRF.
-    5. Map decoded tag-1 positions onto a full-length drop_mask, then force-keep
-       locked positions (see enforce_lock_invariant in src/lamr.rs).
+       every token of the chunk) to get the `logits` tensor (B, T).
+    3. ``p_drop = sigmoid(logits)``; among UNLOCKED tokens, drop the top
+       ``round(target_rate * n_unlocked)`` by ``p_drop`` (or threshold at a fixed
+       cutoff). target_rate is a runtime knob (see decode.json default).
+    4. Force-keep locked positions (see enforce_lock_invariant in src/lamr.rs).
 """
 
 from __future__ import annotations
@@ -32,6 +36,8 @@ import torch
 import yaml
 
 from ..model.lamr import LaMRConfig, LaMRModel
+
+DEFAULT_TARGET_RATE = 0.30
 
 
 def _load_checkpoint(path: Path) -> tuple[LaMRModel, LaMRConfig]:
@@ -63,11 +69,20 @@ def export(
     config_path: Path | None = None,
     opset: int = 17,
     parity_seq_len: int = 64,
+    target_rate: float = DEFAULT_TARGET_RATE,
 ) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     model, cfg = _load_checkpoint(checkpoint)
     core = model.export_core
     core.eval()
+
+    # If the config carries an eval.target_rate, prefer it for the decode default.
+    if config_path is not None and config_path.exists():
+        try:
+            cfg_yaml = yaml.safe_load(config_path.read_text())
+            target_rate = float(cfg_yaml.get("eval", {}).get("target_rate", target_rate))
+        except Exception:
+            pass
 
     # Dummy inputs.
     dummy_ids = torch.randint(0, cfg.vocab_size, (1, parity_seq_len), dtype=torch.long)
@@ -76,24 +91,23 @@ def export(
     onnx_path = out_dir / "model.onnx"
     _export_static_graph(core, dummy_ids, dummy_mask, onnx_path, opset, prefer_dynamo=True)
 
-    # Transitions side-car.
-    sem = model.crf_semantic
-    dep = model.crf_dependency
-    transitions = {
-        "sem_trans": sem.transitions.detach().cpu().numpy(),
-        "sem_start": sem.start_transitions.detach().cpu().numpy(),
-        "sem_end": sem.end_transitions.detach().cpu().numpy(),
-        "dep_trans": dep.transitions.detach().cpu().numpy(),
-        "dep_start": dep.start_transitions.detach().cpu().numpy(),
-        "dep_end": dep.end_transitions.detach().cpu().numpy(),
-    }
-    np.savez(out_dir / "transitions.npz", **transitions)
-    # Plain-JSON mirror of the .npz so the Rust runtime can parse the CRF
-    # params with serde_json instead of pulling in an npz/zip-of-npy reader.
-    # Keys + shapes match transitions.npz exactly: *_trans are (2, 2) row-major
-    # where trans[i][j] = score(tag i -> tag j); *_start / *_end are length-2.
-    (out_dir / "transitions.json").write_text(
-        json.dumps({k: v.astype(float).tolist() for k, v in transitions.items()}, indent=2)
+    # Decode contract side-car (replaces the old transitions.json). The runtime
+    # needs no learned params beyond the ONNX weights: decode is sigmoid + a
+    # threshold calibrated to `default_target_rate` (a runtime knob).
+    (out_dir / "decode.json").write_text(
+        json.dumps(
+            {
+                "decode": "sigmoid_target_rate_threshold",
+                "default_target_rate": float(target_rate),
+                "logit_output": "logits",
+                "note": (
+                    "p_drop = sigmoid(logits[token]); among unlocked tokens drop the "
+                    "top round(target_rate * n_unlocked) by p_drop. target_rate is a "
+                    "runtime knob; locked tokens are always kept."
+                ),
+            },
+            indent=2,
+        )
     )
 
     # Mirror config for downstream reproducibility.
@@ -114,7 +128,7 @@ def export(
         parity = _check_parity(core, sess, cfg, parity_seq_len)
     (out_dir / "parity.json").write_text(json.dumps(parity, indent=2))
 
-    _write_readme(out_dir, cfg)
+    _write_readme(out_dir, cfg, target_rate)
     return parity
 
 
@@ -128,13 +142,11 @@ def _export_static_graph(
 ) -> None:
     names = {
         "input_names": ["input_ids", "attention_mask"],
-        "output_names": ["emissions_sem", "emissions_dep", "head_weights"],
+        "output_names": ["logits"],
         "dynamic_axes": {
             "input_ids": {0: "batch", 1: "seq"},
             "attention_mask": {0: "batch", 1: "seq"},
-            "emissions_sem": {0: "batch", 1: "seq"},
-            "emissions_dep": {0: "batch", 1: "seq"},
-            "head_weights": {0: "batch"},
+            "logits": {0: "batch", 1: "seq"},
         },
         "opset_version": opset,
         "do_constant_folding": True,
@@ -164,59 +176,50 @@ def _check_parity(core: torch.nn.Module, sess, cfg: LaMRConfig, parity_seq_len: 
         (1, max(1, parity_seq_len // 2 + 1)),
         (2, max(2, min(parity_seq_len, 7))),
     ]
-    max_sem = 0.0
-    max_dep = 0.0
-    max_gate = 0.0
+    max_logit = 0.0
     for b, t in shapes:
         ids = torch.randint(0, cfg.vocab_size, (b, t), dtype=torch.long)
         mask = torch.ones((b, t), dtype=torch.bool)
         if t > 2:
             mask[-1, -1] = False
         with torch.no_grad():
-            torch_sem, torch_dep, torch_gate = core(ids, mask)
-        onnx_sem, onnx_dep, onnx_gate = sess.run(
-            ["emissions_sem", "emissions_dep", "head_weights"],
+            torch_logits = core(ids, mask)
+        (onnx_logits,) = sess.run(
+            ["logits"],
             {"input_ids": ids.numpy(), "attention_mask": mask.numpy()},
         )
-        max_sem = max(max_sem, float(np.max(np.abs(torch_sem.numpy() - onnx_sem))))
-        max_dep = max(max_dep, float(np.max(np.abs(torch_dep.numpy() - onnx_dep))))
-        max_gate = max(max_gate, float(np.max(np.abs(torch_gate.numpy() - onnx_gate))))
+        max_logit = max(max_logit, float(np.max(np.abs(torch_logits.numpy() - onnx_logits))))
     return {
-        "max_abs_diff_sem": max_sem,
-        "max_abs_diff_dep": max_dep,
-        "max_abs_diff_head_weights": max_gate,
+        "max_abs_diff_logits": max_logit,
         "checked_shapes": len(shapes),
     }
 
 
-def _write_readme(out_dir: Path, cfg: LaMRConfig) -> None:
+def _write_readme(out_dir: Path, cfg: LaMRConfig, target_rate: float) -> None:
     readme = f"""# LaMR ONNX Artifact
 
 Inference pipeline for Polymorph's Rust MCP runtime.
 
 ## Files
-- `model.onnx` — backbone + semantic/dependency head gate + 2 emission heads.
-- `transitions.npz` — CRF transitions per head (`{{sem,dep}}_{{trans,start,end}}`).
-- `transitions.json` — same keys/shapes as the `.npz`, plain JSON for the Rust runtime (no npz parser needed).
+- `model.onnx` — backbone + drop head -> per-token drop logits.
+- `decode.json` — decode contract (sigmoid + target-rate threshold, default {target_rate}).
 - `config.yaml` — model architecture (must match the training run).
 - `parity.json` — max-abs diff between torch and onnxruntime at export time.
 
 ## Inputs / outputs
 - input_ids: (B, T) int64, cl100k_base token ids
 - attention_mask: (B, T) bool
-- emissions_sem / emissions_dep: (B, T, 2) float, log-emissions for tags {{0: keep, 1: drop}}
-- head_weights: (B, 2) float, softmax weights for semantic and dependency CRFs
+- logits: (B, T) float, per-token drop logit (sigmoid -> P(drop))
 
 ## Decode (Rust side)
 0. Run the model over the FULL token sequence (matching training; locked tokens
    are NOT removed before the model — they are force-kept afterwards).
-1. Run ONNX session → 2 emission tensors + `head_weights`.
-2. Build one CRF per sequence:
-   `weighted = head_weights[0] * semantic + head_weights[1] * dependency`
-   for emissions, transitions, start transitions, and end transitions.
-3. Run one Viterbi decode over the weighted CRF.
-4. Map tag=1 decisions onto a full-length `drop_mask`, then force-keep locked
-   positions (always `false`) via `enforce_lock_invariant` (see `src/lamr.rs`).
+1. Run ONNX session → the `logits` tensor (B, T).
+2. `p_drop = sigmoid(logits)`. Among UNLOCKED tokens, drop the top
+   `round(target_rate * n_unlocked)` by `p_drop` (target_rate is a runtime knob;
+   see `decode.json`). No CRF, no Viterbi, no transitions.
+3. Force-keep locked positions (always `false`) via `enforce_lock_invariant`
+   (see `src/lamr.rs`).
 
 ## Model config
 - vocab_size: {cfg.vocab_size}
@@ -227,12 +230,14 @@ Inference pipeline for Polymorph's Rust MCP runtime.
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Export LaMR to ONNX + transitions.")
+    p = argparse.ArgumentParser(description="Export LaMR to ONNX (drop logits + decode contract).")
     p.add_argument("--ckpt", type=Path, required=True)
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--config", type=Path, default=None)
     p.add_argument("--opset", type=int, default=17)
     p.add_argument("--parity-seq-len", type=int, default=64)
+    p.add_argument("--target-rate", type=float, default=DEFAULT_TARGET_RATE,
+                   help="default decode target drop rate written to decode.json")
     return p
 
 
@@ -244,6 +249,7 @@ def main(argv: list[str] | None = None) -> int:
         config_path=args.config,
         opset=args.opset,
         parity_seq_len=args.parity_seq_len,
+        target_rate=args.target_rate,
     )
     print(f"exported to {args.out}; parity={parity}")
     return 0
