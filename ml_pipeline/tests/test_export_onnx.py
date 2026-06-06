@@ -33,18 +33,21 @@ def test_export_and_parity(tmp_path: Path):
     from polymorph_lamr.export.to_onnx import export
 
     out_dir = tmp_path / "art"
-    parity = export(checkpoint=ckpt, out_dir=out_dir, parity_seq_len=16)
-    assert parity["max_abs_diff_emissions"] < 1e-3
+    parity = export(checkpoint=ckpt, out_dir=out_dir, parity_seq_len=16, target_rate=0.35)
+    assert parity["max_abs_diff_logits"] < 1e-3
     assert parity["checked_shapes"] == 3
 
-    # Side-car & docs exist.
+    # Artifact & docs exist; NO transitions side-car (CRF is gone).
     assert (out_dir / "model.onnx").exists()
-    assert (out_dir / "transitions.npz").exists()
-    assert (out_dir / "transitions.json").exists()
+    assert (out_dir / "decode.json").exists()
+    assert not (out_dir / "transitions.npz").exists()
+    assert not (out_dir / "transitions.json").exists()
     assert (out_dir / "config.yaml").exists()
     assert (out_dir / "README.md").exists()
     parity_json = json.loads((out_dir / "parity.json").read_text())
-    assert parity_json["max_abs_diff_emissions"] < 1e-3
-    # transitions.json carries the single CRF's params.
-    trans = json.loads((out_dir / "transitions.json").read_text())
-    assert set(trans) == {"trans", "start", "end"}
+    assert parity_json["max_abs_diff_logits"] < 1e-3
+    # decode.json carries the sigmoid + target-rate threshold contract.
+    decode = json.loads((out_dir / "decode.json").read_text())
+    assert decode["decode"] == "sigmoid_target_rate_threshold"
+    assert decode["default_target_rate"] == 0.35
+    assert decode["logit_output"] == "logits"

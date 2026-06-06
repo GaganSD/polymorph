@@ -17,17 +17,15 @@ from ..model.lamr import LaMRModel
 class TrainState:
     step: int = 0
     best_loss: float = math.inf
-    best_val_f1: float = -1.0
+    best_val_pr_auc: float = -1.0
 
 
 def _pick_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
-    # Note: MPS is deliberately excluded. The CRF's int64 gather/index ops
-    # surface non-deterministic garbage on MPS today (observed: out-of-range
-    # `prev_tag` values from `tags.to('mps')` post-async-copy). CPU is slow
-    # but correct on Apple silicon; flip to MPS via env override when the
-    # upstream bug is resolved.
+    # CPU fallback on Apple silicon. MPS was historically excluded for the CRF's
+    # int64 gather ops; the CRF is gone now, but CPU stays the safe default for
+    # the small from-scratch model (flip to MPS via env override if desired).
     return torch.device("cpu")
 
 
@@ -57,9 +55,8 @@ def train(
     log_every: int = 50,
     lambda_sem: float = 1.0,
     lambda_dep: float = 1.0,
-    aux_ce_weight: float = 0.0,
     drop_class_weight: float = 1.0,
-    crf_nll_weight: float = 1.0,
+    target_rate: float = 0.30,
     val_loader: DataLoader | None = None,
     eval_every: int = 0,
 ) -> TrainState:
@@ -86,21 +83,16 @@ def train(
                 batch[k] = v.to(device)
 
             with torch.autocast(device_type=device.type, dtype=dtype, enabled=autocast_enabled):
-                # aux_ce_weight/drop_class_weight are LIVE: they add a class-weighted
-                # token-CE to the CRF NLL to counter keep/drop majority-class collapse
-                # (see LaMRModel.joint_nll). w_semantic/w_dependency and lambda_sem/
-                # lambda_dep remain RESERVED (inert) — threaded for forward-compat.
-                out = model.joint_nll(
+                # Class-weighted per-token BCE on the drop logits. drop_class_weight
+                # up-weights the drop (positive) class so the ranking separates;
+                # absolute calibration is a decode-time threshold, not a loss knob
+                # (see LaMRModel.loss). w_semantic/w_dependency + lambda_* stay
+                # RESERVED (inert) — threaded for forward-compat.
+                out = model.loss(
                     input_ids=batch["input_ids"],
                     attention_mask=batch["attention_mask"],
                     tags=batch["tags"],
-                    w_semantic=batch["w_semantic"],
-                    w_dependency=batch["w_dependency"],
-                    lambda_sem=lambda_sem,
-                    lambda_dep=lambda_dep,
-                    aux_ce_weight=aux_ce_weight,
                     drop_class_weight=drop_class_weight,
-                    crf_nll_weight=crf_nll_weight,
                 )
             loss = out["loss"] / grad_accum
             loss.backward()
@@ -118,30 +110,29 @@ def train(
 
                 if state.step % log_every == 0:
                     dt = time.time() - t0
-                    crf_str = f" crf={out['crf_nll'].item():.4f}" if "crf_nll" in out else ""
-                    ce_str = f" ce={out['aux_ce'].item():.4f}" if "aux_ce" in out else ""
                     print(
                         f"step={state.step:6d} lr={cur_lr:.2e} "
-                        f"loss={out['loss'].item():.4f}{crf_str}{ce_str} elapsed={dt:.1f}s"
+                        f"loss={out['loss'].item():.4f} bce={out['bce'].item():.4f} elapsed={dt:.1f}s"
                     )
                 if state.step % ckpt_every == 0:
                     save_checkpoint(model, out_dir / f"ckpt-{state.step:06d}.pt", state)
                 if eval_every and val_loader is not None and state.step % eval_every == 0:
                     from ..eval.evaluate import evaluate
 
-                    m = evaluate(model, val_loader, device)
+                    m = evaluate(model, val_loader, device, target_rate=target_rate)
                     print(
-                        f"  [val] step={state.step} acc={m['accuracy']:.4f} "
-                        f"drop_f1={m['drop_f1']:.4f} (P{m['drop_precision']:.3f}/R{m['drop_recall']:.3f}) "
-                        f"drop_rate={m['pred_drop_rate']:.3f}/gold{m['gold_drop_rate']:.3f} "
-                        f"nll/tok={m['per_token_nll']:.4f}"
+                        f"  [val] step={state.step} PR-AUC={m['pr_auc']:.4f} ROC-AUC={m['roc_auc']:.4f} "
+                        f"F1@{m['target_rate']:.2f}={m['f1_at_target']:.4f} "
+                        f"(P{m['prec_at_target']:.3f}/R{m['rec_at_target']:.3f}) thr={m['thr_at_target']:.3f} "
+                        f"gold_rate={m['gold_rate']:.3f} bce/tok={m['per_token_bce']:.4f}"
                     )
-                    # Save the best-by-val checkpoint (the model oscillates, so the
-                    # final step is often not the best pruner).
-                    if m["drop_f1"] > state.best_val_f1:
-                        state.best_val_f1 = m["drop_f1"]
+                    # Select ckpt-best by PR-AUC: ranking quality is the stable,
+                    # threshold-free signal (argmax-F1 oscillates with the global
+                    # bias and is not what the calibrated decode optimizes).
+                    if m["pr_auc"] > state.best_val_pr_auc:
+                        state.best_val_pr_auc = m["pr_auc"]
                         save_checkpoint(model, out_dir / "ckpt-best.pt", state)
-                        print(f"  [val] new best drop_f1={m['drop_f1']:.4f} -> ckpt-best.pt")
+                        print(f"  [val] new best PR-AUC={m['pr_auc']:.4f} -> ckpt-best.pt")
                     model.train()
                 if state.step >= max_steps:
                     break

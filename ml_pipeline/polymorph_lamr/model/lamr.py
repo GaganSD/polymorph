@@ -1,13 +1,24 @@
-"""Full LaMR model: backbone + one emission head + one linear-chain CRF.
+"""Full LaMR model: backbone + one per-token drop head (sigmoid).
 
-The forward pass returns per-token tag emissions; ONNX export graphs the backbone
-+ head, and the CRF transitions ship as a side-car at export time.
+The pruner is a binary per-token classifier: for each token it emits a single
+*drop logit*; ``sigmoid(logit)`` is the probability that the token can be
+dropped. There is no CRF and no Viterbi — decode is a threshold on the
+per-token drop probability, calibrated to a target compression rate (see
+``eval.evaluate`` and ``src/lamr.rs``).
 
-An earlier design had two emission heads + a gate that blended them into one CRF.
-It was removed: the signal that would differentiate the two heads — the AST
-per-token weights — was never wired into the loss (reserved), so the gate added
-training instability (it oscillated between keep-all and over-drop) for no
-benefit. Re-introduce a dual head as v1 if/when those weights drive the loss.
+Why no CRF: the earlier design wrapped the emissions in a 2-tag linear-chain CRF
+and decoded with Viterbi. Probing trained checkpoints showed the CRF was
+degenerate — its ranking of which tokens to drop was stable (ROC-AUC ~0.78
+across checkpoints) while only the *global keep/drop bias* oscillated, so the
+"keep-all collapse" we chased was a calibration artifact, not a ranking failure.
+A threshold calibrated to a target drop-rate neutralizes that bias and makes the
+compression ratio a runtime knob. The CRF transitions, the transitions side-car,
+and the Rust Viterbi all went away with it.
+
+An even earlier design had two emission heads + a gate. It was removed first
+(the AST per-token weights that would differentiate the heads were never wired
+into the loss). Re-introduce a dual head as v1 if/when those weights drive the
+loss.
 """
 
 from __future__ import annotations
@@ -17,13 +28,15 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from .backbone import GatedDeltaNet2Stub, TransformerEncoderBackbone
-from .crf import NUM_TAGS, LinearChainCRF
+from .backbone import GatedDeltaNet2Stub, ModernBertBackbone, TransformerEncoderBackbone
 
-# Selectable backbones. "transformer" is the real bidirectional encoder (default);
-# "deltanet_stub" is the feed-forward placeholder kept for fallback/ablation.
+# Selectable backbones. "transformer" is the real from-scratch bidirectional
+# encoder (default); "modernbert" is a pretrained ModernBERT encoder (the #33
+# SOTA lever — needs `transformers` + its own tokenizer); "deltanet_stub" is the
+# feed-forward placeholder kept for fallback/ablation.
 _BACKBONES = {
     "transformer": TransformerEncoderBackbone,
+    "modernbert": ModernBertBackbone,
     "deltanet_stub": GatedDeltaNet2Stub,
 }
 
@@ -37,10 +50,18 @@ class LaMRConfig:
     ff_mult: int = 4
     dropout: float = 0.1
     backbone: str = "transformer"
+    # Only used when backbone == "modernbert": the HF encoder to load. d_model
+    # must equal this encoder's hidden_size (768 for ModernBERT-base).
+    encoder_name: str = "answerdotai/ModernBERT-base"
 
 
 class LaMRBackboneForExport(nn.Module):
-    """Backbone + emission head — the sub-module exported to ONNX (no CRF)."""
+    """Backbone + drop head — the sub-module exported to ONNX.
+
+    Forward returns one drop *logit* per token, shape ``(B, T)``. The ONNX graph
+    exports exactly this; the runtime applies ``sigmoid`` + a calibrated
+    threshold. No CRF / transitions are involved.
+    """
 
     def __init__(self, cfg: LaMRConfig):
         super().__init__()
@@ -57,8 +78,10 @@ class LaMRBackboneForExport(nn.Module):
             n_heads=cfg.n_heads,
             ff_mult=cfg.ff_mult,
             dropout=cfg.dropout,
+            encoder_name=getattr(cfg, "encoder_name", "answerdotai/ModernBERT-base"),
         )
-        self.head = nn.Linear(cfg.d_model, NUM_TAGS)
+        # Single drop logit per token (binary keep/drop). sigmoid(logit) = P(drop).
+        self.head = nn.Linear(cfg.d_model, 1)
 
     def forward(
         self,
@@ -66,100 +89,85 @@ class LaMRBackboneForExport(nn.Module):
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         hidden = self.backbone(input_ids, attention_mask)
-        return self.head(hidden)  # (B, T, NUM_TAGS)
+        return self.head(hidden).squeeze(-1)  # (B, T) drop logits
 
 
 class LaMRModel(nn.Module):
-    """Training-time module: the export core + one linear-chain CRF."""
+    """Training-time module: the export core + the binary drop objective."""
 
     def __init__(self, cfg: LaMRConfig):
         super().__init__()
         self.cfg = cfg
         self.export_core = LaMRBackboneForExport(cfg)
-        self.crf = LinearChainCRF()
 
     def forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.export_core(input_ids, attention_mask)  # emissions (B, T, NUM_TAGS)
+        return self.export_core(input_ids, attention_mask)  # drop logits (B, T)
 
-    def joint_nll(
+    @torch.no_grad()
+    def drop_prob(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """P(drop) per token, ``(B, T)`` in [0, 1] — the value the decode thresholds."""
+        return torch.sigmoid(self.forward(input_ids, attention_mask).float())
+
+    def loss(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         tags: torch.Tensor,                         # (B, T) gold labels (0=keep, 1=drop)
-        w_semantic: torch.Tensor | None = None,     # reserved (unused) — see note
-        w_dependency: torch.Tensor | None = None,   # reserved (unused) — see note
-        lambda_sem: float = 1.0,                    # reserved; kept for call-site compatibility
-        lambda_dep: float = 1.0,
-        aux_ce_weight: float = 0.0,
         drop_class_weight: float = 1.0,
-        crf_nll_weight: float = 1.0,
+        # Reserved/inert kwargs kept for call-site + config compatibility. The AST
+        # hop-decay soft labels (w_semantic / w_dependency) and lambda_* are not
+        # wired into the loss; they stay in the signature for a possible future
+        # token-level auxiliary and so existing call sites don't break.
+        w_semantic: torch.Tensor | None = None,
+        w_dependency: torch.Tensor | None = None,
+        lambda_sem: float = 1.0,
+        lambda_dep: float = 1.0,
     ) -> dict[str, torch.Tensor]:
-        """Training objective: a weighted sum of the single linear-chain CRF's
-        per-token NLL and a class-weighted token cross-entropy, both on the same
-        emissions the Rust/ONNX path decodes with Viterbi (train == infer):
+        """Class-weighted binary cross-entropy over valid (non-pad) tokens.
 
-            loss = crf_nll_weight * crf_nll + aux_ce_weight * weighted_ce
+            loss = mean_over_valid( BCEWithLogits(logit, gold; pos_weight=drop_w) )
 
-        Why the aux CE: the keep/drop split is ~71/29, and the CRF NLL alone
-        collapses to keep-all (high drop precision, ~0 recall, acc pinned at the
-        baseline). The class-weighted CE (drop up-weighted by ``drop_class_weight``
-        ~ the keep/drop frequency ratio) pushes balanced per-token supervision into
-        the *emissions*.
+        The keep/drop split is ~71/29, so an unweighted objective drifts toward
+        keep-all. ``drop_class_weight`` (``pos_weight``, ~ the keep/drop frequency
+        ratio) up-weights the drop (positive) class so the *ranking* of which
+        tokens to drop is well separated. Absolute calibration is handled at
+        decode time by the target-rate threshold, NOT by this weight — the weight
+        only shapes the score ordering the threshold then cuts.
 
-        Why ``crf_nll_weight``: the CE only shapes emissions; the CRF *transitions*
-        are trained solely by the CRF NLL, which on the imbalanced corpus drives a
-        dominant keep->keep self-loop that suppresses drops at Viterbi decode — a
-        transition-side collapse no emission-side knob can fix (observed: every run
-        collapses at ~2 epochs regardless of CE/LR). Down-weighting the CRF NLL
-        keeps the transitions near their flat init (flat transitions => Viterbi =
-        per-token argmax of the balanced emissions), so the decode can't collapse.
-        ``crf_nll_weight=0`` trains a pure class-weighted token classifier with the
-        CRF acting as an identity smoother; ``=1`` (default) recovers prior
-        behavior. With ``aux_ce_weight == 0`` the dict carries no ``aux_ce``.
-
-        ``w_semantic`` / ``w_dependency`` (AST hop-decay soft labels) and
-        ``lambda_*`` are reserved and unused; they stay in the signature for
-        call-site compatibility and a possible future token-level auxiliary loss.
+        bf16/fp16 autocast is bypassed (logits upcast to fp32) so the sigmoid
+        isn't biased by low precision over long T.
         """
-        emissions = self.forward(input_ids, attention_mask)
-        crf_nll = self.crf.nll(emissions, tags, attention_mask, reduction="token_mean")
-        loss = crf_nll_weight * crf_nll
-        out = {"crf_nll": crf_nll}
-        if aux_ce_weight > 0.0:
-            aux_ce = self._weighted_token_ce(emissions, tags, attention_mask, drop_class_weight)
-            out["aux_ce"] = aux_ce
-            loss = loss + aux_ce_weight * aux_ce
-        out["loss"] = loss
-        return out
+        logits = self.forward(input_ids, attention_mask)
+        bce = self._weighted_token_bce(logits, tags, attention_mask, drop_class_weight)
+        return {"loss": bce, "bce": bce}
 
     @staticmethod
-    def _weighted_token_ce(
-        emissions: torch.Tensor,        # (B, T, NUM_TAGS)
-        tags: torch.Tensor,             # (B, T) int64 in [0, NUM_TAGS)
+    def _weighted_token_bce(
+        logits: torch.Tensor,           # (B, T) drop logits
+        tags: torch.Tensor,             # (B, T) int in {0, 1}
         attention_mask: torch.Tensor,   # (B, T) bool/0-1 — True = valid
         drop_class_weight: float,
     ) -> torch.Tensor:
-        """Class-weighted per-token cross-entropy over valid (non-pad) positions.
+        """Class-weighted per-token BCE-with-logits over valid positions.
 
-        fp32 like the CRF forward (logits upcast) so bf16/fp16 autocast can't bias
-        the softmax. Class weights are ``[keep=1.0, drop=drop_class_weight]`` (tag
-        set is fixed: 0=keep, 1=drop). Returns weighted nats/token: the sum of
-        per-token weighted CE over valid positions divided by the valid-token
-        count — length-invariant and on the same per-token scale as the CRF's
-        ``token_mean`` NLL, so ``aux_ce_weight`` is a clean relative knob.
+        ``pos_weight`` scales the loss contribution of drop (gold==1) tokens.
+        Returns nats/token: summed weighted BCE over valid positions divided by
+        the valid-token count — length-invariant, so ``drop_class_weight`` is a
+        clean relative knob and long sequences don't dominate.
         """
-        k = emissions.shape[-1]
-        logits = emissions.float().reshape(-1, k)   # (B*T, K)
-        gold = tags.reshape(-1)                      # (B*T,)
-        class_weight = torch.tensor(
-            [1.0, float(drop_class_weight)], device=logits.device, dtype=logits.dtype
-        )
-        ce = torch.nn.functional.cross_entropy(
-            logits, gold, weight=class_weight, reduction="none"
-        )  # (B*T,) — each element already scaled by its target's class weight
-        valid = attention_mask.reshape(-1).to(ce.dtype)
-        return (ce * valid).sum() / valid.sum().clamp(min=1.0)
+        logits = logits.float()
+        gold = tags.float()
+        pos_weight = torch.tensor(float(drop_class_weight), device=logits.device, dtype=logits.dtype)
+        bce = torch.nn.functional.binary_cross_entropy_with_logits(
+            logits, gold, pos_weight=pos_weight, reduction="none"
+        )  # (B, T)
+        valid = attention_mask.to(bce.dtype)
+        return (bce * valid).sum() / valid.sum().clamp(min=1.0)

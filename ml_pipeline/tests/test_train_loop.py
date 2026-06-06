@@ -80,11 +80,10 @@ def test_pick_device_returns_device():
     assert isinstance(dev, torch.device)
 
 
-def test_joint_loss_wrapper_returns_blended_loss():
-    # Post-C1: the wrapper returns the model's single trained objective (the
-    # blended-CRF NLL in out["loss"]), NOT a lambda-weighted sum of the per-head
-    # NLLs. The lambda knobs are vestigial and must not change the result.
-    out = {"loss": torch.tensor(2.5), "nll_sem": torch.tensor(2.0), "nll_dep": torch.tensor(3.0)}
+def test_joint_loss_wrapper_returns_model_loss():
+    # The wrapper returns the model's single trained objective (the per-token BCE
+    # in out["loss"]). The lambda knobs are vestigial and must not change the result.
+    out = {"loss": torch.tensor(2.5), "bce": torch.tensor(2.5)}
     assert torch.equal(joint_loss(out, lambda_sem=1.0, lambda_dep=1.0), out["loss"])
     assert torch.equal(joint_loss(out, lambda_sem=2.0, lambda_dep=0.5), out["loss"])
 

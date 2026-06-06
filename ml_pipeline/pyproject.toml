@@ -28,6 +28,14 @@ dev = [
 train = [
     "wandb>=0.17",
 ]
+bench = [
+    # Optional LLMLingua-2 baseline for the answer-survival benchmark (CPU-ok).
+    "llmlingua>=0.2",
+]
+encoder = [
+    # Pretrained-encoder backbone (backbone: modernbert) — the #33 SOTA lever.
+    "transformers>=4.48",
+]
 
 [project.scripts]
 lamr-pipeline = "polymorph_lamr.pipeline:main"
@@ -36,6 +44,7 @@ lamr-train = "polymorph_lamr.train.train:main"
 lamr-eval = "polymorph_lamr.eval.evaluate:main"
 lamr-export = "polymorph_lamr.export.to_onnx:main"
 lamr-stage-corpora = "polymorph_lamr.distill.adapters.stage:main"
+lamr-bench = "polymorph_lamr.bench.run_bench:main"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

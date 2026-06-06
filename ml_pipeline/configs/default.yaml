@@ -74,20 +74,22 @@ train:
   eval_every: 200         # periodic val pass (acc/F1/drop-rate) when --val-shards is given
   lambda_sem: 1.0
   lambda_dep: 1.0
-  # Class-imbalance fix. The keep/drop split is ~71/29, so an unweighted CRF NLL
-  # collapses to keep-all (high drop precision, ~0 recall, acc stuck at the 0.714
-  # baseline). A class-weighted token-CE auxiliary on the emissions counters the
-  # collapse; total loss = crf_nll + aux_ce_weight * weighted_ce. Set
-  # aux_ce_weight: 0.0 to recover the pure single-CRF objective.
-  aux_ce_weight: 1.0
+  # Class-imbalance handling. The keep/drop split is ~71/29. The objective is a
+  # per-token binary cross-entropy on the drop logit (sigmoid head, no CRF);
+  # drop_class_weight is the BCE pos_weight, up-weighting the drop (positive)
+  # class so the drop-ranking separates. Absolute calibration is NOT done here —
+  # it is a decode-time threshold calibrated to eval.target_rate (see below).
   drop_class_weight: 2.5  # ~= keep/drop frequency ratio (0.714 / 0.286)
-  # CRF NLL strength. The transitions are trained ONLY by the CRF NLL, and on the
-  # imbalanced corpus that NLL drives a keep->keep self-loop that collapses the
-  # Viterbi decode to keep-all (~2 epochs in, independent of the CE/LR knobs).
-  # Down-weight it so transitions stay near their flat init (flat => Viterbi =
-  # argmax of the balanced emissions). 0 => pure class-weighted token classifier.
-  crf_nll_weight: 1.0
   seed: 1337
+
+eval:
+  # Target drop rate the val decode threshold is calibrated to. The pruner is a
+  # ranker (sigmoid drop-prob per token); decode sorts by prob and cuts at the
+  # threshold that drops this fraction, so the compression ratio is a runtime
+  # knob. ckpt-best is selected by PR-AUC (threshold-free ranking quality), and
+  # F1/precision/recall are reported at this calibrated threshold. Also written
+  # to the exported decode.json as the runtime default.
+  target_rate: 0.30
 
 export:
   out_dir: artifacts/lamr-v0
