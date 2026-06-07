@@ -1,0 +1,97 @@
+# LaMR training config — ModernBERT-base backbone (#33 SOTA lever).
+#
+# Mirrors configs/default.yaml; every field that DIFFERS from default carries an
+# inline rationale. The big change: the from-scratch cl100k embedding + 4-layer
+# encoder is replaced by a pretrained ModernBERT-base encoder. That brings TWO
+# downstream consequences baked into this config:
+#   1. tokenizer switches to ModernBERT's (NOT cl100k) — training shards AND the
+#      Rust runtime tokenization both move with it. Shards for this config live
+#      under data/shards/mb_v0 (ModernBERT-tokenized).
+#   2. d_model MUST equal ModernBERT-base hidden_size (768) or the backbone
+#      raises at construction.
+tokenizer:
+  name: answerdotai/ModernBERT-base  # CHANGED: ModernBERT tokenizer (not cl100k). Shards under mb_v0 must be tokenized with this.
+
+distill:
+  mode: ensemble
+  prompt: log_trace
+  teachers:
+    deepseek-v32: bedrock/deepseek.v3.2
+    minimax-m21: bedrock/minimax.minimax-m2.1
+  pair_models:
+    max_compression: anthropic/claude-3-5-sonnet-latest
+    reasoning_preserved: openai/gpt-4o
+  max_chunk_tokens: 512
+  concurrency: 8
+  num_retries: 4
+  request_timeout_s: 60
+  temperature: 0.0
+
+qc:
+  vr_drop_top_pct: 5.0
+  ag_drop_top_pct: 10.0
+
+label:
+  hop_decay:
+    kernel: exp
+    alpha: 0.5
+  scaffold_node_types:
+    python:
+      - function_definition
+      - class_definition
+      - import_statement
+      - import_from_statement
+      - decorator
+      - parameters
+      - typed_parameter
+      - typed_default_parameter
+      - type
+      - call
+    json:
+      - object
+      - pair
+      - array
+
+model:
+  # vocab_size is informational for the modernbert backbone (the pretrained
+  # encoder owns its own embedding table); kept set to ModernBERT-base vocab so
+  # the dataclass field is sane and any incidental vocab read is correct.
+  vocab_size: 50368    # CHANGED: ModernBERT-base vocab (was 100352 cl100k upper bound)
+  d_model: 768         # CHANGED: MUST equal ModernBERT-base hidden_size=768 (backbone raises otherwise)
+  n_layers: 4          # informational only — the pretrained encoder owns its own depth; kept for the dry-run mem estimate
+  n_heads: 4           # informational only — pretrained encoder owns its own head count
+  ff_mult: 4           # informational only — pretrained encoder owns its own FFN width
+  dropout: 0.1
+  backbone: modernbert # CHANGED: pretrained ModernBERT-base encoder (was transformer)
+  encoder_name: answerdotai/ModernBERT-base  # NEW: HF encoder id loaded by ModernBertBackbone
+
+train:
+  batch_size: 32         # A100-40GB: micro-batch 32 (was 4 for T4 16GB). 32x512 of a 150M model fits 40GB with wide margin. The bigger micro-batch is the speedup — T4's 16 sequential micro-steps were overhead-bound, not compute-bound.
+  grad_accum: 2          # 32 x 2 = effective batch 64 — IDENTICAL to the T4 config's 4 x 16, so lr/warmup stay valid and dynamics are unchanged; just 2 micro-steps/optimizer-step instead of 16.
+  max_seq_len: 512       # CHANGED: 512 (was 1024). ModernBERT supports long context, but a 512 training window with batch 4 fits T4 16GB comfortably; long-context can be a later sweep.
+  lr: 3.0e-5             # CHANGED: 3e-5 (was 2e-4). Pretrained encoders want a SMALL fine-tuning LR (~2e-5..5e-5); a from-scratch LR would wreck the pretrained weights.
+  weight_decay: 0.01
+  warmup_steps: 300
+  max_steps: 1500
+  amp_dtype: bf16
+  ckpt_every: 1000
+  log_every: 50
+  eval_every: 200
+  lambda_sem: 1.0
+  lambda_dep: 1.0
+  # Same class-imbalance + salience handling as v0c: drop_class_weight is the BCE
+  # pos_weight up-weighting the drop class; w_semantic (from the shard) is the
+  # per-token keep-salience multiplier the loop passes as `salience`. Unchanged.
+  drop_class_weight: 2.5
+  seed: 1337
+
+eval:
+  target_rate: 0.30
+
+export:
+  out_dir: artifacts/lamr-mb-v0  # CHANGED: separate artifact dir for the ModernBERT run
+  opset: 17
+  # FIXED-WINDOW export: the ModernBERT graph hits a tract Flatten shape-analysis
+  # failure with a dynamic seq axis, so the runtime model is exported at a fixed
+  # window length (see export/to_onnx + backbone.py caveat). Not a dynamic-axes export.
+  dynamic_axes: false

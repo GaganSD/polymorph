@@ -1,0 +1,97 @@
+# LaMR default training + pipeline config.
+tokenizer:
+  name: cl100k_base  # must match src/tokens.rs
+
+distill:
+  mode: ensemble            # ensemble (open-weight teachers, default) | pair (legacy Claude+GPT-4o)
+  prompt: log_trace         # extractive prompt tuned for logs/traces
+  # Open-weight teacher ensemble (E3), provider-prefixed (see distill/providers.py).
+  # Per-chunk best-QC output (VR==0, lowest AG) is kept as the training target.
+  #   bedrock/<model>    -> AWS Bedrock        (AWS credential chain + AWS_REGION)
+  #   vercel/<model>     -> Vercel AI Gateway  (needs VERCEL_AI_GATEWAY_KEY;
+  #                         STRICT: only alibaba/qwen3.7-max permitted) [legacy]
+  # A teacher that errors / is throttled is dropped from per-chunk selection, not fatal.
+  teachers:
+    deepseek-v32: bedrock/deepseek.v3.2          # strong, cheap, ON_DEMAND
+    minimax-m21: bedrock/minimax.minimax-m2.1    # 2nd Bedrock teacher (best-QC pick)
+  # legacy pair-mode models (only used with mode: pair)
+  pair_models:
+    max_compression: anthropic/claude-3-5-sonnet-latest
+    reasoning_preserved: openai/gpt-4o
+  max_chunk_tokens: 512
+  concurrency: 8
+  num_retries: 4
+  request_timeout_s: 60
+  temperature: 0.0
+
+qc:
+  vr_drop_top_pct: 5.0   # drop top 5% by Variation Rate
+  ag_drop_top_pct: 10.0  # then drop top 10% by Alignment Gap
+
+label:
+  hop_decay:
+    kernel: exp        # exp | linear
+    alpha: 0.5
+  scaffold_node_types:
+    python:
+      - function_definition
+      - class_definition
+      - import_statement
+      - import_from_statement
+      - decorator
+      - parameters
+      - typed_parameter
+      - typed_default_parameter
+      - type
+      - call           # call.function -- captured by parent type
+    json:
+      - object
+      - pair
+      - array
+
+model:
+  vocab_size: 100352   # cl100k vocab upper bound
+  d_model: 256
+  n_layers: 4
+  n_heads: 4
+  ff_mult: 4
+  dropout: 0.1
+  # Backbone encoder: transformer = real bidirectional pre-norm Transformer
+  # encoder (default, token-mixing); deltanet_stub = feed-forward placeholder.
+  backbone: transformer
+
+train:
+  batch_size: 2
+  grad_accum: 32         # virtual batch 64
+  max_seq_len: 512
+  lr: 2.0e-4              # per-token loss caps per-token grad, so a moderate LR is stable (3e-4 spiked under the old per-sequence loss)
+  weight_decay: 0.01
+  warmup_steps: 300       # longer warmup for a stable ramp
+  max_steps: 1500         # ~4.6 epochs over the v0 corpus (loop cycles epochs; watch val F1 via eval_every)
+  amp_dtype: bf16
+  ckpt_every: 1000
+  log_every: 50
+  eval_every: 300         # periodic val pass (acc/F1/drop-rate) when --val-shards is given
+  lambda_sem: 1.0
+  lambda_dep: 1.0
+  # Class-imbalance handling. The keep/drop split is ~71/29. The objective is a
+  # per-token binary cross-entropy on the drop logit (sigmoid head, no CRF);
+  # drop_class_weight is the BCE pos_weight, up-weighting the drop (positive)
+  # class so the drop-ranking separates. Absolute calibration is NOT done here —
+  # it is a decode-time threshold calibrated to eval.target_rate (see below).
+  drop_class_weight: 2.5  # ~= keep/drop frequency ratio (0.714 / 0.286)
+  seed: 1337
+
+eval:
+  # Target drop rate the val decode threshold is calibrated to. The pruner is a
+  # ranker (sigmoid drop-prob per token); decode sorts by prob and cuts at the
+  # threshold that drops this fraction, so the compression ratio is a runtime
+  # knob. ckpt-best is selected by PR-AUC (threshold-free ranking quality), and
+  # F1/precision/recall are reported at this calibrated threshold. Also written
+  # to the exported decode.json as the runtime default.
+  target_rate: 0.30
+
+export:
+  out_dir: artifacts/lamr-v0
+  opset: 17
+  dynamic_axes: true

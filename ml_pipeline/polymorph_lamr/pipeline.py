@@ -34,10 +34,45 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from .bench.structural import structural_spans
+from .bench.triples import _SEMANTIC_QUOTED
 from .label.align import derive_mask
 from .label.ast_split import split_labels
 from .qc.filter import filter_records
 from .qc.metrics import QCRecord
+
+
+def _salience_spans(text: str) -> list[tuple[int, int]]:
+    """Byte ranges of answer-bearing content: structural atoms (status, IP,
+    exception, id) + free-text VALUES of salient keys (root_cause / msg /
+    resolution). These are the tokens whose survival the benchmark measures, so
+    the trainer up-weights keeping them (Phase 0e)."""
+    ranges = list(structural_spans(text))
+    for m in _SEMANTIC_QUOTED.finditer(text):
+        s = len(text[: m.start(2)].encode("utf-8"))
+        e = len(text[: m.end(2)].encode("utf-8"))
+        if e > s:
+            ranges.append((s, e))
+    return ranges
+
+
+def _salience_weights(
+    text: str, spans: list[tuple[int, int]], needle_weight: float
+) -> list[float]:
+    """Per-token weight: ``needle_weight`` for tokens overlapping a salient span,
+    else 1.0. ``spans`` are the token byte spans from ``derive_mask``."""
+    sal = _salience_spans(text)
+    w = [1.0] * len(spans)
+    if not sal:
+        return w
+    sal.sort()
+    si = 0
+    for i, (a, b) in enumerate(spans):
+        while si < len(sal) and sal[si][1] <= a:
+            si += 1
+        if si < len(sal) and sal[si][0] < b:
+            w[i] = needle_weight
+    return w
 
 # Number of leading sha256 hex digits used to bucket a source into train/val.
 # 8 hex digits = 32 bits of resolution, plenty for a fractional split.
@@ -132,9 +167,23 @@ def _split_bucket(src_path: str, chunk_id: int, val_frac: float, seed: int) -> s
     return "val" if bucket < val_frac else "train"
 
 
-def _build_shard_record(pair: DistilledPair, lang: str | None) -> dict | None:
-    """Label one pair into a shard line. Returns None if it has no tokens."""
-    align = derive_mask(pair.original, pair.compressed)
+def _build_shard_record(
+    pair: DistilledPair,
+    lang: str | None,
+    needle_weight: float = 1.0,
+    tokenizer: str = "cl100k",
+) -> dict | None:
+    """Label one pair into a shard line. Returns None if it has no tokens.
+
+    ``w_semantic`` carries the Phase 0e keep-salience weight (answer-bearing tokens
+    weighted ``needle_weight``, else 1.0) — repurposed from the inert AST hop-decay
+    channel. ``needle_weight=1.0`` reproduces the un-weighted objective.
+
+    ``tokenizer`` selects the token space of ``input_ids`` / labels: "cl100k"
+    (default, tiktoken) or "modernbert" (HF ModernBERT-base). The byte-level
+    alignment is identical across backends; only the token grid changes.
+    """
+    align = derive_mask(pair.original, pair.compressed, tokenizer=tokenizer)
     if not align.token_ids:
         return None
     split = split_labels(
@@ -145,10 +194,15 @@ def _build_shard_record(pair: DistilledPair, lang: str | None) -> dict | None:
     )
     # Tag convention (see train/dataset.py + run_e2e_smoke.sh): 0 = keep, 1 = drop.
     tags = [0 if k else 1 for k in split.keep_mask]
+    w_semantic = (
+        _salience_weights(pair.original, align.spans, needle_weight)
+        if needle_weight != 1.0
+        else split.w_semantic
+    )
     return {
         "input_ids": align.token_ids,
         "tags": tags,
-        "w_semantic": split.w_semantic,
+        "w_semantic": w_semantic,
         "w_dependency": split.w_dependency,
         "is_code": split.is_code,
         "src_path": pair.src_path,
@@ -183,6 +237,20 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="drop survivors whose original tokenizes to fewer than N tokens",
+    )
+    p.add_argument(
+        "--needle-weight",
+        type=float,
+        default=1.0,
+        help="Phase 0e: keep-salience weight for answer-bearing tokens "
+        "(structural atoms + free-text values) in w_semantic (default 1.0 = off)",
+    )
+    p.add_argument(
+        "--tokenizer",
+        choices=["cl100k", "modernbert"],
+        default="cl100k",
+        help="token space for input_ids + labels: cl100k (tiktoken, default) or "
+        "modernbert (answerdotai/ModernBERT-base via HF fast tokenizer)",
     )
     return p
 
@@ -239,7 +307,9 @@ def main(argv: list[str] | None = None) -> int:
         handles = {"train": train_fh, "val": val_fh}
         for pair in surviving_pairs:
             lang = _infer_lang(pair.src_path) if args.lang_detect else None
-            shard = _build_shard_record(pair, lang)
+            shard = _build_shard_record(
+                pair, lang, needle_weight=args.needle_weight, tokenizer=args.tokenizer
+            )
             if shard is None:
                 continue
             if args.min_tokens and len(shard["input_ids"]) < args.min_tokens:

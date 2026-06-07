@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import modal
 
-GPU = "T4"  # plenty for a 28.8M model; bump to "A10"/"A100" for speed (still pennies)
+GPU = "A100"  # 40GB. ModernBERT-150M is tiny; 40GB is ample (80GB/H100 give no gain for
+# this model size). Speed comes from a bigger micro-batch (see modernbert.yaml batch_size),
+# not the GPU tier — a micro-batch of 4 would leave any big GPU idle.
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -30,6 +32,9 @@ image = (
         "onnx>=1.16",
         "onnxruntime>=1.18",
         "onnxscript>=0.1",
+        # modernbert backbone (configs/modernbert.yaml) needs transformers; the
+        # ModernBERT-base weights (~600MB) download on first use inside the container.
+        "transformers>=4.48",
     )
     # Bake the package + config into the image (paths are relative to repo root,
     # where `modal run` is invoked).
@@ -41,10 +46,20 @@ app = modal.App("polymorph-lamr-v0")
 vol = modal.Volume.from_name("polymorph-lamr-v0", create_if_missing=True)
 
 
-@app.function(image=image, gpu=GPU, volumes={"/data": vol}, timeout=2 * 60 * 60)
+@app.function(image=image, gpu=GPU, volumes={"/data": vol}, timeout=6 * 60 * 60)
 def train(
     max_steps: int = 2000,
     out_subdir: str = "v0",
+    shards_subdir: str = "v0",
+    # Which committed config to train with (under /pkg/configs). Selects the
+    # backbone: "default.yaml" = from-scratch transformer; "modernbert.yaml" =
+    # pretrained ModernBERT-base encoder (reads mb_v0 shards).
+    config_name: str = "default.yaml",
+    # Fixed-window ONNX export length. The modernbert backbone MUST export at a
+    # fixed seq len (dynamic seq -> tract Flatten failure); set this (e.g. 512,
+    # matching the training window) for that config. -1 => dynamic-axes export
+    # (the from-scratch transformer path).
+    export_fixed_seq_len: int = -1,
     # Loss/optimizer overrides for sweeps (negative sentinel => use config value).
     lr: float = -1.0,
     warmup_steps: int = -1,
@@ -63,15 +78,19 @@ def train(
     dev = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
     print(f"[modal] torch={torch.__version__} cuda={torch.cuda.is_available()} dev={dev}")
 
-    train_jsonl = "/data/shards/v0/train.jsonl"
-    val_jsonl = "/data/shards/v0/val.jsonl"
+    train_jsonl = f"/data/shards/{shards_subdir}/train.jsonl"
+    val_jsonl = f"/data/shards/{shards_subdir}/val.jsonl"
     out = f"/data/out/{out_subdir}"
     Path(out).mkdir(parents=True, exist_ok=True)
     print(f"[modal] train={train_jsonl} val={val_jsonl} out={out} max_steps={max_steps}")
 
     from polymorph_lamr.train.train import main as train_main
 
-    argv = ["--config", "configs/default.yaml", "--shards", train_jsonl, "--out", out,
+    config_path = f"configs/{config_name}"
+    if not Path(config_path).is_file():
+        raise SystemExit(f"config not found: {config_path}")
+    print(f"[modal] config={config_path}")
+    argv = ["--config", config_path, "--shards", train_jsonl, "--out", out,
             "--max-steps", str(max_steps)]
     if Path(val_jsonl).is_file():
         argv += ["--val-shards", val_jsonl]  # periodic val acc/F1/drop-rate during training
@@ -101,7 +120,10 @@ def train(
     parity = export(
         checkpoint=ckpt,
         out_dir=Path(out) / "onnx",
-        config_path=Path("configs/default.yaml"),
+        config_path=Path(config_path),
+        # Fixed-window export for the modernbert backbone (dynamic seq -> tract
+        # Flatten failure); -1 sentinel => dynamic-axes export.
+        fixed_seq_len=(export_fixed_seq_len if export_fixed_seq_len > 0 else None),
     )
     print(f"[modal] export parity: {parity}")
     vol.commit()  # persist /data writes so `modal volume get` sees them
@@ -112,6 +134,9 @@ def train(
 def main(
     max_steps: int = 2000,
     out_subdir: str = "v0",
+    shards_subdir: str = "v0",
+    config_name: str = "default.yaml",
+    export_fixed_seq_len: int = -1,
     lr: float = -1.0,
     warmup_steps: int = -1,
     drop_class_weight: float = -1.0,
@@ -120,6 +145,9 @@ def main(
     result = train.remote(
         max_steps=max_steps,
         out_subdir=out_subdir,
+        shards_subdir=shards_subdir,
+        config_name=config_name,
+        export_fixed_seq_len=export_fixed_seq_len,
         lr=lr,
         warmup_steps=warmup_steps,
         drop_class_weight=drop_class_weight,

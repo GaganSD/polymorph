@@ -122,31 +122,34 @@ class LaMRModel(nn.Module):
         attention_mask: torch.Tensor,
         tags: torch.Tensor,                         # (B, T) gold labels (0=keep, 1=drop)
         drop_class_weight: float = 1.0,
-        # Reserved/inert kwargs kept for call-site + config compatibility. The AST
-        # hop-decay soft labels (w_semantic / w_dependency) and lambda_* are not
-        # wired into the loss; they stay in the signature for a possible future
-        # token-level auxiliary and so existing call sites don't break.
+        # ``w_semantic`` is repurposed (Phase 0e) as a per-token KEEP-SALIENCE
+        # weight: tokens inside answer-bearing spans (free-text root_cause / msg /
+        # resolution values, structural atoms) carry weight > 1 so the loss
+        # punishes dropping them harder, directly targeting answer-needle survival.
+        # ``w_dependency`` / ``lambda_*`` remain reserved/inert.
         w_semantic: torch.Tensor | None = None,
         w_dependency: torch.Tensor | None = None,
         lambda_sem: float = 1.0,
         lambda_dep: float = 1.0,
     ) -> dict[str, torch.Tensor]:
-        """Class-weighted binary cross-entropy over valid (non-pad) tokens.
+        """Class-weighted, salience-weighted per-token BCE over valid tokens.
 
-            loss = mean_over_valid( BCEWithLogits(logit, gold; pos_weight=drop_w) )
+            loss = mean_over_valid( w_sal · BCEWithLogits(logit, gold; pos_weight=drop_w) )
 
         The keep/drop split is ~71/29, so an unweighted objective drifts toward
-        keep-all. ``drop_class_weight`` (``pos_weight``, ~ the keep/drop frequency
-        ratio) up-weights the drop (positive) class so the *ranking* of which
-        tokens to drop is well separated. Absolute calibration is handled at
-        decode time by the target-rate threshold, NOT by this weight — the weight
-        only shapes the score ordering the threshold then cuts.
+        keep-all. ``drop_class_weight`` (``pos_weight``) up-weights the drop class
+        so the *ranking* separates; absolute calibration is a decode-time threshold.
+        ``w_semantic`` (per-token salience, default 1) additionally up-weights the
+        tokens whose survival the benchmark measures, so the ranker learns to rank
+        answer-needle tokens as keep even under a tight budget.
 
         bf16/fp16 autocast is bypassed (logits upcast to fp32) so the sigmoid
         isn't biased by low precision over long T.
         """
         logits = self.forward(input_ids, attention_mask)
-        bce = self._weighted_token_bce(logits, tags, attention_mask, drop_class_weight)
+        bce = self._weighted_token_bce(
+            logits, tags, attention_mask, drop_class_weight, salience=w_semantic
+        )
         return {"loss": bce, "bce": bce}
 
     @staticmethod
@@ -155,13 +158,15 @@ class LaMRModel(nn.Module):
         tags: torch.Tensor,             # (B, T) int in {0, 1}
         attention_mask: torch.Tensor,   # (B, T) bool/0-1 — True = valid
         drop_class_weight: float,
+        salience: torch.Tensor | None = None,  # (B, T) per-token keep-salience weight
     ) -> torch.Tensor:
-        """Class-weighted per-token BCE-with-logits over valid positions.
+        """Class- and salience-weighted per-token BCE-with-logits over valid tokens.
 
         ``pos_weight`` scales the loss contribution of drop (gold==1) tokens.
-        Returns nats/token: summed weighted BCE over valid positions divided by
-        the valid-token count — length-invariant, so ``drop_class_weight`` is a
-        clean relative knob and long sequences don't dominate.
+        ``salience`` (default all-ones) is a per-token multiplier that up-weights
+        answer-bearing tokens so the ranker protects them under budget. Returns a
+        weighted mean (sum of weighted BCE / sum of effective weights) so it stays
+        length-invariant and ``drop_class_weight`` remains a clean relative knob.
         """
         logits = logits.float()
         gold = tags.float()
@@ -170,4 +175,11 @@ class LaMRModel(nn.Module):
             logits, gold, pos_weight=pos_weight, reduction="none"
         )  # (B, T)
         valid = attention_mask.to(bce.dtype)
+        if salience is not None:
+            # Default salience is 1.0; only answer-bearing tokens exceed it. Clamp
+            # to >=0 and floor the per-token weight at 1 so a malformed/zero weight
+            # never silently zeroes a valid token's gradient.
+            w = salience.to(bce.dtype).clamp(min=0.0)
+            w = torch.where(w < 1.0, torch.ones_like(w), w) * valid
+            return (bce * w).sum() / w.sum().clamp(min=1.0)
         return (bce * valid).sum() / valid.sum().clamp(min=1.0)

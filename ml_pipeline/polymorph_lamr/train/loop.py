@@ -21,11 +21,17 @@ class TrainState:
 
 
 def _pick_device() -> torch.device:
+    # Explicit override wins (e.g. LAMR_DEVICE=mps on Apple silicon for ~5-10x
+    # speedup over CPU now that the CRF's int64 gather ops are gone).
+    import os
+
+    forced = os.environ.get("LAMR_DEVICE", "").strip().lower()
+    if forced:
+        return torch.device(forced)
     if torch.cuda.is_available():
         return torch.device("cuda")
-    # CPU fallback on Apple silicon. MPS was historically excluded for the CRF's
-    # int64 gather ops; the CRF is gone now, but CPU stays the safe default for
-    # the small from-scratch model (flip to MPS via env override if desired).
+    # CPU is the safe default for the small from-scratch model; set LAMR_DEVICE=mps
+    # to use the Apple GPU.
     return torch.device("cpu")
 
 
@@ -93,6 +99,9 @@ def train(
                     attention_mask=batch["attention_mask"],
                     tags=batch["tags"],
                     drop_class_weight=drop_class_weight,
+                    # Phase 0e: per-token keep-salience weight (answer-bearing
+                    # tokens carry weight > 1 in the shard's w_semantic channel).
+                    w_semantic=batch.get("w_semantic"),
                 )
             loss = out["loss"] / grad_accum
             loss.backward()
@@ -108,6 +117,13 @@ def train(
                 optim.zero_grad(set_to_none=True)
                 state.step += 1
 
+                # Bound the MPS allocator's cached-block high-watermark: it grows
+                # across steps as differently-shaped (padded) batches allocate new
+                # buffers, and trips the ~9GB cap mid-backward even with RAM free.
+                # Releasing every 20 steps keeps peak bounded for a small cost.
+                if device.type == "mps" and state.step % 20 == 0:
+                    torch.mps.empty_cache()
+
                 if state.step % log_every == 0:
                     dt = time.time() - t0
                     print(
@@ -120,6 +136,13 @@ def train(
                     from ..eval.evaluate import evaluate
 
                     m = evaluate(model, val_loader, device, target_rate=target_rate)
+                    # The val pass allocates a full sweep of logits; free it before
+                    # resuming training so the device-memory high-watermark from
+                    # eval doesn't stack with the next training batch (MPS OOM).
+                    if device.type == "mps":
+                        torch.mps.empty_cache()
+                    elif device.type == "cuda":
+                        torch.cuda.empty_cache()
                     print(
                         f"  [val] step={state.step} PR-AUC={m['pr_auc']:.4f} ROC-AUC={m['roc_auc']:.4f} "
                         f"F1@{m['target_rate']:.2f}={m['f1_at_target']:.4f} "

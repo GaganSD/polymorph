@@ -70,7 +70,17 @@ def export(
     opset: int = 17,
     parity_seq_len: int = 64,
     target_rate: float = DEFAULT_TARGET_RATE,
+    fixed_seq_len: int | None = None,
 ) -> dict:
+    """Export the pruner to ONNX.
+
+    ``fixed_seq_len``: when set, export a FIXED-WINDOW graph (no dynamic seq
+    axis) at exactly this length. Required for the ModernBERT backbone — its
+    dynamic-seq graph hits a tract Flatten shape-analysis failure (see
+    backbone.py caveat), so the runtime model must be a fixed window. Parity is
+    then checked only at that one length. When None, the legacy dynamic-axes
+    export + multi-shape parity sweep is used (from-scratch transformer backbone).
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     model, cfg = _load_checkpoint(checkpoint)
     core = model.export_core
@@ -84,12 +94,21 @@ def export(
         except Exception:
             pass
 
-    # Dummy inputs.
-    dummy_ids = torch.randint(0, cfg.vocab_size, (1, parity_seq_len), dtype=torch.long)
-    dummy_mask = torch.ones((1, parity_seq_len), dtype=torch.bool)
-
     onnx_path = out_dir / "model.onnx"
-    _export_static_graph(core, dummy_ids, dummy_mask, onnx_path, opset, prefer_dynamo=True)
+
+    if fixed_seq_len is not None:
+        # FIXED-WINDOW export: static seq axis at exactly fixed_seq_len. The
+        # runtime must pad/truncate every chunk to this length. Required for the
+        # ModernBERT backbone (dynamic seq -> tract Flatten failure).
+        seq = int(fixed_seq_len)
+        dummy_ids = torch.randint(0, cfg.vocab_size, (1, seq), dtype=torch.long)
+        dummy_mask = torch.ones((1, seq), dtype=torch.bool)
+        _export_fixed_graph(core, dummy_ids, dummy_mask, onnx_path, opset)
+    else:
+        # Dummy inputs.
+        dummy_ids = torch.randint(0, cfg.vocab_size, (1, parity_seq_len), dtype=torch.long)
+        dummy_mask = torch.ones((1, parity_seq_len), dtype=torch.bool)
+        _export_static_graph(core, dummy_ids, dummy_mask, onnx_path, opset, prefer_dynamo=True)
 
     # Decode contract side-car (replaces the old transitions.json). The runtime
     # needs no learned params beyond the ONNX weights: decode is sigmoid + a
@@ -120,12 +139,16 @@ def export(
     import onnxruntime as ort
 
     sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
-    try:
-        parity = _check_parity(core, sess, cfg, parity_seq_len)
-    except Exception:
-        _export_static_graph(core, dummy_ids, dummy_mask, onnx_path, opset, prefer_dynamo=False)
-        sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
-        parity = _check_parity(core, sess, cfg, parity_seq_len)
+    if fixed_seq_len is not None:
+        # Single fixed-length parity check (the graph has no dynamic seq axis).
+        parity = _check_parity_fixed(core, sess, cfg, int(fixed_seq_len))
+    else:
+        try:
+            parity = _check_parity(core, sess, cfg, parity_seq_len)
+        except Exception:
+            _export_static_graph(core, dummy_ids, dummy_mask, onnx_path, opset, prefer_dynamo=False)
+            sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+            parity = _check_parity(core, sess, cfg, parity_seq_len)
     (out_dir / "parity.json").write_text(json.dumps(parity, indent=2))
 
     _write_readme(out_dir, cfg, target_rate)
@@ -168,6 +191,54 @@ def _export_static_graph(
     finally:
         if set_fastpath is not None and previous_fastpath is not None:
             set_fastpath(previous_fastpath)
+
+
+def _export_fixed_graph(
+    core: torch.nn.Module,
+    dummy_ids: torch.Tensor,
+    dummy_mask: torch.Tensor,
+    onnx_path: Path,
+    opset: int,
+) -> None:
+    """Export with NO dynamic axes (batch+seq fixed to the dummy shape).
+
+    Used for the ModernBERT backbone, whose dynamic-seq graph trips a tract
+    Flatten shape-analysis failure. Uses the legacy (dynamo=False) exporter:
+    the dynamo path emits a Split with a num_outputs attr that onnxruntime
+    rejects, and a fixed graph doesn't need dynamo's dynamic-shape tracing.
+    """
+    names = {
+        "input_names": ["input_ids", "attention_mask"],
+        "output_names": ["logits"],
+        "opset_version": opset,
+        "do_constant_folding": True,
+    }
+    mha_backend = getattr(torch.backends, "mha", None)
+    set_fastpath = getattr(mha_backend, "set_fastpath_enabled", None)
+    previous_fastpath = getattr(mha_backend, "get_fastpath_enabled", lambda: None)()
+    try:
+        if set_fastpath is not None:
+            set_fastpath(False)
+        torch.onnx.export(core, (dummy_ids, dummy_mask), str(onnx_path), dynamo=False, **names)
+    finally:
+        if set_fastpath is not None and previous_fastpath is not None:
+            set_fastpath(previous_fastpath)
+
+
+def _check_parity_fixed(core: torch.nn.Module, sess, cfg: LaMRConfig, seq_len: int) -> dict[str, float]:
+    """Parity at the single fixed export length (the graph has no dynamic axis)."""
+    ids = torch.randint(0, cfg.vocab_size, (1, seq_len), dtype=torch.long)
+    mask = torch.ones((1, seq_len), dtype=torch.bool)
+    with torch.no_grad():
+        torch_logits = core(ids, mask)
+    (onnx_logits,) = sess.run(
+        ["logits"], {"input_ids": ids.numpy(), "attention_mask": mask.numpy()}
+    )
+    return {
+        "max_abs_diff_logits": float(np.max(np.abs(torch_logits.numpy() - onnx_logits))),
+        "checked_shapes": 1,
+        "fixed_seq_len": int(seq_len),
+    }
 
 
 def _check_parity(core: torch.nn.Module, sess, cfg: LaMRConfig, parity_seq_len: int) -> dict[str, float]:
@@ -238,6 +309,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--parity-seq-len", type=int, default=64)
     p.add_argument("--target-rate", type=float, default=DEFAULT_TARGET_RATE,
                    help="default decode target drop rate written to decode.json")
+    p.add_argument("--fixed-seq-len", type=int, default=None,
+                   help="export a FIXED-WINDOW graph (no dynamic seq axis) at this length; "
+                        "required for the modernbert backbone (dynamic seq -> tract Flatten failure)")
     return p
 
 
@@ -250,6 +324,7 @@ def main(argv: list[str] | None = None) -> int:
         opset=args.opset,
         parity_seq_len=args.parity_seq_len,
         target_rate=args.target_rate,
+        fixed_seq_len=args.fixed_seq_len,
     )
     print(f"exported to {args.out}; parity={parity}")
     return 0

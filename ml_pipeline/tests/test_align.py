@@ -31,6 +31,42 @@ def test_dropping_middle_word_marks_correct_tokens():
     assert "delta" not in kept_text
 
 
+def _kept_text(original: str, compressed: str) -> str:
+    import tiktoken
+
+    enc = tiktoken.get_encoding("cl100k_base")
+    res = derive_mask(original, compressed)
+    return enc.decode([t for t, k in zip(res.token_ids, res.keep_mask) if k])
+
+
+def test_needle_survives_when_subtoken_budget_consumed_elsewhere():
+    # "CRITICAL" tokenizes as [' CR', 'ITICAL']; the common ' CR' sub-token also
+    # appears in many other words. Token-id alignment would spend ' CR' elsewhere
+    # and drop the one forming the needle, breaking the string. Byte-level
+    # alignment keeps the whole surviving run.
+    original = (
+        "CREATE ok\nCRAWL ok\nCRC ok\n2023 CRITICAL disk failure\nCROP ok\nCRUST ok"
+    )
+    compressed = "CRITICAL disk failure"
+    assert "CRITICAL" in _kept_text(original, compressed)
+
+
+def test_repeated_token_needle_survives():
+    # The kept occurrence of a repeated word must survive even when earlier
+    # occurrences are dropped.
+    original = "\n".join(["request ok"] * 20 + ["request FAILED id=req99042"])
+    compressed = "request FAILED id=req99042"
+    assert "req99042" in _kept_text(original, compressed)
+
+
+def test_word_absent_from_compressed_is_dropped():
+    # A word that does not appear in the compressed text at all stays dropped
+    # (majority-coverage rejects coincidental single boundary bytes).
+    kept = _kept_text("send payload now please", "send now")
+    assert "payload" not in kept
+    assert "please" not in kept
+
+
 def test_spans_reconstruct_original():
     text = "Hello, world!\nThis is a test."
     ids, spans = encode_with_spans(text)

@@ -30,6 +30,8 @@ def build_model(cfg: dict) -> LaMRModel:
         ff_mult=int(mcfg["ff_mult"]),
         dropout=float(mcfg["dropout"]),
         backbone=str(mcfg.get("backbone", "transformer")),
+        # Only consumed by the modernbert backbone; harmless for others.
+        encoder_name=str(mcfg.get("encoder_name", "answerdotai/ModernBERT-base")),
     )
     return LaMRModel(lcfg)
 
