@@ -1,5 +1,10 @@
 # Project: Polymorph
 
+> **STATUS 2026-06-07:** vision below is current. Implementation reality + results live in
+> [`README.md`](README.md); the learned pruner is now a single-head sigmoid token classifier on
+> ModernBERT-150M (the "dual-CRF" in [`plan.md`](plan.md) was dropped) and is SOTA-for-class on
+> answer survival. Open work (latency, Rust runtime wiring) is in [`TODOS.md`](TODOS.md).
+
 ## One-Line Description
 
 **Self-hostable, open-source, low-latency compression engine for audit logs and production traces that improves LLM accuracy and reduces token costs by removing redundant operational noise from log streams—while keeping every structural field, error code, and state transition perfectly intact.**

@@ -1,3 +1,13 @@
+> **STATUS 2026-06-07 — partly superseded. Read [`README.md`](README.md) + [`TODOS.md`](TODOS.md) first.**
+> The **dual-CRF / query-adaptive head-gate** design below was **dropped**. The shipped LaMR
+> pruner is a **single per-token sigmoid "drop" head** on a pretrained **ModernBERT-150M**
+> encoder with **span-aware (word, `max`) decode** to a target rate. It is trained and
+> **SOTA-for-class on answer survival** (68% @3× vs keep-severity 14%, vs LLMLingua-2 ~20%).
+> The deterministic locking/dedup/CCR layer below is accurate and shipping. Latency
+> optimization and wiring the ONNX model into the Rust runtime are the open items.
+
+---
+
 Audit logs and production traces are not uniform. A single investigation pulls together **semi-structured data**: structured event fields wrapped around free-text messages, deeply nested JSON payloads, multi-frame stack traces, and long timelines of repetitive operational chatter.
 
 By integrating the latest research on **Lossless Context Management (LCM)** and **Latent Multi-Rubric (LaMR) Pruning**, the blueprint handles both strict structural boundaries (the parseable record) and fluid semi-structured flows (the prose around it).
