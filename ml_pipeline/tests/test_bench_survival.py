@@ -142,3 +142,53 @@ def test_format_report_is_nonempty_string():
     results, skipped = run_benchmark(triples, methods, RATES)
     report = format_report(results, skipped, triples, RATES)
     assert isinstance(report, str) and "survival" in report
+
+
+# ---- Phase 0c: semantic needles + McNemar ----
+
+from polymorph_lamr.bench.triples import _best_semantic_triple_for_chunk
+from polymorph_lamr.bench.survival import mcnemar, survival_vector
+
+
+def test_semantic_extractor_pulls_freetext_phrase():
+    text = (
+        'ERROR payment-api status=503 client_ip=10.0.0.9 '
+        'msg="Internal server error" root_cause="Memory exhaustion here" resolution="Restart"'
+    )
+    t = _best_semantic_triple_for_chunk("d#0", text, "s")
+    assert t is not None
+    assert t.fact_type.startswith("semantic:")
+    assert " " in t.answer  # multi-word phrase, not an atom
+
+
+def test_floor_locks_key_anchored_value_but_not_unanchored_prose():
+    # Key-anchored values ARE floor-lockable (the key locates them); bare prose
+    # with no salient key is the floor's genuine blind spot (needs a model).
+    from polymorph_lamr.bench.methods import RandomDropFloor
+    floored = RandomDropFloor(floor=True)
+    keyed = "\n".join(f"INFO tick {i}" for i in range(40))
+    keyed += '\nINFO note root_cause="cascading queue backpressure" done'
+    assert answer_survives("cascading queue backpressure", floored.compress(keyed, 0.8))
+    bare = "\n".join(f"INFO tick {i}" for i in range(40))
+    bare += "\nthe replication follower silently fell three minutes behind schedule"
+    assert not answer_survives("silently fell three minutes behind", floored.compress(bare, 0.8))
+
+
+def test_mcnemar_paired_significance():
+    # A strictly dominates B on 10 of 100 items, never worse -> significant.
+    a = [True] * 100
+    b = [True] * 90 + [False] * 10
+    r = mcnemar(a, b)
+    assert r["b10_a_better"] == 10
+    assert r["b01_a_worse"] == 0
+    assert r["p_value"] < 0.05
+    # Identical vectors -> no discordance -> p = 1.0
+    assert mcnemar(a, a)["p_value"] == 1.0
+
+
+def test_survival_vector_aligned_length():
+    from polymorph_lamr.bench.methods import KeepSeverityHeuristic
+    ts = curated_triples()
+    v = survival_vector(KeepSeverityHeuristic(), ts, 0.5)
+    assert len(v) == len(ts)
+    assert all(isinstance(x, bool) for x in v)

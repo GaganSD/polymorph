@@ -67,6 +67,45 @@ _EXTRACTORS: list[tuple[str, re.Pattern, int, str]] = [
 ]
 
 
+# Semantic extractors — free-text VALUES of salient keys (root cause, resolution,
+# message). Unlike the structural extractors above, the answer is a multi-word
+# phrase with no fixed pattern, so the deterministic structural floor cannot lock
+# it and keep-severity only saves it when its line happens to be severe. These are
+# the held-out "semantic needles" that measure whether a model models salience
+# rather than matching regexes (Phase 0c). The question is keyed off the field.
+_SEMANTIC_KEYS: dict[str, str] = {
+    "root_cause": "What was the root cause?",
+    "resolution": "What resolution or action was applied?",
+    "resolution_action": "What resolution or action was applied?",
+    "remediation": "What remediation was applied?",
+    "reason": "What reason was given?",
+    "failure_reason": "What was the failure reason?",
+    "msg": "What did the log message say?",
+    "message": "What did the log message say?",
+    "short_description": "What was the issue described as?",
+    "summary": "What was the summary?",
+}
+# key="multi word value" (quoted) or key=value,... (unquoted, up to a delimiter).
+_SEMANTIC_QUOTED = re.compile(
+    r"\b(" + "|".join(_SEMANTIC_KEYS) + r')\s*[=:]\s*"([^"\n]{3,})"', re.IGNORECASE
+)
+
+
+def _semantic_candidates(text: str) -> list[tuple[str, str, str]]:
+    """Free-text field values as (fact_type='semantic:<key>', question, answer).
+    Only multi-word phrases qualify, so survival requires keeping a contiguous
+    non-atomic span — a genuine salience test, not a token match."""
+    out: list[tuple[str, str, str]] = []
+    for m in _SEMANTIC_QUOTED.finditer(text):
+        key = m.group(1).lower()
+        value = m.group(2).strip()
+        if " " not in value:  # require a real phrase, not a single token
+            continue
+        question = _SEMANTIC_KEYS.get(key, "What was reported?")
+        out.append((f"semantic:{key}", question, value))
+    return out
+
+
 def _candidates(text: str) -> list[tuple[str, str, str]]:
     """Return (fact_type, question, answer) candidates, in priority order."""
     out: list[tuple[str, str, str]] = []
@@ -94,6 +133,22 @@ def _best_triple_for_chunk(doc_id: str, text: str, source: str) -> AnswerTriple 
             return AnswerTriple(doc_id, text, question, answer, fact_type, source)
     # Fall back to the first candidate even if it repeats (still a valid test).
     cands = _candidates(text)
+    if cands:
+        fact_type, question, answer = cands[0]
+        return AnswerTriple(doc_id, text, question, answer, fact_type, source)
+    return None
+
+
+def _best_semantic_triple_for_chunk(doc_id: str, text: str, source: str) -> AnswerTriple | None:
+    """Pick a unique multi-word semantic value as the needle (regex-floor-proof)."""
+    seen_types: set[str] = set()
+    cands = _semantic_candidates(text)
+    for fact_type, question, answer in cands:
+        if fact_type in seen_types:
+            continue
+        seen_types.add(fact_type)
+        if text.count(answer) == 1:
+            return AnswerTriple(doc_id, text, question, answer, fact_type, source)
     if cands:
         fact_type, question, answer = cands[0]
         return AnswerTriple(doc_id, text, question, answer, fact_type, source)

@@ -170,29 +170,97 @@ class KeepSeverityHeuristic:
 # Random-drop floor (deterministic)
 # ---------------------------------------------------------------------------
 
+def _decode_with_drop_order(
+    ids: list[int],
+    drop_order: list[int],
+    target_drop_rate: float,
+    force_keep: list[bool] | None = None,
+    tokenizer: str = "cl100k",
+) -> str:
+    """Drop the first round(R*n) tokens in ``drop_order`` (most-droppable first),
+    skipping any token marked in ``force_keep`` (the structural floor), then decode
+    the survivors. Force-kept tokens are never dropped — at high R this can leave
+    the achieved drop below target, which is the intended high-recall trade.
+    """
+    from ..label.align import decode_tokens
+
+    n = len(ids)
+    if n == 0:
+        return decode_tokens(ids, tokenizer)
+    k = min(n, max(0, round(max(0.0, min(1.0, target_drop_rate)) * n)))
+    fk = force_keep or [False] * n
+    dropped: set[int] = set()
+    for i in drop_order:
+        if len(dropped) >= k:
+            break
+        if fk[i]:
+            continue
+        dropped.add(i)
+    return decode_tokens([tid for i, tid in enumerate(ids) if i not in dropped], tokenizer)
+
+
 @dataclass
 class RandomDropFloor:
     """Deterministically drop ~R of the tokens (keyed by content + index). The
     floor a real ranker must beat: same compression ratio, blind to salience.
+
+    With ``floor=True`` the structural locker (``structural.py``) force-keeps
+    high-salience atoms. A *blind* ranker plus the floor beating keep-severity is
+    the non-circular demonstration that a token-level structural prior keeps
+    needles that a line-level severity prior drops.
     """
 
     name: str = "random"
     tunable: bool = True
+    floor: bool = False
+    span: str | None = None        # None = token-level; else 'word' / 'chunk:N'
+    aggregator: str = "max"        # empirical + Rust default (see spandecode.py)
+
+    def __post_init__(self) -> None:
+        suffix = ""
+        if self.span:
+            suffix += "+span"
+        if self.floor:
+            suffix += "+floor"
+        if suffix and self.name == "random":
+            self.name = "random" + suffix
 
     def available(self) -> tuple[bool, str]:
         return True, ""
 
     def compress(self, text: str, target_drop_rate: float) -> str:
-        ids = _enc().encode(text)
+        force_keep: list[bool] | None = None
+        spans: list[tuple[int, int]] | None = None
+        if self.floor:
+            from .structural import structural_keep_mask
+
+            ids, spans, force_keep = structural_keep_mask(text)
+        elif self.span:
+            from ..label.align import encode_with_spans
+
+            ids, spans = encode_with_spans(text)
+        else:
+            ids = _enc().encode(text)
         if not ids:
             return text
         seed = zlib.crc32(text.encode("utf-8", "ignore"))
-        thr = int(max(0.0, min(1.0, target_drop_rate)) * 0xFFFF_FFFF)
-        kept = [
-            tid for i, tid in enumerate(ids)
-            if (zlib.crc32(f"{seed}:{i}".encode()) & 0xFFFF_FFFF) >= thr
-        ]
-        return _enc().decode(kept)
+        # Deterministic pseudo-random per-token "drop-prob". The token-level path
+        # keeps the original ascending-crc rule (most-droppable = lowest crc), so
+        # mapping crc -> drop_prob must be DESCENDING in crc to match it.
+        crc = [zlib.crc32(f"{seed}:{i}".encode()) & 0xFFFF_FFFF for i in range(len(ids))]
+        if self.span:
+            from .spandecode import span_decode
+
+            # Higher drop_prob = more droppable. Lower crc was more droppable, so
+            # invert: drop_prob = 1 - crc/2^32.
+            drop_probs = [1.0 - (c / float(0x1_0000_0000)) for c in crc]
+            return span_decode(
+                ids, spans, text, drop_probs, target_drop_rate,
+                span=self.span, aggregator=self.aggregator, force_keep=force_keep,
+            )
+        # Most-droppable first: ascending crc (mirrors the old threshold rule).
+        order = sorted(range(len(ids)), key=lambda i: crc[i])
+        return _decode_with_drop_order(ids, order, target_drop_rate, force_keep)
 
 
 # ---------------------------------------------------------------------------
@@ -250,10 +318,33 @@ class LaMRMethod:
     ckpt: Path
     name: str = "lamr"
     tunable: bool = True
-    max_seq_len: int = 1024
+    max_seq_len: int = 512  # inference window = training window (configs/modernbert.yaml)
+    floor: bool = False  # apply the structural insurance floor at decode
+    span: str | None = None        # None = token-level; else 'word' / 'chunk:N'
+    aggregator: str = "max"        # empirical + Rust default (see spandecode.py)
+    # Token space for encode/floor/decode. "auto" reads it from the checkpoint's
+    # backbone (modernbert -> ModernBERT tokenizer, else cl100k); a ModernBERT
+    # checkpoint MUST be fed ModernBERT ids or it sees garbage.
+    tokenizer: str = "auto"
+    _tokenizer: str = "cl100k"
     _model: object | None = None
     _device: object | None = None
     _err: str = ""
+    # Per-text forward cache: id(text)->(ids, spans, force_keep, probs). The
+    # iso-ratio gate bisects the drop rate by calling compress(same_text, varying
+    # rate) ~14x; the windowed forward is identical across those calls (only the
+    # decode threshold changes), so caching it turns 14 forwards into 1. Keyed by
+    # the text string itself (small benchmark corpus; exact-match reuse).
+    _score_cache: dict | None = None
+
+    def __post_init__(self) -> None:
+        suffix = ""
+        if self.span:
+            suffix += "+span"
+        if self.floor:
+            suffix += "+floor"
+        if suffix and self.name == "lamr":
+            self.name = "lamr" + suffix
 
     def available(self) -> tuple[bool, str]:
         if self._model is not None:
@@ -266,40 +357,90 @@ class LaMRMethod:
             from ..export.to_onnx import _load_checkpoint
             from ..train.loop import _pick_device
 
-            model, _ = _load_checkpoint(Path(self.ckpt))
+            model, cfg = _load_checkpoint(Path(self.ckpt))
             device = _pick_device()
             model.to(device)
             model.eval()
             self._model = model
             self._device = device
             self._torch = torch
+            # Resolve the token space: "auto" follows the checkpoint's backbone.
+            if self.tokenizer == "auto":
+                self._tokenizer = "modernbert" if getattr(cfg, "backbone", "") == "modernbert" else "cl100k"
+            else:
+                self._tokenizer = self.tokenizer
             return True, ""
         except Exception as e:
             self._err = str(e)
             return False, f"load failed ({type(e).__name__}: {e})"
 
+    def _score(self, text: str):
+        """Encode ``text`` and run windowed inference to per-token drop-probs.
+
+        Returns (ids, spans, force_keep, probs). Cached by text so the iso-ratio
+        bisection (many compresses of the same text at different rates) pays the
+        forward once. Windowed because real log chunks exceed the training window:
+        truncating to one window would silently drop every token past it (and any
+        needle in the tail — the costliest error for high recall), so the whole doc
+        is scored in consecutive max_seq_len windows.
+        """
+        if self._score_cache is None:
+            self._score_cache = {}
+        cached = self._score_cache.get(text)
+        if cached is not None:
+            return cached
+        torch = self._torch
+        tok = self._tokenizer
+        force_keep = None
+        if self.floor:
+            from .structural import structural_keep_mask
+
+            ids, spans, force_keep = structural_keep_mask(text, tok)
+        else:
+            from ..label.align import encode_with_spans
+
+            ids, spans = encode_with_spans(text, tok)
+        if not ids:
+            result = (ids, spans, force_keep, None)
+            self._score_cache[text] = result
+            return result
+        import numpy as np
+
+        W = self.max_seq_len
+        chunks = []
+        with torch.no_grad():
+            for s in range(0, len(ids), W):
+                window = ids[s : s + W]
+                t_ids = torch.tensor([window], dtype=torch.long, device=self._device)
+                mask = torch.ones((1, len(window)), dtype=torch.bool, device=self._device)
+                chunks.append(torch.sigmoid(self._model(t_ids, mask).float())[0].cpu().numpy())
+        probs = np.concatenate(chunks) if len(chunks) > 1 else chunks[0]
+        result = (ids, spans, force_keep, probs)
+        self._score_cache[text] = result
+        return result
+
     def compress(self, text: str, target_drop_rate: float) -> str:
         ok, reason = self.available()
         if not ok:
             raise RuntimeError(f"LaMR unavailable: {reason}")
-        torch = self._torch
-        ids = _enc().encode(text)[: self.max_seq_len]
+        tok = self._tokenizer
+        ids, spans, force_keep, probs = self._score(text)
         if not ids:
-            return text
-        with torch.no_grad():
-            t_ids = torch.tensor([ids], dtype=torch.long, device=self._device)
-            mask = torch.ones((1, len(ids)), dtype=torch.bool, device=self._device)
-            probs = torch.sigmoid(self._model(t_ids, mask).float())[0].cpu().numpy()
-        # Calibrated target-rate decode: drop the top-k highest-prob tokens.
-        n = len(ids)
-        k = min(n, max(0, round(max(0.0, min(1.0, target_drop_rate)) * n)))
-        if k == 0:
             return text
         import numpy as np
 
-        drop_idx = set(np.argsort(-probs)[:k].tolist())
-        kept = [tid for i, tid in enumerate(ids) if i not in drop_idx]
-        return _enc().decode(kept)
+        if self.span:
+            from .spandecode import span_decode
+
+            return span_decode(
+                ids, spans, text, probs, target_drop_rate,
+                span=self.span, aggregator=self.aggregator, force_keep=force_keep,
+                tokenizer=tok,
+            )
+        # Calibrated target-rate decode: drop the top-k highest-prob tokens, but
+        # never a force-kept structural atom.
+        drop_order = np.argsort(-probs).tolist()
+        return _decode_with_drop_order(ids, drop_order, target_drop_rate, force_keep, tok)
 
 
 def default_methods(lamr_ckpt: Path | None = None, include_llmlingua: bool = True) -> list[CompressionMethod]:
@@ -309,9 +450,11 @@ def default_methods(lamr_ckpt: Path | None = None, include_llmlingua: bool = Tru
         DeterministicDedup(),
         KeepSeverityHeuristic(),
         RandomDropFloor(),
+        RandomDropFloor(floor=True),  # structural-floor demonstration
     ]
     if include_llmlingua:
         methods.append(LLMLingua2Method())
     if lamr_ckpt is not None:
         methods.append(LaMRMethod(ckpt=Path(lamr_ckpt)))
+        methods.append(LaMRMethod(ckpt=Path(lamr_ckpt), floor=True))
     return methods

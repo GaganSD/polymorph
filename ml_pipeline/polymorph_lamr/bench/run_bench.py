@@ -36,6 +36,10 @@ def _parse_rates(s: str) -> list[float]:
 
 
 def _gather_triples(args) -> list[AnswerTriple]:
+    if args.triples:
+        from .build_heldout import load_triples
+
+        return load_triples(Path(args.triples))
     if args.curated or not args.corpus:
         return curated_triples()
     files: list[Path] = []
@@ -56,6 +60,7 @@ def _gather_triples(args) -> list[AnswerTriple]:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Answer-survival vs compression-ratio benchmark.")
     p.add_argument("--corpus", nargs="+", default=None, help="dirs/files of log text to mine triples from")
+    p.add_argument("--triples", type=str, default=None, help="load a saved held-out triples JSON (lamr-build-heldout)")
     p.add_argument("--curated", action="store_true", help="use the built-in fixture triples (no corpus)")
     p.add_argument("--drop-rates", type=str, default="0.1,0.3,0.5,0.7", help="comma-separated target drop rates")
     p.add_argument("--max-docs", type=int, default=200, help="cap on total triples")
@@ -81,13 +86,27 @@ def main(argv: list[str] | None = None) -> int:
         model = args.llm_judge
         survival_fn = lambda t, comp: llm_judge_survives(t.question, comp, t.answer, model)  # noqa: E731
 
-    if survival_fn is None:
-        results, skipped = run_benchmark(triples, methods, rates)
-    else:
-        results, skipped = run_benchmark(triples, methods, rates, survival_fn)
+    sfn = survival_fn if survival_fn is not None else None
 
-    report = format_report(results, skipped, triples, rates)
-    print(report)
+    def _run(ts):
+        return run_benchmark(ts, methods, rates, sfn) if sfn else run_benchmark(ts, methods, rates)
+
+    # Split by needle class when a semantic class is present: the structural class
+    # saturates under the floor (by construction), so the SEMANTIC table is the one
+    # that discriminates models. Print both, semantic last (the headline).
+    structural = [t for t in triples if not t.fact_type.startswith("semantic:")]
+    semantic = [t for t in triples if t.fact_type.startswith("semantic:")]
+    if structural and semantic:
+        for label, subset in (("STRUCTURAL needles (atoms — floor-locked)", structural),
+                              ("KEY-VALUE needles (msg/root_cause/resolution — key-anchored, also floor-lockable)", semantic)):
+            res, skp = _run(subset)
+            print(f"\n### {label}  (n={len(subset)})")
+            print(format_report(res, skp, subset, rates))
+        results, skipped = _run(triples)
+    else:
+        results, skipped = _run(triples)
+        report = format_report(results, skipped, triples, rates)
+        print(report)
 
     if args.out:
         payload = {

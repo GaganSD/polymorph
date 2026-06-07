@@ -93,6 +93,43 @@ def evaluate_method(
     return rows
 
 
+def survival_vector(
+    method: CompressionMethod,
+    triples: list[AnswerTriple],
+    drop_rate: float,
+    survival_fn: SurvivalFn = _default_survival,
+) -> list[bool]:
+    """Per-triple survival booleans for one method at one drop rate (for paired
+    significance testing — McNemar needs the aligned per-item outcomes)."""
+    return [survival_fn(t, method.compress(t.text, drop_rate)) for t in triples]
+
+
+def mcnemar(a: list[bool], b: list[bool]) -> dict[str, float]:
+    """Paired McNemar test comparing method A vs B on the SAME triples.
+
+    Returns the discordant counts and a two-sided p-value. ``b01`` = A wrong / B
+    right, ``b10`` = A right / B wrong. We use the exact binomial test on the
+    discordant pairs (robust for the small counts a 400-triple survival delta
+    produces; the chi-square approximation is unreliable when b01+b10 < ~25).
+    A significant result with b10 > b01 means A preserves more needles than B.
+    """
+    from math import comb
+
+    if len(a) != len(b):
+        raise ValueError("survival vectors must be aligned (same triples/order)")
+    b01 = sum(1 for x, y in zip(a, b) if (not x) and y)
+    b10 = sum(1 for x, y in zip(a, b) if x and (not y))
+    n = b01 + b10
+    if n == 0:
+        p = 1.0
+    else:
+        k = min(b01, b10)
+        # Two-sided exact binomial p at theta=0.5.
+        tail = sum(comb(n, i) for i in range(0, k + 1)) / (2.0**n)
+        p = min(1.0, 2.0 * tail)
+    return {"b01_a_worse": float(b01), "b10_a_better": float(b10), "n_discordant": float(n), "p_value": p}
+
+
 def run_benchmark(
     triples: list[AnswerTriple],
     methods: list[CompressionMethod],
@@ -169,17 +206,31 @@ def format_report(
 def llm_judge_survives(
     question: str, compressed: str, gold_answer: str, model: str
 ) -> bool:  # pragma: no cover - network/env dependent
-    """Ask ``model`` (via litellm) the extraction question over the compressed
-    payload; pass if the gold answer appears in the model's response."""
+    """Judge whether the gold fact SURVIVED compression, robust to paraphrase.
+
+    Earlier design ("answer the open question, then substring-match the gold")
+    was broken for log facts: the question is generic ("what event was reported?")
+    so the model enumerates many events, the gold phrase is paraphrased
+    ("Registered signal handlers for [TERM,HUP,INT]" vs "Signal handlers
+    registered for TERM, HUP and INT"), and max_tokens truncates the reply — so a
+    fact that plainly survived scored 0. Instead we ask a direct YES/NO entailment
+    on the gold fact against the compressed excerpt: does the excerpt state or let
+    you directly answer this specific fact? This tests survival of the FACT (the
+    thing we care about), not surface-form reproduction, and needs only one token.
+    """
     import litellm
 
     prompt = (
-        "You are reading a compressed log excerpt. Answer the question using ONLY "
-        "the excerpt. If the answer is not present, reply exactly 'NOT FOUND'.\n\n"
-        f"--- COMPRESSED LOG ---\n{compressed}\n--- END ---\n\nQuestion: {question}\nAnswer:"
+        "You are checking whether a specific fact survived log compression. Below "
+        "is a compressed log excerpt, then a FACT. Answer YES if the fact is stated "
+        "in the excerpt or can be directly read from it (allowing paraphrase / "
+        "different wording / formatting). Answer NO if the information is absent. "
+        "Reply with ONLY 'YES' or 'NO'.\n\n"
+        f"--- COMPRESSED LOG ---\n{compressed}\n--- END ---\n\n"
+        f"FACT: {gold_answer}\n\nIs this fact present or directly answerable? Answer:"
     )
     resp = litellm.completion(
-        model=model, messages=[{"role": "user", "content": prompt}], temperature=0.0, max_tokens=64
+        model=model, messages=[{"role": "user", "content": prompt}], temperature=0.0, max_tokens=4
     )
-    answer = resp["choices"][0]["message"]["content"]
-    return _norm(gold_answer) in _norm(answer)
+    answer = _norm(resp["choices"][0]["message"]["content"])
+    return answer.startswith("yes")
