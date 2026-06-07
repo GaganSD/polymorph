@@ -131,7 +131,7 @@ pub fn lock_payload(
 ) -> anyhow::Result<LockResult> {
     let (token_ids, token_spans, ast_intervals, daac_token_intervals, mask) =
         lock_core(text, language, keywords, grammars_dir)?;
-    let drop_mask = lamr::apply_lamr(&token_ids, &mask);
+    let drop_mask = lamr::apply_lamr(&token_ids, &mask, &token_spans, text);
     let kept_tokens = drop_mask.iter().filter(|&&d| !d).count();
     Ok(LockResult {
         token_ids,
