@@ -285,6 +285,15 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--judge-model", type=str, default=DEFAULT_JUDGE_MODEL, help="litellm model string for the judge")
     p.add_argument("--semantic-only", action="store_true", help="restrict to semantic: needles (the discriminating class)")
     p.add_argument("--out", type=Path, default=DEFAULT_OUT, help="write results JSON here")
+    p.add_argument(
+        "--stats",
+        action="store_true",
+        help="after the run, compute per-domain/per-fact_type survival, McNemar "
+        "paired tests (lamr+span vs keep-severity / llmlingua2), and bootstrap "
+        "95%% CIs from the per-item results, and print the defensible-eval table.",
+    )
+    p.add_argument("--stats-metric", choices=["judge", "exact"], default="judge", help="metric for the --stats table")
+    p.add_argument("--stats-seed", type=int, default=1234, help="bootstrap seed (determinism)")
     args = p.parse_args(argv)
 
     judge_status = _bootstrap_judge_env()
@@ -357,6 +366,15 @@ def main(argv: list[str] | None = None) -> int:
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(payload, indent=2))
     print(f"\nwrote {args.out}")
+
+    if args.stats:
+        from .stats import analyze, format_stats
+
+        analysis = analyze(per_item_all, seed=args.stats_seed)
+        print("\n" + format_stats(analysis, metric=args.stats_metric))
+        stats_out = args.out.with_name(args.out.stem + "_stats.json")
+        stats_out.write_text(json.dumps(analysis, indent=2))
+        print(f"\nwrote {stats_out}")
     return 0
 
 

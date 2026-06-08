@@ -225,6 +225,45 @@ def _export_fixed_graph(
             set_fastpath(previous_fastpath)
 
 
+def _export_dynbatch_graph(
+    core: torch.nn.Module,
+    dummy_ids: torch.Tensor,
+    dummy_mask: torch.Tensor,
+    onnx_path: Path,
+    opset: int,
+) -> None:
+    """Export with a DYNAMIC BATCH axis but a FIXED seq axis.
+
+    Workstream C latency fallback: a long doc's 512-token windows could run in a
+    single batched forward instead of one call per window. Dynamic *seq* trips a
+    tract Flatten shape-analysis failure (see `_export_fixed_graph`); dynamic
+    *batch* is the safer variant — seq stays the concrete export length, only
+    axis 0 is symbolic. Uses the legacy (dynamo=False) exporter, like the fixed
+    graph, since the dynamo path emits a Split attr onnxruntime rejects.
+    """
+    names = {
+        "input_names": ["input_ids", "attention_mask"],
+        "output_names": ["logits"],
+        "dynamic_axes": {
+            "input_ids": {0: "batch"},
+            "attention_mask": {0: "batch"},
+            "logits": {0: "batch"},
+        },
+        "opset_version": opset,
+        "do_constant_folding": True,
+    }
+    mha_backend = getattr(torch.backends, "mha", None)
+    set_fastpath = getattr(mha_backend, "set_fastpath_enabled", None)
+    previous_fastpath = getattr(mha_backend, "get_fastpath_enabled", lambda: None)()
+    try:
+        if set_fastpath is not None:
+            set_fastpath(False)
+        torch.onnx.export(core, (dummy_ids, dummy_mask), str(onnx_path), dynamo=False, **names)
+    finally:
+        if set_fastpath is not None and previous_fastpath is not None:
+            set_fastpath(previous_fastpath)
+
+
 def _check_parity_fixed(core: torch.nn.Module, sess, cfg: LaMRConfig, seq_len: int) -> dict[str, float]:
     """Parity at the single fixed export length (the graph has no dynamic axis)."""
     ids = torch.randint(0, cfg.vocab_size, (1, seq_len), dtype=torch.long)
