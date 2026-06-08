@@ -1,82 +1,26 @@
 # Polymorph
 
-> Local-first **context middleware** for logs and traces. Drop a 10 MB log in front of a model; Polymorph returns a smaller payload that still contains the answer — every structural field, error code, and trace ID preserved byte-for-byte, the redundant operational prose pruned by a trained token-classifier. Served over MCP.
+Polymorph is a local-first compression engine for logs and traces, served over the Model Context Protocol (MCP). You give it a log; it returns a smaller log that still contains the answer. Every structural field, error code, IP, UUID, and trace ID is preserved byte-for-byte; the redundant operational prose is pruned by a trained token classifier.
 
-Polymorph sits between your log/trace store and the model provider as an MCP server. You feed it a log; it emits a compressed version that fits more signal into the context window. Two layers do the work:
+It exists for one job: feed large logs and traces to an LLM (incident triage, root-cause analysis, trace debugging) without burning the context window on repetitive chatter or losing the one line that matters.
 
-1. **Deterministic structure layer (shipping).** Token-locking (structural JSON fields, severities, error codes, IPs, UUIDs, trace/span IDs are force-kept), template/run-length dedup, and Compress-Cache-Retrieve for long JSON arrays. Lossless and reversible.
-2. **Learned pruner — LaMR (trained, benchmarked, not yet wired into the runtime).** A 150M ModernBERT token classifier that scores `P(drop)` per token over the *unlocked prose residual* and drops whole low-salience words to hit a target compression rate. This is the part that removes verbose-but-uninformative chatter without losing the one line that matters.
+## How it works
 
-**Status in one line: the learned pruner is SOTA-for-class on answer survival (below), but the local latency target is not yet met and the model is not yet loaded by the Rust MCP server. Remaining work is tracked in [`TODOS.md`](TODOS.md).**
+Two layers do the work. The first is deterministic and lossless. It tokenizes the log, then force-keeps every structural atom by intersecting three sources: a regex/Aho-Corasick scan for error codes, severities, IPs, UUIDs, and trace IDs; a Tree-sitter parse of any embedded JSON; and any extra keywords you pass. It then collapses repeated template lines (run-length dedup) and stashes the middle of long JSON arrays in a local SQLite cache. Nothing is deleted irreversibly: the original is cached and retrievable by id, so a heavily pruned payload can always be expanded back.
 
----
+The second layer is a learned pruner, LaMR. A 150M-parameter ModernBERT token classifier scores a drop probability for each token in the *unlocked* prose residual, and a span-aware decoder drops whole low-salience words to hit a target compression rate. It runs inside the Rust server with no Python and no native dependencies: a pure-Rust ModernBERT byte-level tokenizer (byte-exact with the Hugging Face tokenizer) feeds a windowed `tract` ONNX forward pass. The Rust runtime reproduces the PyTorch drop probabilities to `max_abs_diff = 3e-6`. Because the deterministic layer bounds the residual, the model never sees the whole stream — a 10 MB repetitive log is collapsed to a few kilobytes before the model runs.
 
-## For the ML engineer: the mental model
+## Getting started
 
-You have a 10 MB log and a budget-limited context window. Naively truncating loses the needle; naively compressing (entropy coders, generic summarizers) destroys structure or hallucinates. Polymorph is **extractive** — it only ever *deletes* tokens, never rewrites them — so a status code, IP, or exception type that survives is byte-identical to the original.
-
-```
-10 MB log ──> Polymorph MCP ──> compressed context ──> Claude Code
-                  │
-                  ├─ lock:   force-keep structural atoms (regex + AST + DAAC, O(N))
-                  ├─ dedup:  collapse repeated templated lines
-                  └─ LaMR:   ModernBERT scores P(drop)/token over the prose residual,
-                             span-aware decode drops whole words to a target rate
-```
-
-Precise terms used throughout:
-- **Drop rate `R`** — fraction of *tokens* removed. **Compression ratio** — `input_tokens / output_tokens` (measured in cl100k tokens as a method-independent yardstick).
-- **Answer survival** — given a (log, question, gold-answer) triple, does the gold fact survive compression? Measured two ways: **exact-match** (gold substring present, whitespace/case-normalized) and **LLM-judge** (a YES/NO entailment on the gold fact, robust to paraphrase).
-- **Span-aware decode** — keep/drop decisions are made at the granularity of whitespace **words**, never splitting a multi-token word, so a multi-word needle isn't fragmented. Per-word score aggregator is `max` (drop a word if any token is droppable) — empirically the best survival with a calibrated model.
-- **Windowed inference** — a long log is scored in consecutive 512-token windows (the training window), so a needle in the tail isn't silently truncated away.
-
----
-
-## Results
-
-Trained ModernBERT-150M pruner (`mb_v0`), evaluated on 50 LogHub-2.0 prose triples across domains (OpenStack/Spark/Hadoop/BGL/etc.), at **matched compression ratio** (iso-ratio), LLM-judged answer survival (Claude Sonnet 4.6 entailment):
-
-| method | 3× survival | 5× survival |
-|---|---|---|
-| keep-severity (line-level baseline) | 14% | 10% |
-| LLMLingua-2 (560M, published SOTA extractive) | ~20% @3.1× | — |
-| **Polymorph LaMR `lamr+span` (150M)** | **68%** | **48%** |
-
-- **~4.9× more answers preserved than keep-severity** at both ratios; **~3.4× over LLMLingua-2** at 3×.
-- Trained checkpoint quality: **PR-AUC 0.873, ROC-AUC 0.933, F1@0.30 0.765 (recall 0.797 > precision 0.736)** on the held-out val shard. ONNX export parity `max_abs_diff_logits = 3.9e-6`.
-- The **structural floor hurts on unstructured prose** (it locks non-needle atoms and spends budget) — `lamr+span` *without* floor wins (68 vs 62 @3×). The floor is a structured-log tool, not a prose tool.
-
-> Caveat: LLMLingua-2 at 560M ran ~8.4 s/doc on CPU; our 150M model is more accurate, but its own local latency is not yet acceptable (see [`TODOS.md`](TODOS.md)). "SOTA" here means **answer-survival at matched compression among locally-runnable extractive methods** — the accuracy bar is cleared; the latency bar is not.
-
-Reproduce:
-
-```bash
-cd ml_pipeline
-eval "$(grep -E '^[[:space:]]*export ANTHROPIC_API_KEY=' ~/.zshrc | head -1)"   # judge key
-.venv/bin/python -m polymorph_lamr.bench.judge_bench \
-  --triples ../data/bench/loghub_triples.json \
-  --methods keep-severity,lamr+span,lamr+span+floor \
-  --lamr-ckpt ../data/modal_out/mb_v0/ckpt-best.pt \
-  --iso-ratio 3,5 --sample 50 --judge-model anthropic/claude-sonnet-4-6
-```
-
----
-
-## Quick Start (deterministic engine, ~2 minutes)
-
-The MCP server today ships the **deterministic** layers. The LaMR neural pruner is a Python/ONNX artifact (above) and is **not yet loaded by the Rust runtime** — the server still uses a mock pruner.
+Requirements: a recent Rust toolchain. The deterministic layer needs nothing else; the learned pruner needs the trained model file (see below).
 
 ```bash
 git clone https://github.com/GaganSD/lulu-polymorph.git
 cd lulu-polymorph
 cargo build --release
-
-# Demos, no MCP client needed:
-./target/release/polymorph-mcp --demo lcm-loop   # auto-archive timeline
-./target/release/polymorph-mcp --demo ccr        # JSON-array compress + retrieve
 ```
 
-Register with an MCP client (`~/.config/claude-code/settings.json` or `.claude/settings.json`):
+Register the server with an MCP client (`~/.config/claude-code/settings.json` or a project `.claude/settings.json`). Set `POLYMORPH_LAMR_MODEL` to enable the learned pruner; omit it to run the deterministic layer alone.
 
 ```json
 {
@@ -85,48 +29,68 @@ Register with an MCP client (`~/.config/claude-code/settings.json` or `.claude/s
       "command": "/absolute/path/to/lulu-polymorph/target/release/polymorph-mcp",
       "env": {
         "POLYMORPH_DB_PATH": "~/.polymorph/cache.db",
-        "POLYMORPH_GRAMMARS_DIR": "/absolute/path/to/lulu-polymorph/grammars"
+        "POLYMORPH_GRAMMARS_DIR": "/absolute/path/to/lulu-polymorph/grammars",
+        "POLYMORPH_LAMR_MODEL": "/absolute/path/to/lulu-polymorph/data/modal_out/mb_v0/onnx/model.onnx"
       }
     }
   }
 }
 ```
 
-Tools: `lock_mask`, `compress_array`, `polymorph_retrieve_cache`, `lcm_append`, `lcm_describe`, `lcm_expand`.
+Compress a log with the `compress_log` tool. Pass a file `path` for large logs (read on the server, no paste limit) or inline `text`:
 
----
+```jsonc
+{ "path": "/var/log/app/incident.log" }
+// → { compressed, cache_id, input_tokens, output_tokens, ratio, dedup_elided_lines, used_model }
+```
 
-## ML pipeline layout (`ml_pipeline/`)
+A bundled Claude Code skill in `.claude/skills/polymorph/` invokes this automatically. Ask *"here are the production traces, debug this, use polymorph"* and it routes the log through `compress_log` before analysis. Copy that folder to `~/.claude/skills/polymorph/` to use it in any project.
 
-| Path | What |
+Build `--release` — debug builds run inference about 15× slower. In release, the 600 MB model loads in ~2.4 s and scores a multi-window document in ~2.8 s.
+
+## Results
+
+`mb_v0` (ModernBERT-150M) on the 187 LogHub-2.0 prose triples across 7 domains, at matched compression ratio, LLM-judged answer survival. 95% bootstrap confidence intervals; paired McNemar test against the keep-severity baseline.
+
+| method | survival @3× (95% CI) | survival @5× (95% CI) |
+|---|---|---|
+| keep-severity (line baseline) | 17% [12–23] | 14% [9–19] |
+| **Polymorph LaMR `lamr+span`** | **62% [55–69]** | **44% [36–51]** |
+| `lamr+span+floor` | 51% [44–58] | 37% [31–45] |
+
+`lamr+span` preserves about 3.6× as many answers as the baseline, and the gap is significant: McNemar wins 92–9 discordant pairs at 3× (p ≈ 0) and 66–10 at 5× (p ≈ 0). Judge-free exact-match survival is 56% / 37%, still ~3.5× the baseline. Per-domain at 3×: BGL 88%, Linux 68%, ZooKeeper 57%, Hadoop 52%, Spark 50%, OpenStack 25%. Checkpoint quality on the held-out shard: PR-AUC 0.873, ROC-AUC 0.933.
+
+The eval runs on Modal GPU (`ml_pipeline/cloud/eval_modal.py`); the stats (McNemar, bootstrap CIs, per-domain breakdown) are in `ml_pipeline/polymorph_lamr/bench/stats.py`.
+
+## MCP tools
+
+| tool | purpose |
 |---|---|
-| `polymorph_lamr/model/` | `LaMRConfig`/`LaMRModel`; backbones (`transformer`, `modernbert`) |
-| `polymorph_lamr/label/align.py` | byte-level keep/drop labeling; tokenizer-agnostic (`cl100k` / `modernbert`), `encode_with_spans` / `decode_tokens` |
-| `polymorph_lamr/bench/` | answer-survival benchmark: `methods.py` (compressors), `spandecode.py` (span-aware decode), `structural.py` (floor), `loghub.py` (prose triples), `judge_bench.py` (iso-ratio + LLM judge), `survival.py` |
-| `polymorph_lamr/train/` | training loop (AMP, grad-accum, PR-AUC-selected `ckpt-best`) |
-| `polymorph_lamr/export/to_onnx.py` | ONNX export (fixed-seq-len 512) + parity check |
-| `cloud/train_modal.py` | Modal GPU training entrypoint (run from **repo root**) |
-| `configs/modernbert.yaml` | the `mb_v0` recipe (lr 3e-5, warmup 300, batch 32×2, seq 512) |
-
-Training is reproducible and cheap (~18 min on an A100, ~$3). Checkpoints/ONNX live on the Modal volume `polymorph-lamr-v0:/out/mb_v0` and download to `data/modal_out/mb_v0/` (gitignored).
-
-See [`blog.md`](blog.md) for the full narrative, challenges, and mistakes; [`TODOS.md`](TODOS.md) for remaining work.
-
----
+| `compress_log` | log/trace text or file path → smaller log + `cache_id` |
+| `polymorph_retrieve_cache` | fetch the original (or an elided slice) by `cache_id` |
+| `lock_mask` | per-token lock/drop mask for a block of text |
+| `compress_array` | head/tail-keep a large JSON array, cache the middle |
+| `lcm_append` / `lcm_describe` / `lcm_expand` | append-only timeline with summary nodes |
 
 ## Configuration
 
-| Env var | Default | Meaning |
+| env var | default | meaning |
 |---|---|---|
-| `POLYMORPH_DB_PATH` | `~/.polymorph/cache.db` | SQLite database location |
-| `POLYMORPH_GRAMMARS_DIR` | walks up from binary, falls back to `./grammars` | Tree-sitter WASM grammars |
-| `ANTHROPIC_API_KEY` | — | required only to run the LLM-judge benchmark |
+| `POLYMORPH_LAMR_MODEL` | unset | path to the ONNX pruner; unset runs the deterministic layer only |
+| `POLYMORPH_DB_PATH` | `~/.polymorph/cache.db` | SQLite cache location |
+| `POLYMORPH_GRAMMARS_DIR` | walks up from the binary | Tree-sitter WASM grammars |
+
+The model file is gitignored. Pull it with `modal volume get polymorph-lamr-v0 /out/mb_v0/onnx data/modal_out/mb_v0/onnx`. An INT8 build (`ml_pipeline/scripts/quantize_int8.py`) produces a 154 MB artifact that loads in ~1 s with near-identical decisions (top-k drop Jaccard 0.994).
 
 ## Development
 
 ```bash
-cargo test                                  # Rust runtime
-cd ml_pipeline && .venv/bin/python -m pytest # 269+ Python tests
+cargo test                                    # Rust runtime
+cd ml_pipeline && .venv/bin/python -m pytest  # Python pipeline + bench
 ```
 
-License: Apache-2.0 (planned).
+The ML pipeline (training, ONNX export, eval) runs on Modal — see `ml_pipeline/cloud/`. There is no local training. [`TODOS.md`](TODOS.md) tracks open work; [`blog.md`](blog.md) has the build narrative.
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).
