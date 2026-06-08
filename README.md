@@ -60,7 +60,7 @@ Build `--release` — debug builds run inference about 15× slower. In release, 
 
 `lamr+span` preserves about 3.6× as many answers as the baseline, and the gap is significant: McNemar wins 92–9 discordant pairs at 3× (p ≈ 0) and 66–10 at 5× (p ≈ 0). Judge-free exact-match survival is 56% / 37%, still ~3.5× the baseline. Per-domain at 3×: BGL 88%, Linux 68%, ZooKeeper 57%, Hadoop 52%, Spark 50%, OpenStack 25%. Checkpoint quality on the held-out shard: PR-AUC 0.873, ROC-AUC 0.933.
 
-The eval runs on Modal GPU (`ml_pipeline/cloud/eval_modal.py`); the stats (McNemar, bootstrap CIs, per-domain breakdown) are in `ml_pipeline/polymorph_lamr/bench/stats.py`.
+The eval runs on Modal GPU (`ml_pipeline/cloud/eval_modal.py`); the defensible-eval stats (McNemar, bootstrap CIs, per-domain breakdown) are computed in Rust (`src/stats.rs`, exposed as `polymorph-mcp --bench-stats`).
 
 ## MCP tools
 
@@ -85,11 +85,11 @@ The model file is gitignored. Pull it with `modal volume get polymorph-lamr-v0 /
 ## Development
 
 ```bash
-cargo test                                    # Rust runtime
-cd ml_pipeline && .venv/bin/python -m pytest  # Python pipeline + bench
+cargo test                                    # Rust runtime + bench/eval/distill ports
+cd ml_pipeline && .venv/bin/python -m pytest  # Python training/export pipeline
 ```
 
-The ML pipeline (training, ONNX export, eval) runs on Modal — see `ml_pipeline/cloud/`. There is no local training. [`TODOS.md`](TODOS.md) tracks open work; [`blog.md`](blog.md) has the build narrative.
+The offline benchmark, eval, and distillation pure-logic (answer-survival triple mining, compression baselines, McNemar/bootstrap stats, label-ceiling gate, ranking metrics, training-template dedup) is implemented in Rust and driven by binary subcommands — `polymorph-mcp --bench-survival | --bench-stats | --build-triples | --build-loghub | --label-ceiling | --eval-metrics | --sampler-filter`. Model training, ONNX export, and the LLM-judge eval stay in Python and run on Modal — see `ml_pipeline/cloud/`. There is no local training. [`TODOS.md`](TODOS.md) tracks open work; [`blog.md`](blog.md) has the build narrative.
 
 ## License
 

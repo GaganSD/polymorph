@@ -368,14 +368,39 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\nwrote {args.out}")
 
     if args.stats:
-        from .stats import analyze, format_stats
-
-        analysis = analyze(per_item_all, seed=args.stats_seed)
-        print("\n" + format_stats(analysis, metric=args.stats_metric))
+        # Defensible-eval stats (per-domain survival, McNemar, bootstrap CIs) are
+        # computed by the Rust `polymorph-mcp --bench-stats` subcommand, which reads
+        # the per_item map from the results JSON we just wrote. Keeping the stats in
+        # Rust means one source of truth for the headline survival claim.
         stats_out = args.out.with_name(args.out.stem + "_stats.json")
-        stats_out.write_text(json.dumps(analysis, indent=2))
-        print(f"\nwrote {stats_out}")
+        _run_bench_stats(args.out, args.stats_metric, args.stats_seed, stats_out)
     return 0
+
+
+def _polymorph_bin() -> str:
+    """Locate the built `polymorph-mcp` binary (env override, then target/)."""
+    env = os.environ.get("POLYMORPH_BIN")
+    if env and Path(env).is_file():
+        return env
+    repo = Path(__file__).resolve().parents[3]  # bench/ -> polymorph_lamr -> ml_pipeline -> repo
+    for profile in ("release", "debug"):
+        cand = repo / "target" / profile / "polymorph-mcp"
+        if cand.is_file():
+            return str(cand)
+    raise SystemExit(
+        "polymorph-mcp binary not found; build it with `cargo build --release` "
+        "or set POLYMORPH_BIN to its path"
+    )
+
+
+def _run_bench_stats(results: Path, metric: str, seed: int, out: Path) -> None:
+    import subprocess
+
+    cmd = [
+        _polymorph_bin(), "--bench-stats", str(results),
+        "--metric", metric, "--seed", str(seed), "--out", str(out),
+    ]
+    subprocess.run(cmd, check=True)
 
 
 if __name__ == "__main__":

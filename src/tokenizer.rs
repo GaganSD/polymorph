@@ -15,6 +15,14 @@ pub fn count_tokens(text: &str) -> Result<usize> {
     Ok(bpe()?.encode_ordinary(text).len())
 }
 
+/// Detokenize cl100k `ids` back to text — the inverse of [`token_spans`]' id
+/// stream. Mirrors the Python `label.align.decode_tokens` (cl100k backend).
+pub fn decode_tokens(ids: &[u32]) -> Result<String> {
+    bpe()?
+        .decode(ids.to_vec())
+        .map_err(|e| anyhow!("cl100k decode failed: {e}"))
+}
+
 /// Tokenize `text` and return both the token ID stream and a parallel array of
 /// (start_byte, end_byte) spans into the original input.
 ///

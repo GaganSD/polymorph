@@ -32,6 +32,10 @@ regex = "1"
 rusqlite = { version = "0.31", features = ["bundled"] }
 rand = "0.8"
 rand_chacha = "0.3"
+# erfc for the McNemar chi-square survival function (stats.rs); pure Rust, no libc.
+libm = "0.2"
+# CSV adapters (distill corpus staging) ported from adapters/_common.py.
+csv = "1"
 uuid = { version = "1", features = ["v4"] }
 crossbeam-channel = "0.5"
 dirs = "5"

@@ -26,6 +26,11 @@ fn main() -> Result<()> {
         return polymorph::bench::run(dir, chunk_kb, max_mb);
     }
 
+    // Offline bench/eval/distill subcommands ported from the Python ml_pipeline.
+    if let Some(result) = polymorph::cli::try_run(&args) {
+        return result;
+    }
+
     let db_path = db::default_path()?;
     let db = db::open_pool(&db_path)?;
 
