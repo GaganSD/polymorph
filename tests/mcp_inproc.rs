@@ -168,6 +168,59 @@ async fn unknown_tool_rejected() {
 }
 
 #[tokio::test]
+async fn compress_log_dedups_and_caches_original() {
+    // No model configured → the LaMR stage is a no-op, but deterministic dedup
+    // still collapses repeated lines, and the ORIGINAL must be cached and
+    // retrievable byte-for-byte (the reversibility guarantee).
+    let (client, _server, _dir) = harness().await;
+    let mut original = String::new();
+    for _ in 0..20 {
+        original.push_str("INFO heartbeat ok region=us-east-1\n");
+    }
+    original.push_str("ERROR disk controller firmware deadlock code=E513\n");
+
+    let r = call(&client, "compress_log", json!({ "text": original })).await;
+    let sc = r.structured_content.expect("structuredContent");
+    assert!(
+        sc["dedup_elided_lines"].as_u64().unwrap() > 0,
+        "repeated lines must be elided"
+    );
+    assert_eq!(sc["used_model"], json!(false), "no model configured");
+    assert!(sc["compressed"].as_str().unwrap().contains("E513"), "unique error survives");
+    assert!(sc["input_tokens"].as_u64().unwrap() > sc["output_tokens"].as_u64().unwrap());
+
+    // Original is retrievable verbatim via the cache_id.
+    let cache_id = sc["cache_id"].as_str().expect("cache_id");
+    let back = call(&client, "polymorph_retrieve_cache", json!({"cache_id": cache_id})).await;
+    let bsc = back.structured_content.expect("retrieve structured");
+    assert_eq!(bsc["value"], json!(original), "cache returns the original verbatim");
+    let _ = client.cancel().await;
+}
+
+#[tokio::test]
+async fn compress_log_reads_from_path() {
+    let (client, _server, dir) = harness().await;
+    let logp = dir.path().join("app.log");
+    std::fs::write(
+        &logp,
+        "GET /health 200\nGET /health 200\nGET /health 200\nFATAL oom killed pid=42\n",
+    )
+    .unwrap();
+    let r = call(&client, "compress_log", json!({ "path": logp.to_str().unwrap() })).await;
+    let sc = r.structured_content.expect("structuredContent");
+    assert!(sc["compressed"].as_str().unwrap().contains("pid=42"));
+    let _ = client.cancel().await;
+}
+
+#[tokio::test]
+async fn compress_log_rejects_both_text_and_path() {
+    let (client, _server, _dir) = harness().await;
+    let err = call_err(&client, "compress_log", json!({"text": "x", "path": "/tmp/y"})).await;
+    error_data(&err, -32602, "validation_failed");
+    let _ = client.cancel().await;
+}
+
+#[tokio::test]
 async fn compress_array_short_passes_through() {
     let (client, _server, _dir) = harness().await;
     let r = call(&client, "compress_array", json!({"value": [1, 2, 3]})).await;

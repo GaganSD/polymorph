@@ -91,6 +91,7 @@ fn grammar_bytes(language: Language, grammars_dir: &Path) -> Result<&'static [u8
     let cache = match language {
         Language::Json => &JSON_BYTES,
         Language::Python => &PY_BYTES,
+        Language::PlainText => unreachable!("PlainText skips AST before grammar load"),
     };
 
     let bytes = cache.get_or_try_init(|| {
@@ -113,6 +114,7 @@ fn parser_cache(language: Language) -> &'static OnceCell<Mutex<CachedWasmParser>
     match language {
         Language::Json => &JSON_PARSER,
         Language::Python => &PY_PARSER,
+        Language::PlainText => unreachable!("PlainText skips AST before parser cache"),
     }
 }
 
@@ -148,6 +150,11 @@ pub fn extract_ast_intervals(
     language: Language,
     grammars_dir: &Path,
 ) -> Result<Vec<(usize, usize)>> {
+    // PlainText has no grammar — skip AST locking entirely (raw logs shouldn't be
+    // force-parsed as JSON/Python; see `Language::PlainText`).
+    if language == Language::PlainText {
+        return Ok(Vec::new());
+    }
     // Ensure WASM grammar is compiled before the timed window starts.
     cached_parser(language, grammars_dir)?;
 
@@ -209,6 +216,7 @@ fn collect_iterative(cursor: &mut TreeCursor, lang: Language, out: &mut Vec<(usi
                 Language::Python => {
                     matches!(kind, "none" | "true" | "false" | "integer" | "float")
                 }
+                Language::PlainText => unreachable!("PlainText produces no parse tree"),
             }
         };
         if is_structural {

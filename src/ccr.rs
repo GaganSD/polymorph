@@ -131,6 +131,25 @@ pub fn compress_array(
     })
 }
 
+/// Stash an opaque JSON payload in the cache and return its id. Reuses the
+/// `ccr_cache` table (and so the existing `polymorph_retrieve_cache` tool) so
+/// `compress_log` can make the *original* log text retrievable after pruning —
+/// the reversibility guarantee for an audit-log compressor.
+pub fn stash(value: &Value, db: &DbHandle) -> Result<String> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let payload = serde_json::to_vec(value)?;
+    let now = unix_now()?;
+    let id_for_db = id.clone();
+    db.call(move |conn| {
+        conn.execute(
+            "INSERT INTO ccr_cache (id, payload, omitted_count, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![id_for_db, payload, 0i64, now],
+        )?;
+        Ok(())
+    })?;
+    Ok(id)
+}
+
 /// Retrieves the omitted middle slice for a given cache id. Returns a typed
 /// `CacheMiss` error when the id isn't found so the MCP layer can map to a
 /// structured client-side error.

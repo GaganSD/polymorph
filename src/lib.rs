@@ -1,6 +1,7 @@
 pub mod ast;
 pub mod bench;
 pub mod ccr;
+pub mod compress;
 pub mod daac;
 pub mod db;
 pub mod dedup;
@@ -10,6 +11,7 @@ pub mod lamr;
 pub mod lcm;
 pub mod locking;
 pub mod mcp;
+pub mod modernbert;
 pub mod selftest;
 pub mod tokenizer;
 pub mod transport;
@@ -23,6 +25,13 @@ pub use tokenizer::token_spans;
 pub enum Language {
     Json,
     Python,
+    /// No grammar — AST structural locking is skipped entirely. The correct mode
+    /// for raw/free-text logs: forcing `Json`/`Python` on text that doesn't parse
+    /// makes tree-sitter emit huge ERROR-node intervals that spuriously lock ~half
+    /// the doc, crowding the pruner's drop budget and evicting free-text needles
+    /// (the README's "structural floor hurts on prose"). Structure is then locked
+    /// only by DAAC keyword matches; the model handles the prose.
+    PlainText,
 }
 
 impl Language {
@@ -30,14 +39,18 @@ impl Language {
         match s {
             "json" => Some(Language::Json),
             "python" => Some(Language::Python),
+            "text" | "plain" | "plaintext" | "log" => Some(Language::PlainText),
             _ => None,
         }
     }
 
+    /// Grammar WASM filename. Never called for [`Language::PlainText`] —
+    /// `extract_ast_intervals` short-circuits it before any grammar load.
     pub fn grammar_filename(self) -> &'static str {
         match self {
             Language::Json => "tree-sitter-json.wasm",
             Language::Python => "tree-sitter-python.wasm",
+            Language::PlainText => "",
         }
     }
 
@@ -45,6 +58,7 @@ impl Language {
         match self {
             Language::Json => "json",
             Language::Python => "python",
+            Language::PlainText => "text",
         }
     }
 }

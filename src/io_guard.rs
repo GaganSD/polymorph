@@ -65,6 +65,34 @@ pub struct RetrieveCacheInput {
     pub cache_id: String,
 }
 
+/// Max bytes read from a local log file by `compress_log`'s `path` arg. Larger
+/// than [`MAX_TEXT_LEN`] (the inline-`text` cap) so 10 MB logs can be fed by path.
+pub const MAX_LOG_FILE_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_PATH_LEN: usize = 4_096;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CompressLogInput {
+    /// Inline log text (≤ 1 MB). Provide this OR `path`, not both.
+    #[serde(default)]
+    pub text: Option<String>,
+    /// Local filesystem path to read the log from — use this for large logs
+    /// (≤ 64 MB) that exceed the inline text/payload caps. Provide this OR `text`.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Structural-lock grammar: "text" (default, no AST locking — correct for raw
+    /// logs), "json", or "python".
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Extra substrings to force-keep (API keys, resource ids, anything the model
+    /// must never drop), locked via the DAAC scanner.
+    #[schemars(length(max = MAX_KEYWORDS), inner(length(max = MAX_KEYWORD_ITEM_LEN)))]
+    #[serde(default)]
+    pub keywords: Vec<String>,
+    /// Fraction of unlocked tokens to drop, in (0,1). Omit for the model default.
+    #[serde(default)]
+    pub target_rate: Option<f64>,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct LcmAppendInput {
     #[schemars(length(max = MAX_ID_LEN))]
@@ -136,6 +164,34 @@ pub fn check_compress_array_input(input: &CompressArrayInput) -> Result<()> {
 
 pub fn check_retrieve_cache_input(input: &RetrieveCacheInput) -> Result<()> {
     check_string_len("cache_id", &input.cache_id, MAX_ID_LEN)
+}
+
+pub fn check_compress_log_input(input: &CompressLogInput) -> Result<()> {
+    match (&input.text, &input.path) {
+        (Some(_), Some(_)) => {
+            return Err(anyhow!("provide exactly one of `text` or `path`, not both"))
+        }
+        (None, None) => return Err(anyhow!("provide one of `text` or `path`")),
+        (Some(t), None) => check_string_len("text", t, MAX_TEXT_LEN)?,
+        (None, Some(p)) => check_string_len("path", p, MAX_PATH_LEN)?,
+    }
+    if input.keywords.len() > MAX_KEYWORDS {
+        return Err(anyhow!("keywords exceeds max count {MAX_KEYWORDS}"));
+    }
+    for (i, kw) in input.keywords.iter().enumerate() {
+        check_string_len(&format!("keywords[{i}]"), kw, MAX_KEYWORD_ITEM_LEN)?;
+    }
+    if let Some(r) = input.target_rate {
+        if !(r > 0.0 && r < 1.0) || !r.is_finite() {
+            return Err(anyhow!("target_rate must be a finite number in (0,1)"));
+        }
+    }
+    if let Some(l) = &input.language {
+        if crate::Language::from_str(l).is_none() {
+            return Err(anyhow!("unsupported language: {l} (use text|json|python)"));
+        }
+    }
+    Ok(())
 }
 
 pub fn check_lcm_append_input(input: &LcmAppendInput) -> Result<()> {

@@ -19,13 +19,20 @@ use serde_json::{json, Value};
 
 use crate::ccr::{self, CacheMiss, CcrOpts};
 use crate::db::DbHandle;
+use crate::dedup::{self, DedupOpts};
 use crate::io_guard::{
-    check_compress_array_input, check_lcm_append_input, check_lcm_node_input,
-    check_lock_mask_input, check_retrieve_cache_input, CompressArrayInput, LcmAppendInput,
-    LcmNodeInput, LockMaskInput, RetrieveCacheInput, MAX_MASK_TOKENS,
+    check_compress_array_input, check_compress_log_input, check_lcm_append_input,
+    check_lcm_node_input, check_lock_mask_input, check_retrieve_cache_input, CompressArrayInput,
+    CompressLogInput, LcmAppendInput, LcmNodeInput, LockMaskInput, RetrieveCacheInput,
+    MAX_LOG_FILE_BYTES, MAX_MASK_TOKENS,
 };
 use crate::lcm::{self, NotFound as LcmNotFound, DEFAULT_SOFT_THRESHOLD};
-use crate::{lock_payload, Language};
+use crate::{compress, lock_payload, tokenizer, Language};
+
+/// Upper bound on ModernBERT tokens the LaMR pruner scores per `compress_log`
+/// call (after dedup). Beyond it the tail is kept verbatim — a latency guard for
+/// pathological all-unique prose; a kept tail never loses a needle.
+const COMPRESS_LOG_NEURAL_CAP: usize = 65_536;
 
 /// Shared server state. Cheap to clone — `DbHandle` is an actor handle, the
 /// grammars path is `Arc`-wrapped for the same reason.
@@ -91,6 +98,64 @@ impl PolymorphServer {
             "mask": res.mask,
             "drop_mask": res.drop_mask,
         })))
+    }
+
+    #[tool(
+        description = "Compress a log/trace block into a smaller payload that still contains the answer. Deterministic template/run-length dedup + structural token-locking, then the trained LaMR pruner drops redundant prose to a target rate. Structural fields, error codes and trace ids are preserved; the full original is cached and retrievable via polymorph_retrieve_cache (cache_id). Accepts inline `text` or a local file `path` (use `path` for large logs). Reason over the returned `compressed` text."
+    )]
+    async fn compress_log(
+        &self,
+        Parameters(input): Parameters<CompressLogInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        check_compress_log_input(&input).map_err(validation_err)?;
+        let lang = input
+            .language
+            .as_deref()
+            .and_then(Language::from_str)
+            .unwrap_or(Language::PlainText);
+        let original = match (input.text.clone(), input.path.clone()) {
+            (Some(t), _) => t,
+            (None, Some(p)) => {
+                read_log_file(&p).map_err(|e| internal_err("read_failed", e.to_string()))?
+            }
+            _ => unreachable!("validated: exactly one of text/path"),
+        };
+        let keywords = input.keywords.clone();
+        let target_rate = input.target_rate;
+        let grammars = self.grammars_dir.clone();
+        let db = self.db.clone();
+
+        let out = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+            let input_tokens = tokenizer::count_tokens(&original)?;
+            // Deterministic template/run-length dedup first — bounds the neural
+            // workload so a repetitive 10 MB log doesn't fan out to thousands of
+            // windows.
+            let plan = dedup::dedup_plan(&original, DedupOpts::default());
+            let res = compress::compress_text(
+                &plan.reduced,
+                lang,
+                &keywords,
+                grammars.as_path(),
+                target_rate,
+                Some(COMPRESS_LOG_NEURAL_CAP),
+            )?;
+            // Cache the ORIGINAL for reversibility (retrievable via cache_id).
+            let cache_id = ccr::stash(&Value::String(original), &db)?;
+            let ratio = input_tokens as f64 / res.output_tokens.max(1) as f64;
+            Ok(json!({
+                "compressed": res.compressed,
+                "cache_id": cache_id,
+                "input_tokens": input_tokens,
+                "output_tokens": res.output_tokens,
+                "ratio": ratio,
+                "dedup_elided_lines": plan.elided_line_count(),
+                "used_model": res.used_model,
+            }))
+        })
+        .await
+        .map_err(|e| internal_err("task_join_failed", format!("join: {e}")))?
+        .map_err(|e| internal_err("compress_log_failed", format!("compress_log failed: {e}")))?;
+        Ok(CallToolResult::structured(out))
     }
 
     #[tool(
@@ -246,6 +311,42 @@ impl ServerHandler for PolymorphServer {
                 env!("CARGO_PKG_VERSION"),
             ))
     }
+}
+
+/// Expand a leading `~/` to the user's home dir; otherwise pass through.
+fn expand_tilde(p: &str) -> PathBuf {
+    if let Some(rest) = p.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(p)
+}
+
+/// Read a local log file for `compress_log`, bounded to [`MAX_LOG_FILE_BYTES`] and
+/// required to be valid UTF-8. The server is local/single-user, so reading a
+/// caller-named local path is in-scope (the same trust model as the SQLite cache).
+fn read_log_file(path: &str) -> anyhow::Result<String> {
+    use std::io::Read;
+    let pb = expand_tilde(path);
+    let meta = std::fs::metadata(&pb).map_err(|e| anyhow::anyhow!("stat {}: {e}", pb.display()))?;
+    if !meta.is_file() {
+        anyhow::bail!("{} is not a regular file", pb.display());
+    }
+    if meta.len() > MAX_LOG_FILE_BYTES {
+        anyhow::bail!(
+            "{} is {} bytes, exceeds the {} byte cap",
+            pb.display(),
+            meta.len(),
+            MAX_LOG_FILE_BYTES
+        );
+    }
+    let f = std::fs::File::open(&pb).map_err(|e| anyhow::anyhow!("open {}: {e}", pb.display()))?;
+    let mut buf = Vec::with_capacity(meta.len() as usize);
+    f.take(MAX_LOG_FILE_BYTES)
+        .read_to_end(&mut buf)
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", pb.display()))?;
+    String::from_utf8(buf).map_err(|e| anyhow::anyhow!("{} is not valid UTF-8: {e}", pb.display()))
 }
 
 fn validation_err(e: anyhow::Error) -> ErrorData {

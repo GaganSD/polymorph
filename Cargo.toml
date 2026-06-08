@@ -2,7 +2,7 @@
 name = "polymorph-mcp"
 version = "0.1.0"
 edition = "2021"
-license = "Apache-2.0"
+license = "MIT"
 description = "Polymorph: lossless context compressor MCP server (token-locking pipeline)"
 
 [lib]
@@ -19,6 +19,9 @@ serde_json = "1"
 schemars = "1"
 rmcp = { version = "=1.7.0", features = ["server", "client", "transport-io", "macros", "schemars"] }
 tiktoken-rs = "0.6"
+# Matches tiktoken-rs's own rustc-hash (1.1) so the FxHashMap rank map we hand to
+# `CoreBPE::new` (pure-Rust ModernBERT tokenizer) is the exact same type.
+rustc-hash = "1.1"
 daachorse = "1"
 anyhow = "1"
 thiserror = "1"
