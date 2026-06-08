@@ -13,11 +13,14 @@
 //!     global bias oscillated), so decode became a calibrated threshold and the
 //!     transitions side-car went away.
 //!
-//! Both backends run the model over the **full** token sequence (matching how
-//! the labeler tags every token at training time). The mock funnels through
-//! [`enforce_lock_invariant`]; the ONNX path uses [`target_rate_drop_bits`],
-//! which is itself lock-aware. Both honour the invariant:
-//! `lock_mask[i] == true  =>  drop_mask[i] == false`.
+//! Both backends produce one drop-decision per token (matching how the labeler
+//! tags every token at training time). The mock runs over the whole sequence in
+//! one pass; the ONNX path scores the sequence in consecutive fixed-size
+//! **windows** (== the training `max_seq_len`) and concatenates the per-token
+//! drop-probs, so a needle in the tail of a long log is never truncated away.
+//! The mock funnels through [`enforce_lock_invariant`]; the ONNX path decodes
+//! with the lock-aware span decode ([`span_drop_bits`]). Both honour the
+//! invariant: `lock_mask[i] == true  =>  drop_mask[i] == false`.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -28,6 +31,9 @@ use rand_chacha::ChaCha8Rng;
 use serde::Deserialize;
 
 use tract_onnx::prelude::*;
+// `TDim::to_usize` (read a concrete seq dim off the model's input fact) lives on
+// the `DimLike` trait, which the prelude does not re-export.
+use tract_onnx::tract_hir::internal::DimLike;
 
 /// Deterministic seed for the mock pruner. Used only when no ONNX model is
 /// available; the real model swaps in via [`apply_lamr_onnx`].
@@ -42,13 +48,14 @@ pub const DEFAULT_DROP_RATE: f64 = 0.30;
 /// [`apply_lamr`] uses the real ONNX path; otherwise it falls back to the mock.
 pub const LAMR_MODEL_ENV: &str = "POLYMORPH_LAMR_MODEL";
 
-/// Hard upper bound on tokens fed to the ONNX model in a single forward pass.
-/// Matches the sinusoidal pos-enc `max_len` in `model/backbone.py`; beyond it
-/// the pos-enc slice is out of range and O(T^2) attention blows up. This is an
-/// interim guard: it refuses oversize input (→ logged fallback to the mock)
-/// rather than crashing/OOMing. TODO: implement windowing to the trained
-/// `max_seq_len` (1024) and run the model per window, matching `dataset.py`.
-const MAX_INFERENCE_TOKENS: usize = 8192;
+/// Default inference window used when the exported graph does NOT fix the
+/// sequence axis. The model is run over consecutive windows of this many tokens
+/// and the per-token drop-probs are concatenated, mirroring the windowed scoring
+/// in `polymorph_lamr/bench/methods.py::LaMRMethod._score` (window == the
+/// training `max_seq_len`). A fixed-seq export (the ModernBERT `[1,512]` graph)
+/// overrides this with its own concrete sequence length, detected at load — see
+/// [`LamrOnnx::load_with_decode`].
+const LAMR_WINDOW: usize = 512;
 
 // ---------------------------------------------------------------------------
 // Mock backend (fallback)
@@ -450,6 +457,14 @@ pub struct LamrOnnx {
     model: std::sync::Arc<TypedRunnableModel>,
     target_rate: f64,
     span_cfg: SpanDecodeConfig,
+    /// Inference window: the step size for windowed scoring. Equals the export's
+    /// fixed sequence length when the graph fixes it (the ModernBERT `[1,512]`
+    /// case), else [`LAMR_WINDOW`].
+    window: usize,
+    /// Whether the exported graph fixed the sequence axis. When true, every
+    /// window is padded to `window` and the padding is masked out of attention;
+    /// when false (dynamic-seq export) each window runs at its true length.
+    fixed_seq: bool,
 }
 
 impl LamrOnnx {
@@ -465,17 +480,31 @@ impl LamrOnnx {
 
     pub fn load_with_decode(model_path: &Path, decode_path: &Path) -> anyhow::Result<Self> {
         let decode = DecodeConfig::from_json_path_or_default(decode_path);
-        let model = tract_onnx::onnx()
+        let typed = tract_onnx::onnx()
             .model_for_path(model_path)
             .map_err(|e| anyhow::anyhow!("loading {}: {e}", model_path.display()))?
             .into_optimized()
-            .map_err(|e| anyhow::anyhow!("optimizing {}: {e}", model_path.display()))?
+            .map_err(|e| anyhow::anyhow!("optimizing {}: {e}", model_path.display()))?;
+        // Detect whether the export fixed the sequence axis. The ModernBERT
+        // graph is `[1, 512]` (a concrete dim 1 ⇒ pad each window to it and mask
+        // the padding); the from-scratch dynamic export leaves the seq axis
+        // symbolic (`to_usize()` errors ⇒ run each window at its true length).
+        // input 0 is `input_ids` with shape `[batch, seq]`, so axis 1 is seq.
+        let seq_fixed: Option<usize> = typed
+            .input_fact(0)
+            .ok()
+            .and_then(|f| f.shape.dims().get(1).cloned())
+            .and_then(|d| d.to_usize().ok());
+        let window = seq_fixed.unwrap_or(LAMR_WINDOW);
+        let model = typed
             .into_runnable()
             .map_err(|e| anyhow::anyhow!("making {} runnable: {e}", model_path.display()))?;
         Ok(LamrOnnx {
             model,
             target_rate: decode.default_target_rate,
             span_cfg: SpanDecodeConfig::default(),
+            window,
+            fixed_seq: seq_fixed.is_some(),
         })
     }
 
@@ -498,26 +527,46 @@ impl LamrOnnx {
         self
     }
 
-    /// Run the model on a single sequence of token ids and produce a per-token
-    /// drop probability (`sigmoid(logit)`), one per input token, in order.
+    /// Score a token sequence of any length and return one drop probability
+    /// (`sigmoid(logit)`) per input token, in order. The sequence is scored in
+    /// consecutive [`Self::window`]-token windows and the per-window probs are
+    /// concatenated — mirroring `LaMRMethod._score` in `bench/methods.py`, so a
+    /// needle in the tail of a long log is never truncated away.
     pub fn forward_drop_probs(&self, token_ids: &[u32]) -> anyhow::Result<Vec<f32>> {
         if token_ids.is_empty() {
             return Ok(Vec::new());
         }
-        let t = token_ids.len();
-        anyhow::ensure!(
-            t <= MAX_INFERENCE_TOKENS,
-            "sequence length {t} exceeds MAX_INFERENCE_TOKENS {MAX_INFERENCE_TOKENS}; \
-             inference windowing is not yet implemented — refusing to run out-of-distribution \
-             (caller falls back to the mock)"
-        );
+        let mut probs = Vec::with_capacity(token_ids.len());
+        for chunk in token_ids.chunks(self.window) {
+            probs.extend(self.forward_window(chunk)?);
+        }
+        debug_assert_eq!(probs.len(), token_ids.len());
+        Ok(probs)
+    }
 
-        // input_ids: i64 [1, T]
-        let ids: Vec<i64> = token_ids.iter().map(|&id| id as i64).collect();
+    /// Run the model on ONE window of at most [`Self::window`] tokens, returning
+    /// a drop probability for each *real* token in `chunk` (length == `chunk.len()`).
+    ///
+    /// For a fixed-seq export the window is padded to `self.window` with id 0 and
+    /// the padding positions are masked out of attention (`attention_mask=false`),
+    /// so the real tokens' logits match an un-padded run. For a dynamic-seq export
+    /// the window runs at its true length with an all-true mask.
+    fn forward_window(&self, chunk: &[u32]) -> anyhow::Result<Vec<f32>> {
+        let l = chunk.len();
+        debug_assert!(l > 0 && l <= self.window, "window chunk len {l} out of bounds");
+        // Tensor sequence length: the fixed export demands exactly `self.window`;
+        // the dynamic export takes the chunk's true length.
+        let t = if self.fixed_seq { self.window } else { l };
+
+        // input_ids: i64 [1, t], real tokens then zero padding.
+        let mut ids: Vec<i64> = Vec::with_capacity(t);
+        ids.extend(chunk.iter().map(|&id| id as i64));
+        ids.resize(t, 0);
         let ids_tensor = tract_ndarray::Array2::from_shape_vec((1, t), ids)?.into_tensor();
-        // attention_mask: bool [1, T] — all valid (single un-padded sequence).
-        let mask_tensor =
-            tract_ndarray::Array2::from_shape_vec((1, t), vec![true; t])?.into_tensor();
+        // attention_mask: bool [1, t], true for real tokens, false for padding.
+        let mut mask: Vec<bool> = vec![true; l];
+        mask.resize(t, false);
+        let mask_tensor = tract_ndarray::Array2::from_shape_vec((1, t), mask)?.into_tensor();
 
         let outputs = self
             .model
@@ -529,26 +578,33 @@ impl LamrOnnx {
             outputs.len()
         );
 
-        // Single output: logits [1, T] — per-token drop logit. `to_plain_array_view`
-        // returns an `ArrayViewD<f32>` over the contiguous tensor buffer.
+        // logits [1, t] — per-token drop logit. `to_plain_array_view` returns an
+        // `ArrayViewD<f32>` over the contiguous tensor buffer. Only the first `l`
+        // positions are real; the rest are masked padding.
         let logits = outputs[0].to_plain_array_view::<f32>()?;
         anyhow::ensure!(
             logits.shape() == [1, t].as_slice(),
             "logits shape mismatch: {:?} expected [1,{t}]",
             logits.shape()
         );
-        Ok((0..t).map(|pos| sigmoid(logits[[0, pos]])).collect())
+        Ok((0..l).map(|pos| sigmoid(logits[[0, pos]])).collect())
     }
 }
 
-/// Resolve the configured ONNX model path from `POLYMORPH_LAMR_MODEL`.
+/// Resolve the LaMR ONNX model path from `POLYMORPH_LAMR_MODEL` (explicit opt-in).
 ///
-/// The real model must be opted into explicitly — we deliberately do NOT default
-/// to the gitignored smoke artifact: that risks silently running a tiny untrained
-/// model in a deployed tree, and the `CARGO_MANIFEST_DIR`-relative path may not
-/// exist at the install location. Returns `None` when unset/missing → mock.
+/// Resolution is env-only by design: auto-discovering a model in the tree would
+/// make every test silently load the 600 MB `mb_v0` (and a *smoke* artifact would
+/// silently run a tiny untrained model in a deployed tree — worse than no model).
+/// The MCP server is pointed at the real model via its `env` block in the client
+/// config (see the README `mcpServers` example), so the model is live once
+/// registered without any auto-discovery. Returns `None` when unset/missing →
+/// deterministic-only (`compress_text`) or mock (`apply_lamr`).
 fn resolve_model_path() -> Option<PathBuf> {
     let p = std::env::var(LAMR_MODEL_ENV).ok()?;
+    if p.is_empty() {
+        return None;
+    }
     let pb = PathBuf::from(p);
     pb.exists().then_some(pb)
 }
@@ -647,6 +703,20 @@ pub fn apply_lamr_with_model(
     text: &str,
     model: &LamrOnnx,
 ) -> anyhow::Result<Vec<bool>> {
+    apply_lamr_with_model_rate(token_ids, lock_mask, token_spans, text, model, None)
+}
+
+/// As [`apply_lamr_with_model`], but with an optional runtime `target_rate`
+/// override (the compression ratio is a runtime knob; `None` uses the model's
+/// `decode.json` default).
+pub fn apply_lamr_with_model_rate(
+    token_ids: &[u32],
+    lock_mask: &[bool],
+    token_spans: &[(usize, usize)],
+    text: &str,
+    model: &LamrOnnx,
+    target_rate: Option<f64>,
+) -> anyhow::Result<Vec<bool>> {
     debug_assert_eq!(token_ids.len(), lock_mask.len());
     let probs = model.forward_drop_probs(token_ids)?;
     Ok(span_drop_bits(
@@ -654,9 +724,34 @@ pub fn apply_lamr_with_model(
         lock_mask,
         token_spans,
         text,
-        model.target_rate,
+        target_rate.unwrap_or(model.target_rate),
         model.span_cfg,
     ))
+}
+
+/// Run the configured ONNX model over an **already-tokenised** sequence and
+/// return the span-decoded drop mask, or `None` when no model is configured.
+///
+/// Unlike [`apply_lamr`] there is **no mock fallback**: the caller supplies token
+/// ids/spans in the model's own token space (e.g. ModernBERT — see
+/// [`crate::compress`]), and a random mock over those ids would corrupt the
+/// output, so "no model" returns `None` and the caller keeps the text intact.
+/// A configured model that errors at runtime is logged and also yields `None`.
+pub fn apply_lamr_if_model(
+    token_ids: &[u32],
+    lock_mask: &[bool],
+    token_spans: &[(usize, usize)],
+    text: &str,
+    target_rate: Option<f64>,
+) -> Option<Vec<bool>> {
+    let model = cached_model()?;
+    match apply_lamr_with_model_rate(token_ids, lock_mask, token_spans, text, model, target_rate) {
+        Ok(mask) => Some(mask),
+        Err(e) => {
+            eprintln!("[lamr] ONNX inference failed: {e}; leaving text uncompressed");
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1156,19 +1251,22 @@ mod tests {
     }
 
     #[test]
-    fn onnx_forward_drop_probs_rejects_oversize_sequence() {
-        // The interim length guard must refuse > MAX_INFERENCE_TOKENS rather than
-        // crash/OOM on huge input (windowing is the real fix, TODO).
+    fn onnx_forward_drop_probs_windows_long_sequence() {
+        // Windowing is the real fix for long input: a sequence many windows long
+        // must be scored end-to-end (one prob per token), not rejected/truncated.
         let path = smoke_model_path();
         if !path.exists() {
-            eprintln!("skipping onnx oversize test: {} not found", path.display());
+            eprintln!("skipping onnx windowing test: {} not found", path.display());
             return;
         }
         let model = LamrOnnx::load(&path).expect("load smoke model");
-        let huge: Vec<u32> = vec![1u32; MAX_INFERENCE_TOKENS + 1];
+        // > 4 windows at the default 512; exercises the partial-last-window path.
+        let long: Vec<u32> = (0..(model.window * 4 + 7)).map(|i| (i % 1000) as u32).collect();
+        let probs = model.forward_drop_probs(&long).expect("windowed forward");
+        assert_eq!(probs.len(), long.len(), "windowed scoring must cover every token");
         assert!(
-            model.forward_drop_probs(&huge).is_err(),
-            "oversize sequence must be rejected by the length guard"
+            probs.iter().all(|&p| (0.0..=1.0).contains(&p)),
+            "all windowed drop-probs must be in [0,1]"
         );
     }
 }
