@@ -364,7 +364,7 @@ async fn token_mask_collision_locks_daac_ast_and_lamr_overlap() {
         .find(|text| {
             let (ids, spans) = polymorph::tokenizer::token_spans(text).unwrap();
             ids.len() == 1
-                && spans.as_slice() == &[(0, text.len())]
+                && spans.as_slice() == [(0, text.len())]
                 && polymorph::lamr::dummy_lamr_forward_pass(&ids)[0]
         })
         .expect("single-token JSON number that mock LaMR would drop");

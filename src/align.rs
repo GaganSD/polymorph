@@ -12,6 +12,8 @@ use std::collections::HashMap;
 
 use crate::tokenizer::token_spans;
 
+type DerivedMask = (Vec<u32>, Vec<(usize, usize)>, Vec<bool>);
+
 // Minimum matched byte-run length honored when projecting onto tokens (suppress
 // coincidental short runs; every real needle is a contiguous run of >= 3 bytes).
 const MIN_MATCH_RUN: usize = 3;
@@ -42,9 +44,9 @@ fn find_longest_match(
     let mut bestj = blo;
     let mut bestsize = 0usize;
     let mut j2len: HashMap<usize, usize> = HashMap::new();
-    for i in alo..ahi {
+    for (i, &byte) in a.iter().enumerate().take(ahi).skip(alo) {
         let mut newj2len: HashMap<usize, usize> = HashMap::new();
-        if let Some(js) = b2j.get(&a[i]) {
+        if let Some(js) = b2j.get(&byte) {
             for &j in js {
                 if j < blo {
                     continue;
@@ -130,10 +132,7 @@ pub fn get_matching_blocks(a: &[u8], b: &[u8]) -> Vec<(usize, usize, usize)> {
 /// Align `original` to `compressed` at the byte level, then project the matched
 /// byte runs onto cl100k tokens. Returns `(token_ids, spans, keep_mask)` where
 /// `keep_mask[i]` is true iff token i is preserved by the teacher's compression.
-pub fn derive_mask(
-    original: &str,
-    compressed: &str,
-) -> Result<(Vec<u32>, Vec<(usize, usize)>, Vec<bool>)> {
+pub fn derive_mask(original: &str, compressed: &str) -> Result<DerivedMask> {
     let (ids, spans) = token_spans(original)?;
     let o = original.as_bytes();
     let c = compressed.as_bytes();

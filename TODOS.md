@@ -21,8 +21,6 @@ ModernBERT ONNX model is live when `POLYMORPH_LAMR_MODEL` points at the artifact
 ## Optional Follow-Ups
 
 - Add prebuilt release binaries once the source-install path has proven stable.
-- Clean existing clippy warnings, then tighten CI from `cargo clippy --all-targets`
-  to `cargo clippy --all-targets -- -D warnings`.
 - Add an INT8 model selection guide only if size-constrained installs become common;
   fp32 remains the default because INT8 is smaller but slower in current tract tests.
 - Re-run the same LogHub eval with `llmlingua2` on Modal for a same-set baseline.

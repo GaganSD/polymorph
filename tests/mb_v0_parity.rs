@@ -157,7 +157,7 @@ fn e2e_ten_mb_log_compress_preserves_needles() {
     while log.len() < 10 * 1024 * 1024 {
         log.push_str("2026-06-08T03:22:01Z [INFO] svc=api req=heartbeat path=/healthz status=200 dur=3ms region=us-east-1 pool=warm cache=hit\n");
         n += 1;
-        if n % 5000 == 0 {
+        if n.is_multiple_of(5000) {
             // sprinkle the needles through the stream
             let (line, _) = needles[(n / 5000) % needles.len()];
             log.push_str(line);

@@ -17,7 +17,7 @@ use std::path::Path;
 pub fn sanitize_field(value: Option<&str>) -> String {
     match value {
         None => String::new(),
-        Some(v) => v.replace('\n', " ").replace('\r', " "),
+        Some(v) => v.replace(['\n', '\r'], " "),
     }
 }
 

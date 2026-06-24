@@ -784,7 +784,7 @@ mod tests {
 
     #[test]
     fn bootstrap_degenerate_all_true_is_tight() {
-        let ci = bootstrap_ci(&vec![true; 40], 300, 0.95, 3);
+        let ci = bootstrap_ci(&[true; 40], 300, 0.95, 3);
         assert_eq!(ci.point, 1.0);
         assert_eq!(ci.lo, 1.0);
         assert_eq!(ci.hi, 1.0);
@@ -814,7 +814,7 @@ mod tests {
     fn survival_rate_and_bits() {
         let items = mk_items(&["x", "y"], &[true, false]);
         // exact mirrors judge in mk_items; build a custom case for exact != judge.
-        let items = vec![
+        let items = [
             Item {
                 doc_id: None,
                 fact_type: "x".into(),

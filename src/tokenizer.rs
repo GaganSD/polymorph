@@ -4,6 +4,9 @@ use tiktoken_rs::CoreBPE;
 
 static BPE: OnceCell<CoreBPE> = OnceCell::new();
 
+pub type ByteSpan = (usize, usize);
+pub type TokenSpans = (Vec<u32>, Vec<ByteSpan>);
+
 fn bpe() -> Result<&'static CoreBPE> {
     BPE.get_or_try_init(tiktoken_rs::cl100k_base)
         .map_err(|e| anyhow!("failed to load cl100k_base: {e}"))
@@ -29,7 +32,7 @@ pub fn decode_tokens(ids: &[u32]) -> Result<String> {
 /// cl100k uses byte-level BPE, so concatenating decoded token bytes reproduces
 /// the input byte-for-byte — that is what lets us assign each token a precise
 /// byte range without a separate offset API.
-pub fn token_spans(text: &str) -> Result<(Vec<u32>, Vec<(usize, usize)>)> {
+pub fn token_spans(text: &str) -> Result<TokenSpans> {
     let bpe = bpe()?;
     let ids: Vec<u32> = bpe.encode_ordinary(text);
     let mut spans: Vec<(usize, usize)> = Vec::with_capacity(ids.len());

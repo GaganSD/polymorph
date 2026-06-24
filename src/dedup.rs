@@ -208,8 +208,8 @@ pub fn dedup_plan(text: &str, opts: DedupOpts) -> DedupPlan {
 
         if run_len >= min_run {
             // head verbatim
-            for k in i..i + head {
-                units.push(Unit::Verbatim(lines[k].to_string()));
+            for line in lines.iter().skip(i).take(head) {
+                units.push(Unit::Verbatim((*line).to_string()));
             }
             // middle elided
             let mid_start = i + head;
@@ -223,12 +223,12 @@ pub fn dedup_plan(text: &str, opts: DedupOpts) -> DedupPlan {
             });
             units.push(Unit::Collapsed(group_idx));
             // tail verbatim
-            for k in (j - tail)..j {
-                units.push(Unit::Verbatim(lines[k].to_string()));
+            for line in lines.iter().take(j).skip(j - tail) {
+                units.push(Unit::Verbatim((*line).to_string()));
             }
         } else {
-            for k in i..j {
-                units.push(Unit::Verbatim(lines[k].to_string()));
+            for line in lines.iter().take(j).skip(i) {
+                units.push(Unit::Verbatim((*line).to_string()));
             }
         }
         i = j;
@@ -390,8 +390,7 @@ mod tests {
         // A retry storm: the same 5xx line 1000x. Must collapse, but the error
         // must remain visible (first + last kept).
         let err = "ERROR 503 upstream payment timeout";
-        let text = std::iter::repeat(err)
-            .take(1000)
+        let text = std::iter::repeat_n(err, 1000)
             .collect::<Vec<_>>()
             .join("\n");
         let plan = dedup_plan(&text, DedupOpts::default());
@@ -434,8 +433,7 @@ mod tests {
     #[test]
     fn persist_groups_round_trips_through_cache() {
         let pool = db::test_pool().unwrap();
-        let text = std::iter::repeat("heartbeat ok 1")
-            .take(40)
+        let text = std::iter::repeat_n("heartbeat ok 1", 40)
             .collect::<Vec<_>>()
             .join("\n");
         let plan = dedup_plan(&text, DedupOpts::default());

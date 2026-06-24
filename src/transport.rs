@@ -71,7 +71,7 @@ mod tests {
     #[tokio::test]
     async fn passes_small_messages_through() {
         let data: &[u8] = b"hello\nworld\n";
-        let mut r = BoundedAsyncRead::new(&data[..]);
+        let mut r = BoundedAsyncRead::new(data);
         let mut out = Vec::new();
         r.read_to_end(&mut out).await.unwrap();
         assert_eq!(out, data);

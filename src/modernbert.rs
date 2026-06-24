@@ -249,7 +249,7 @@ static TOKENIZER: OnceLock<Result<ModernBertTokenizer>> = OnceLock::new();
 /// Process-wide cached tokenizer. The parse + rank-map build is non-trivial
 /// (~50k vocab entries) so it happens once. Returns a reference or the build error.
 pub fn get() -> Result<&'static ModernBertTokenizer> {
-    match TOKENIZER.get_or_init(|| ModernBertTokenizer::build()) {
+    match TOKENIZER.get_or_init(ModernBertTokenizer::build) {
         Ok(t) => Ok(t),
         Err(e) => Err(anyhow!("ModernBERT tokenizer unavailable: {e}")),
     }

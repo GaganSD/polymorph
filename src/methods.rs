@@ -5,8 +5,8 @@
 //! text (see `survival.rs`). Always-available, GPU-free, deterministic:
 //!   * [`DeterministicDedup`]    — line-normalize + run-length collapse.
 //!   * [`KeepSeverityHeuristic`] — keep the most-severe lines until the budget.
-//!   * [`RandomDropFloor`]       — deterministic pseudo-random token drop (the
-//!                                 floor any real ranker must beat).
+//!   * [`RandomDropFloor`]       — deterministic pseudo-random token drop
+//!     (the floor any real ranker must beat).
 //!
 //! The optional torch-backed `LaMRMethod` and network `LLMLingua2Method` from the
 //! Python original are intentionally out of scope for the Rust runtime. Ported
@@ -19,6 +19,8 @@ use regex::Regex;
 use crate::spandecode::{span_decode, Aggregator};
 use crate::structural::structural_keep_mask;
 use crate::tokenizer::{count_tokens, decode_tokens, token_spans};
+
+type TokenizedWithFloor = (Vec<u32>, Vec<(usize, usize)>, Option<Vec<bool>>);
 
 /// Count cl100k tokens in `text`.
 pub fn token_count(text: &str) -> usize {
@@ -210,7 +212,7 @@ impl CompressionMethod for KeepSeverityHeuristic {
             return Ok(text.to_string());
         }
         let total = token_count(text);
-        let budget = round_half_even((1.0 - target_drop_rate) * total as f64).max(1) as i64;
+        let budget = round_half_even((1.0 - target_drop_rate) * total as f64).max(1);
         // Stable priority: (severity_rank, original_index).
         let mut order: Vec<usize> = (0..lines.len()).collect();
         order.sort_by_key(|&idx| (severity_rank(lines[idx]), idx));
@@ -323,17 +325,16 @@ impl CompressionMethod for RandomDropFloor {
         true
     }
     fn compress(&self, text: &str, target_drop_rate: f64) -> Result<String> {
-        let (ids, spans, force_keep): (Vec<u32>, Vec<(usize, usize)>, Option<Vec<bool>>) =
-            if self.floor {
-                let (ids, spans, fk) = structural_keep_mask(text)?;
-                (ids, spans, Some(fk))
-            } else if self.span.is_some() {
-                let (ids, spans) = token_spans(text)?;
-                (ids, spans, None)
-            } else {
-                let (ids, _spans) = token_spans(text)?;
-                (ids, Vec::new(), None)
-            };
+        let (ids, spans, force_keep): TokenizedWithFloor = if self.floor {
+            let (ids, spans, fk) = structural_keep_mask(text)?;
+            (ids, spans, Some(fk))
+        } else if self.span.is_some() {
+            let (ids, spans) = token_spans(text)?;
+            (ids, spans, None)
+        } else {
+            let (ids, _spans) = token_spans(text)?;
+            (ids, Vec::new(), None)
+        };
         if ids.is_empty() {
             return Ok(text.to_string());
         }

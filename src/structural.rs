@@ -13,6 +13,8 @@ use regex::{Regex, RegexBuilder};
 
 use crate::tokenizer::token_spans;
 
+type StructuralKeepMask = (Vec<u32>, Vec<(usize, usize)>, Vec<bool>);
+
 static LOCK_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     let ci = |p: &str| RegexBuilder::new(p).case_insensitive(true).build().unwrap();
     vec![
@@ -65,7 +67,7 @@ pub fn structural_spans(text: &str) -> Vec<(usize, usize)> {
 /// Returns (token_ids, byte_spans, force_keep) for `text`. `force_keep[i]` is
 /// true iff token i overlaps any structural match — the tokens the decode floor
 /// must never drop.
-pub fn structural_keep_mask(text: &str) -> Result<(Vec<u32>, Vec<(usize, usize)>, Vec<bool>)> {
+pub fn structural_keep_mask(text: &str) -> Result<StructuralKeepMask> {
     let (ids, spans) = token_spans(text)?;
     let ranges = structural_spans(text);
     let mut force = vec![false; ids.len()];
