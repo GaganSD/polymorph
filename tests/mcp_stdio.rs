@@ -52,7 +52,7 @@ async fn stdio_initialize_handshake() {
 }
 
 #[tokio::test]
-async fn stdio_tools_list_advertises_all_six_tools() {
+async fn stdio_tools_list_advertises_all_seven_tools() {
     let (mut child, client) = spawn_server().await;
     let tools = client
         .list_tools(Default::default())
@@ -61,6 +61,7 @@ async fn stdio_tools_list_advertises_all_six_tools() {
     let names: Vec<&str> = tools.tools.iter().map(|t| t.name.as_ref()).collect();
     for expected in [
         "lock_mask",
+        "compress_log",
         "compress_array",
         "polymorph_retrieve_cache",
         "lcm_append",
@@ -72,6 +73,32 @@ async fn stdio_tools_list_advertises_all_six_tools() {
             "missing tool {expected}: {names:?}"
         );
     }
+    let _ = client.cancel().await;
+    let _ = child.kill().await;
+}
+
+#[tokio::test]
+async fn stdio_compress_log_round_trip() {
+    let (mut child, client) = spawn_server().await;
+    let text = "\
+INFO heartbeat ok
+INFO heartbeat ok
+INFO heartbeat ok
+ERROR DiskControllerFirmwareDeadlock code=E513
+";
+    let result = client
+        .peer()
+        .call_tool(
+            CallToolRequestParams::new("compress_log")
+                .with_arguments(json!({"text": text}).as_object().unwrap().clone()),
+        )
+        .await
+        .expect("call_tool");
+    let sc = result.structured_content.expect("structuredContent");
+    assert!(sc["cache_id"].as_str().is_some());
+    assert!(sc["compressed"].as_str().unwrap().contains("E513"));
+    assert!(sc["dedup_elided_lines"].as_u64().unwrap() > 0);
+    assert_eq!(sc["used_model"], false);
     let _ = client.cancel().await;
     let _ = child.kill().await;
 }

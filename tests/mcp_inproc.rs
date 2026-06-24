@@ -186,14 +186,26 @@ async fn compress_log_dedups_and_caches_original() {
         "repeated lines must be elided"
     );
     assert_eq!(sc["used_model"], json!(false), "no model configured");
-    assert!(sc["compressed"].as_str().unwrap().contains("E513"), "unique error survives");
+    assert!(
+        sc["compressed"].as_str().unwrap().contains("E513"),
+        "unique error survives"
+    );
     assert!(sc["input_tokens"].as_u64().unwrap() > sc["output_tokens"].as_u64().unwrap());
 
     // Original is retrievable verbatim via the cache_id.
     let cache_id = sc["cache_id"].as_str().expect("cache_id");
-    let back = call(&client, "polymorph_retrieve_cache", json!({"cache_id": cache_id})).await;
+    let back = call(
+        &client,
+        "polymorph_retrieve_cache",
+        json!({"cache_id": cache_id}),
+    )
+    .await;
     let bsc = back.structured_content.expect("retrieve structured");
-    assert_eq!(bsc["value"], json!(original), "cache returns the original verbatim");
+    assert_eq!(
+        bsc["value"],
+        json!(original),
+        "cache returns the original verbatim"
+    );
     let _ = client.cancel().await;
 }
 
@@ -206,7 +218,12 @@ async fn compress_log_reads_from_path() {
         "GET /health 200\nGET /health 200\nGET /health 200\nFATAL oom killed pid=42\n",
     )
     .unwrap();
-    let r = call(&client, "compress_log", json!({ "path": logp.to_str().unwrap() })).await;
+    let r = call(
+        &client,
+        "compress_log",
+        json!({ "path": logp.to_str().unwrap() }),
+    )
+    .await;
     let sc = r.structured_content.expect("structuredContent");
     assert!(sc["compressed"].as_str().unwrap().contains("pid=42"));
     let _ = client.cancel().await;
@@ -215,7 +232,12 @@ async fn compress_log_reads_from_path() {
 #[tokio::test]
 async fn compress_log_rejects_both_text_and_path() {
     let (client, _server, _dir) = harness().await;
-    let err = call_err(&client, "compress_log", json!({"text": "x", "path": "/tmp/y"})).await;
+    let err = call_err(
+        &client,
+        "compress_log",
+        json!({"text": "x", "path": "/tmp/y"}),
+    )
+    .await;
     error_data(&err, -32602, "validation_failed");
     let _ = client.cancel().await;
 }
@@ -621,7 +643,7 @@ async fn lock_mask_oversized_keywords_rejected_by_semantic_validator() {
 }
 
 #[tokio::test]
-async fn tools_list_advertises_all_six() {
+async fn tools_list_advertises_all_seven() {
     let (client, _server, _dir) = harness().await;
     let tools = client
         .list_tools(Default::default())
@@ -630,6 +652,7 @@ async fn tools_list_advertises_all_six() {
     let names: Vec<&str> = tools.tools.iter().map(|t| t.name.as_ref()).collect();
     for expected in [
         "lock_mask",
+        "compress_log",
         "compress_array",
         "polymorph_retrieve_cache",
         "lcm_append",
@@ -667,6 +690,20 @@ async fn tools_list_advertises_schema_bounds() {
     assert_eq!(
         lock_mask["properties"]["keywords"]["items"]["maxLength"],
         MAX_KEYWORD_ITEM_LEN as u64
+    );
+
+    let compress_log = tool_schema(&tools, "compress_log");
+    assert_eq!(
+        compress_log["properties"]["text"]["maxLength"],
+        MAX_TEXT_LEN as u64
+    );
+    assert_eq!(
+        compress_log["properties"]["path"]["maxLength"],
+        polymorph::io_guard::MAX_PATH_LEN as u64
+    );
+    assert_eq!(
+        compress_log["properties"]["keywords"]["maxItems"],
+        MAX_KEYWORDS as u64
     );
 
     let retrieve = tool_schema(&tools, "polymorph_retrieve_cache");

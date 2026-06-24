@@ -6,6 +6,11 @@ fn grammars_dir() -> PathBuf {
 }
 
 #[test]
+fn demo_compress_runs_to_completion() {
+    demo::run("compress", &grammars_dir()).expect("compress demo should succeed");
+}
+
+#[test]
 fn demo_lcm_loop_runs_to_completion() {
     demo::run("lcm-loop", &grammars_dir()).expect("lcm-loop demo should succeed");
 }
