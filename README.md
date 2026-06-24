@@ -70,9 +70,9 @@ The archive must contain `model.onnx`. It may also contain `model.onnx.data` and
 
 ## Claude Code Setup
 
-Copy `.claude/settings.example.json` into your Claude Code settings file, or add
-the `mcpServers.polymorph` block to an existing config. Replace
-`/absolute/path/to/lulu-polymorph` with this checkout.
+Add the `mcpServers.polymorph` block below to your Claude Code settings file.
+Replace `/absolute/path/to/lulu-polymorph` with this checkout. A generic copy is
+also available in `mcp.example.json`.
 
 ```json
 {
@@ -94,8 +94,8 @@ To enable the model, add:
 "POLYMORPH_LAMR_MODEL": "/absolute/path/to/lulu-polymorph/data/modal_out/mb_v0/onnx/model.onnx"
 ```
 
-A Claude Code skill is bundled at `.claude/skills/polymorph/`. To use it in any
-project, copy that folder to `~/.claude/skills/polymorph/`. Then ask:
+A Claude Code skill is bundled at `skills/polymorph/`. To use it in any project,
+copy that folder to `~/.claude/skills/polymorph/`. Then ask:
 
 ```text
 Here are production traces in /tmp/incident.log. Debug this, use polymorph.
@@ -105,9 +105,9 @@ The skill routes the log through `compress_log` before analysis.
 
 ## Cursor Setup
 
-Copy `.cursor/mcp.json.example` to `.cursor/mcp.json` in this repo or merge the
-same `mcpServers.polymorph` block into your Cursor MCP config. Replace the
-absolute paths with your checkout path.
+Merge the same `mcpServers.polymorph` block into your Cursor MCP config. You can
+start from `mcp.example.json`, replacing the absolute paths with your checkout
+path.
 
 Use the same optional `POLYMORPH_LAMR_MODEL` env var as Claude Code when the
 model is installed.

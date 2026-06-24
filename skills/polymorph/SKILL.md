@@ -92,5 +92,5 @@ it's specialized for operational logs and traces.
   `bash scripts/fetch_model.sh` or point the server at an existing artifact via
   `POLYMORPH_LAMR_MODEL=/path/to/mb_v0/onnx/model.onnx`. Without it,
   `compress_log` still runs deterministic dedup + locking (`used_model:false`).
-- To use this skill outside this repo, copy `.claude/skills/polymorph/` to
+- To use this skill in Claude Code, copy `skills/polymorph/` to
   `~/.claude/skills/polymorph/`.

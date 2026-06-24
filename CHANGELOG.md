@@ -5,7 +5,7 @@
 ### Added
 - Install verification via `polymorph-mcp --selftest`, including grammar, SQLite cache, and model-path diagnostics.
 - `polymorph-mcp --demo compress` plus `examples/sample.log` for a local first-run compression demo.
-- Claude Code and Cursor MCP config examples.
+- Claude Code and Cursor MCP config guidance via `mcp.example.json`.
 - `scripts/fetch_model.sh` for downloading a public ONNX model artifact into the expected runtime path.
 
 ### Changed
@@ -22,7 +22,7 @@ First release: the learned pruner is live end-to-end in the Rust runtime.
 - Windowed `tract` ONNX inference for the LaMR pruner (`src/lamr.rs`), reproducing the PyTorch drop probabilities to `max_abs_diff = 3e-6`.
 - `compress_text` pipeline (`src/compress.rs`): structural lock to byte intervals, ModernBERT tokenization, span-aware decode, reconstruction.
 - `Language::PlainText` so raw logs are not force-parsed as JSON (which over-locked ~42% of tokens).
-- Claude Code skill in `.claude/skills/polymorph/`.
+- Claude Code skill in `skills/polymorph/`.
 - Modal GPU eval (`ml_pipeline/cloud/eval_modal.py`) and bench statistics (per-domain, McNemar, bootstrap CIs) in Rust via `polymorph-mcp --bench-stats`.
 - INT8 quantization and dynamic-batch export scripts under `ml_pipeline/scripts/`.
 

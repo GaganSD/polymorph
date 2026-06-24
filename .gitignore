@@ -3,6 +3,10 @@
 Cargo.lock.bak
 .DS_Store
 
+# Local agent/editor client config
+.claude/
+.cursor/
+
 # Python / ml_pipeline
 ml_pipeline/.venv/
 ml_pipeline/artifacts/
