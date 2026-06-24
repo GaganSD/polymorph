@@ -11,9 +11,7 @@ use anyhow::{anyhow, Result};
 use crate::methods::default_methods;
 use crate::stats::Metric;
 use crate::survival::{default_survival, format_report, run_benchmark};
-use crate::triples::{
-    build_triples_from_paths, collect_log_files, curated_triples, AnswerTriple,
-};
+use crate::triples::{build_triples_from_paths, collect_log_files, curated_triples, AnswerTriple};
 
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     args.iter()
@@ -57,7 +55,8 @@ pub fn try_run(args: &[String]) -> Option<Result<()>> {
 /// the ranking + calibrated-decode metrics. The torch forward pass that produces
 /// `drop_prob`/`gold` stays in Python; this scores them.
 fn eval_metrics(args: &[String]) -> Result<()> {
-    let path = flag(args, "--eval-metrics").ok_or_else(|| anyhow!("--eval-metrics needs a json path"))?;
+    let path =
+        flag(args, "--eval-metrics").ok_or_else(|| anyhow!("--eval-metrics needs a json path"))?;
     let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
     let drop_prob: Vec<f64> = serde_json::from_value(v["drop_prob"].clone())?;
     let gold: Vec<i64> = serde_json::from_value(v["gold"].clone())?;
@@ -68,23 +67,41 @@ fn eval_metrics(args: &[String]) -> Result<()> {
 }
 
 fn bench_stats(args: &[String]) -> Result<()> {
-    let results = flag(args, "--bench-stats").ok_or_else(|| anyhow!("--bench-stats needs a path"))?;
+    let results =
+        flag(args, "--bench-stats").ok_or_else(|| anyhow!("--bench-stats needs a path"))?;
     let metric = match flag(args, "--metric").unwrap_or("judge") {
         "exact" => Metric::Exact,
         _ => Metric::Judge,
     };
-    let resamples = flag(args, "--resamples").and_then(|s| s.parse().ok()).unwrap_or(1000);
-    let conf = flag(args, "--conf").and_then(|s| s.parse().ok()).unwrap_or(0.95);
-    let seed = flag(args, "--seed").and_then(|s| s.parse().ok()).unwrap_or(1234);
+    let resamples = flag(args, "--resamples")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1000);
+    let conf = flag(args, "--conf")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.95);
+    let seed = flag(args, "--seed")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1234);
     let out = flag(args, "--out").map(PathBuf::from);
-    crate::stats::run(Path::new(results), metric, resamples, conf, seed, out.as_deref())
+    crate::stats::run(
+        Path::new(results),
+        metric,
+        resamples,
+        conf,
+        seed,
+        out.as_deref(),
+    )
 }
 
 fn build_loghub(args: &[String]) -> Result<()> {
     let raw_dir = PathBuf::from(flag(args, "--raw-dir").unwrap_or("../data/raw/loghub2"));
     let out = PathBuf::from(flag(args, "--out").unwrap_or("../data/bench/loghub_triples.json"));
-    let window = flag(args, "--window-lines").and_then(|s| s.parse().ok()).unwrap_or(30);
-    let max_per = flag(args, "--max-per-system").and_then(|s| s.parse().ok()).unwrap_or(40);
+    let window = flag(args, "--window-lines")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
+    let max_per = flag(args, "--max-per-system")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40);
     crate::loghub::run(&raw_dir, &out, window, max_per)
 }
 
@@ -97,9 +114,14 @@ fn label_ceiling(args: &[String]) -> Result<()> {
 }
 
 fn build_triples(args: &[String]) -> Result<()> {
-    let root = flag(args, "--build-triples").ok_or_else(|| anyhow!("--build-triples needs a root dir"))?;
-    let window = flag(args, "--window-lines").and_then(|s| s.parse().ok()).unwrap_or(40);
-    let max_per_file = flag(args, "--max-per-file").and_then(|s| s.parse().ok()).unwrap_or(5);
+    let root =
+        flag(args, "--build-triples").ok_or_else(|| anyhow!("--build-triples needs a root dir"))?;
+    let window = flag(args, "--window-lines")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40);
+    let max_per_file = flag(args, "--max-per-file")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
     let max_total = flag(args, "--max-total").and_then(|s| s.parse().ok());
     let paths = collect_log_files(Path::new(root));
     let triples = build_triples_from_paths(&paths, window, max_per_file, max_total, 2_000_000);
@@ -120,7 +142,9 @@ fn load_triples(path: &Path) -> Result<Vec<AnswerTriple>> {
     let arr = if v.is_array() {
         v
     } else {
-        v.get("triples").cloned().ok_or_else(|| anyhow!("no 'triples' array in {}", path.display()))?
+        v.get("triples")
+            .cloned()
+            .ok_or_else(|| anyhow!("no 'triples' array in {}", path.display()))?
     };
     Ok(serde_json::from_value(arr)?)
 }
@@ -145,8 +169,12 @@ fn bench_survival(args: &[String]) -> Result<()> {
 /// the per-line `normalize.template_key_cached` / `is_low_signal` loop in
 /// `distill/sampler.py`.
 fn sampler_filter(args: &[String]) -> Result<()> {
-    let min_ratio = flag(args, "--min-ratio").and_then(|s| s.parse().ok()).unwrap_or(0.30);
-    let min_alnum = flag(args, "--min-alnum").and_then(|s| s.parse().ok()).unwrap_or(24);
+    let min_ratio = flag(args, "--min-ratio")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.30);
+    let min_alnum = flag(args, "--min-alnum")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(24);
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();

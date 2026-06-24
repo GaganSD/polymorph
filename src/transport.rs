@@ -55,9 +55,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for BoundedAsyncRead<R> {
                 buf.set_filled(before);
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!(
-                        "incoming message exceeds {MAX_PAYLOAD_BYTES} bytes \u{2014} refusing"
-                    ),
+                    format!("incoming message exceeds {MAX_PAYLOAD_BYTES} bytes \u{2014} refusing"),
                 )));
             }
         }

@@ -58,7 +58,8 @@ fn main() {
     };
 
     // Dummy forward: input_ids + attention_mask, both i64 [1, seq_len].
-    let ids = tract_ndarray::Array2::<i64>::from_shape_fn((1, seq_len), |(_, j)| (j as i64) % 100 + 1);
+    let ids =
+        tract_ndarray::Array2::<i64>::from_shape_fn((1, seq_len), |(_, j)| (j as i64) % 100 + 1);
     let mask = tract_ndarray::Array2::<i64>::from_elem((1, seq_len), 1i64);
     match runnable.run(tvec!(ids.into_tensor().into(), mask.into_tensor().into())) {
         Ok(out) => {
@@ -71,7 +72,9 @@ fn main() {
         }
         Err(e) => {
             println!("[tract_probe] forward: FAILED -> {e}");
-            println!("[tract_probe] VERDICT: loads but won't run as-given (check input dtypes/names)");
+            println!(
+                "[tract_probe] VERDICT: loads but won't run as-given (check input dtypes/names)"
+            );
             std::process::exit(1);
         }
     }

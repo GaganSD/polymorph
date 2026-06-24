@@ -78,7 +78,9 @@ pub fn evaluate_method(
         let mut ratios: Vec<f64> = Vec::new();
         let mut drops: Vec<f64> = Vec::new();
         for t in triples {
-            let comp = method.compress(&t.text, r).unwrap_or_else(|_| t.text.clone());
+            let comp = method
+                .compress(&t.text, r)
+                .unwrap_or_else(|_| t.text.clone());
             if survival_fn(t, &comp) {
                 survived += 1;
             }
@@ -89,7 +91,11 @@ pub fn evaluate_method(
         rows.push(MethodRow {
             method: method.name().to_string(),
             target_drop_rate: r,
-            survival: if n > 0 { survived as f64 / n as f64 } else { 0.0 },
+            survival: if n > 0 {
+                survived as f64 / n as f64
+            } else {
+                0.0
+            },
             mean_ratio: if !ratios.is_empty() {
                 ratios.iter().sum::<f64>() / ratios.len() as f64
             } else {
@@ -226,7 +232,11 @@ pub fn format_report(run: &BenchmarkRun, triples: &[AnswerTriple], drop_rates: &
                 row.mean_ratio,
                 row.mean_achieved_drop
             );
-            lines.push(format!("  {}{}   [not rate-tunable]", ljust(name, 18), cell));
+            lines.push(format!(
+                "  {}{}   [not rate-tunable]",
+                ljust(name, 18),
+                cell
+            ));
             continue;
         }
         let mut cells = String::new();
@@ -261,7 +271,9 @@ pub fn format_report(run: &BenchmarkRun, triples: &[AnswerTriple], drop_rates: &
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::methods::{default_methods, DeterministicDedup, KeepSeverityHeuristic, RandomDropFloor};
+    use crate::methods::{
+        default_methods, DeterministicDedup, KeepSeverityHeuristic, RandomDropFloor,
+    };
     use crate::triples::curated_triples;
 
     const RATES: [f64; 3] = [0.2, 0.5, 0.8];
@@ -302,7 +314,12 @@ mod tests {
     #[test]
     fn deterministic_preserves_all_unique_needles() {
         let triples = curated_triples();
-        let rows = evaluate_method(&DeterministicDedup::default(), &triples, &RATES, &default_survival);
+        let rows = evaluate_method(
+            &DeterministicDedup::default(),
+            &triples,
+            &RATES,
+            &default_survival,
+        );
         assert_eq!(rows[0].survival, 1.0);
     }
 
@@ -310,7 +327,12 @@ mod tests {
     fn random_is_a_floor_keep_severity_beats_it_at_high_drop() {
         let triples = curated_triples();
         let sev = evaluate_method(&KeepSeverityHeuristic, &triples, &[0.8], &default_survival);
-        let rnd = evaluate_method(&RandomDropFloor::default(), &triples, &[0.8], &default_survival);
+        let rnd = evaluate_method(
+            &RandomDropFloor::default(),
+            &triples,
+            &[0.8],
+            &default_survival,
+        );
         assert!(sev[0].survival >= rnd[0].survival);
     }
 

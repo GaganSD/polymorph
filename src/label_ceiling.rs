@@ -87,7 +87,8 @@ pub fn iter_records(content: &str, limit: Option<usize>) -> Vec<(String, String,
 pub fn measure(content: &str, limit: Option<usize>, semantic: bool) -> Result<CeilingCounts> {
     let mut c = CeilingCounts::default();
     let keepsev = KeepSeverityHeuristic;
-    for (ci, (original, compressed, source)) in iter_records(content, limit).into_iter().enumerate() {
+    for (ci, (original, compressed, source)) in iter_records(content, limit).into_iter().enumerate()
+    {
         c.chunks += 1;
         let doc_id = format!("{source}#{ci}");
         let triple = if semantic {
@@ -105,7 +106,10 @@ pub fn measure(content: &str, limit: Option<usize>, semantic: bool) -> Result<Ce
             continue;
         }
         c.needle_in_original += 1;
-        let bucket = c.by_type.entry(triple.fact_type.clone()).or_insert([0, 0, 0]);
+        let bucket = c
+            .by_type
+            .entry(triple.fact_type.clone())
+            .or_insert([0, 0, 0]);
         bucket[0] += 1;
 
         if answer_survives(needle, &compressed) {
@@ -217,7 +221,12 @@ pub fn format_report(c: &CeilingCounts) -> String {
 }
 
 /// CLI: read a distilled JSONL, measure, print the report, optionally dump JSON.
-pub fn run(distilled: &Path, limit: Option<usize>, semantic: bool, out: Option<&Path>) -> Result<()> {
+pub fn run(
+    distilled: &Path,
+    limit: Option<usize>,
+    semantic: bool,
+    out: Option<&Path>,
+) -> Result<()> {
     if !distilled.is_file() {
         anyhow::bail!("distilled file not found: {}", distilled.display());
     }

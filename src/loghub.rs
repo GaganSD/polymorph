@@ -25,10 +25,15 @@ static FLOOR_LOCKABLE: Lazy<Vec<Regex>> = Lazy::new(|| {
         Regex::new(r"\berrno[=:]\s*\d+\b").unwrap(),
         ci(r"\berror code\s+(?:0x[0-9A-Fa-f]+|\d+)\b"),
         Regex::new(r"\b\d{1,3}(?:\.\d{1,3}){3}\b").unwrap(),
-        Regex::new(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b").unwrap(),
+        Regex::new(
+            r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b",
+        )
+        .unwrap(),
         Regex::new(r"\bINC\d{4,}\b").unwrap(),
         Regex::new(r"request_id[=:]\s*[A-Za-z0-9_-]+").unwrap(),
-        ci(r#"\b(?:root_cause|resolution|resolution_action|remediation|failure_reason|reason|msg|message|short_description|summary)\s*[=:]\s*"[^"\n]{1,200}""#),
+        ci(
+            r#"\b(?:root_cause|resolution|resolution_action|remediation|failure_reason|reason|msg|message|short_description|summary)\s*[=:]\s*"[^"\n]{1,200}""#,
+        ),
     ]
 });
 
@@ -38,14 +43,18 @@ fn floor_would_lock(text: &str) -> bool {
 
 // Per-system header strippers.
 static OS_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"^\S+\s+\d{4}-\d{2}-\d{2}\s+[\d:.]+\s+\d+\s+[A-Z]+\s+[\w.$]+\s+(?:\[[^\]]*\]\s+)?(.*)$").unwrap()
+    Regex::new(
+        r"^\S+\s+\d{4}-\d{2}-\d{2}\s+[\d:.]+\s+\d+\s+[A-Z]+\s+[\w.$]+\s+(?:\[[^\]]*\]\s+)?(.*)$",
+    )
+    .unwrap()
 });
 static SPARK_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^\d\d/\d\d/\d\d \d\d:\d\d:\d\d [A-Z]+ +[\w.$]+: (.*)$").unwrap());
 static ZK_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^[\d\- :,]+ - [A-Z]+ +\[[^\]]*\] - (.*)$").unwrap());
-static HADOOP_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^\d{4}-\d{2}-\d{2} [\d:,]+ [A-Z]+ +\[[^\]]*\] [\w.$]+: (.*)$").unwrap());
+static HADOOP_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^\d{4}-\d{2}-\d{2} [\d:,]+ [A-Z]+ +\[[^\]]*\] [\w.$]+: (.*)$").unwrap()
+});
 static HDFS_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^\d{6} \d{6} \d+ [A-Z]+ [\w.$]+: (.*)$").unwrap());
 static LINUX_RE: Lazy<Regex> =
@@ -55,7 +64,13 @@ static BGL_RE: Lazy<Regex> =
 
 /// The LogHub systems we mine, in fixed order.
 pub const SYSTEMS: &[&str] = &[
-    "openstack", "spark", "hadoop", "zookeeper", "hdfs", "linux", "bgl",
+    "openstack",
+    "spark",
+    "hadoop",
+    "zookeeper",
+    "hdfs",
+    "linux",
+    "bgl",
 ];
 
 fn strip_openstack(line: &str) -> Option<String> {
@@ -195,7 +210,12 @@ pub fn build_all(raw_dir: &Path, window_lines: usize, max_per_system: usize) -> 
             Ok(b) => String::from_utf8_lossy(&b).into_owned(),
             Err(_) => continue,
         };
-        triples.extend(build_triples_for_system(name, &text, window_lines, max_per_system));
+        triples.extend(build_triples_for_system(
+            name,
+            &text,
+            window_lines,
+            max_per_system,
+        ));
     }
     triples
 }
@@ -265,15 +285,23 @@ mod tests {
     #[test]
     fn mines_prose_needle_from_spark_window() {
         let mut lines: Vec<String> = (0..10)
-            .map(|i| format!("17/06/09 20:10:4{} INFO storage.BlockManager: heartbeat received", i % 10))
+            .map(|i| {
+                format!(
+                    "17/06/09 20:10:4{} INFO storage.BlockManager: heartbeat received",
+                    i % 10
+                )
+            })
             .collect();
         lines.insert(
             5,
-            "17/06/09 20:10:45 INFO executor.Executor: Send worker leaving thread gracefully".to_string(),
+            "17/06/09 20:10:45 INFO executor.Executor: Send worker leaving thread gracefully"
+                .to_string(),
         );
         let text = lines.join("\n");
         let triples = build_triples_for_system("spark", &text, 30, 40);
-        assert!(triples.iter().any(|t| t.answer == "Send worker leaving thread gracefully"));
+        assert!(triples
+            .iter()
+            .any(|t| t.answer == "Send worker leaving thread gracefully"));
         for t in &triples {
             assert_eq!(t.fact_type, "loghub:spark");
             assert!(t.text.contains(&t.answer));

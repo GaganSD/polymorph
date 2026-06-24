@@ -76,13 +76,9 @@ def hello(name):
     assert!(any_unlocked, "docstring prose must have unlocked tokens");
 
     let comment_pos = text.find("comment body").unwrap();
-    let any_unlocked = res
-        .token_spans
-        .iter()
-        .enumerate()
-        .any(|(i, &(s, e))| {
-            s >= comment_pos && e <= comment_pos + "comment body".len() && !res.mask[i]
-        });
+    let any_unlocked = res.token_spans.iter().enumerate().any(|(i, &(s, e))| {
+        s >= comment_pos && e <= comment_pos + "comment body".len() && !res.mask[i]
+    });
     assert!(any_unlocked, "comment body must have unlocked tokens");
 }
 
@@ -154,11 +150,14 @@ fn unsupported_language_handled_at_lib_level() {
 #[test]
 fn keyword_locks_multiple_occurrences() {
     let text = r#"{"a":"secret","b":"secret"}"#;
-    let res = lock_payload(text, Language::Json, &["secret".to_string()], &grammars_dir()).unwrap();
-    let secret_positions: Vec<usize> = text
-        .match_indices("secret")
-        .map(|(i, _)| i)
-        .collect();
+    let res = lock_payload(
+        text,
+        Language::Json,
+        &["secret".to_string()],
+        &grammars_dir(),
+    )
+    .unwrap();
+    let secret_positions: Vec<usize> = text.match_indices("secret").map(|(i, _)| i).collect();
     assert_eq!(secret_positions.len(), 2);
     for pos in secret_positions {
         let range = pos..(pos + "secret".len());

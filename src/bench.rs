@@ -44,9 +44,7 @@ struct CorpusStats {
 /// Entry point for `--bench`.
 pub fn run(corpus_dir: &str, chunk_kb: Option<usize>, max_mb: Option<usize>) -> Result<()> {
     let chunk_bytes = chunk_kb.map(|k| k * 1024).unwrap_or(DEFAULT_CHUNK_BYTES);
-    let max_bytes = max_mb
-        .map(|m| m * 1024 * 1024)
-        .unwrap_or(DEFAULT_MAX_BYTES);
+    let max_bytes = max_mb.map(|m| m * 1024 * 1024).unwrap_or(DEFAULT_MAX_BYTES);
     let root = Path::new(corpus_dir);
     if !root.exists() {
         anyhow::bail!("corpus dir not found: {corpus_dir}");
@@ -97,7 +95,9 @@ pub fn run(corpus_dir: &str, chunk_kb: Option<usize>, max_mb: Option<usize>) -> 
             let start = Instant::now();
             let plan = dedup_plan(chunk, DedupOpts::default());
             let elapsed = start.elapsed();
-            stats.chunk_latencies_ms.push(elapsed.as_secs_f64() * 1000.0);
+            stats
+                .chunk_latencies_ms
+                .push(elapsed.as_secs_f64() * 1000.0);
             stats.total_secs += elapsed.as_secs_f64();
             stats.bytes_processed += chunk.len();
             stats.orig_tokens += tokenizer::count_tokens(chunk).unwrap_or(0);
@@ -173,7 +173,11 @@ fn report(s: &CorpusStats) {
     );
     if s.survive_total > 0 {
         let surv = 100.0 * s.survive_kept as f64 / s.survive_total as f64;
-        let flag = if surv < 99.9 { "  <-- CHECK: answer tokens lost" } else { "" };
+        let flag = if surv < 99.9 {
+            "  <-- CHECK: answer tokens lost"
+        } else {
+            ""
+        };
         println!(
             "answer-token survival : {:.2}% ({}/{}){}",
             surv, s.survive_kept, s.survive_total, flag
@@ -302,8 +306,8 @@ fn load_survive_tokens(file: &Path) -> Vec<String> {
                 let name = e.file_name();
                 let name = name.to_str().unwrap_or("");
                 if name.starts_with("potentialAnomalies") && name.ends_with(".txt") {
-                    if let Ok(content) = std::fs::read_to_string(e.path())
-                        .with_context(|| format!("reading {name}"))
+                    if let Ok(content) =
+                        std::fs::read_to_string(e.path()).with_context(|| format!("reading {name}"))
                     {
                         return content
                             .lines()
@@ -441,7 +445,9 @@ mod tests {
             "some anomaly line here\nshort\n",
         )
         .unwrap();
-        assert!(load_survive_tokens(&logf).iter().any(|t| t.contains("anomaly")));
+        assert!(load_survive_tokens(&logf)
+            .iter()
+            .any(|t| t.contains("anomaly")));
         // sidecar takes precedence
         std::fs::write(logf.with_extension("log.survive"), "EXACT-TOKEN\n").unwrap();
         assert_eq!(load_survive_tokens(&logf), vec!["EXACT-TOKEN".to_string()]);

@@ -18,14 +18,19 @@ static LOCK_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
         Regex::new(r"\b[A-Z][A-Za-z0-9_]*(?:Error|Exception)\b").unwrap(), // exception type
         Regex::new(r"\b(?:FATAL|CRITICAL|ERROR|EXCEPTION|TRACEBACK|WARN(?:ING)?)\b").unwrap(), // severity
-        ci(r"(?:status|HTTP|code)[=:\s]+[45]\d{2}\b"),         // http 4xx/5xx
-        Regex::new(r"\berrno[=:]\s*\d+\b").unwrap(),           // errno
-        ci(r"\berror code\s+(?:0x[0-9A-Fa-f]+|\d+)\b"),        // error code
-        Regex::new(r"\b\d{1,3}(?:\.\d{1,3}){3}\b").unwrap(),   // IPv4
-        Regex::new(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b").unwrap(), // UUID
-        Regex::new(r"\bINC\d{4,}\b").unwrap(),                 // incident id
+        ci(r"(?:status|HTTP|code)[=:\s]+[45]\d{2}\b"), // http 4xx/5xx
+        Regex::new(r"\berrno[=:]\s*\d+\b").unwrap(),   // errno
+        ci(r"\berror code\s+(?:0x[0-9A-Fa-f]+|\d+)\b"), // error code
+        Regex::new(r"\b\d{1,3}(?:\.\d{1,3}){3}\b").unwrap(), // IPv4
+        Regex::new(
+            r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b",
+        )
+        .unwrap(), // UUID
+        Regex::new(r"\bINC\d{4,}\b").unwrap(),         // incident id
         Regex::new(r"request_id[=:]\s*[A-Za-z0-9_-]+").unwrap(), // request id
-        ci(r#"\b(?:root_cause|resolution|resolution_action|remediation|failure_reason|reason|msg|message|short_description|summary)\s*[=:]\s*"[^"\n]{1,200}""#),
+        ci(
+            r#"\b(?:root_cause|resolution|resolution_action|remediation|failure_reason|reason|msg|message|short_description|summary)\s*[=:]\s*"[^"\n]{1,200}""#,
+        ),
     ]
 });
 

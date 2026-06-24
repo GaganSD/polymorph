@@ -20,7 +20,8 @@ fn model_path() -> PathBuf {
 }
 
 fn fixture() -> serde_json::Value {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mb_v0_forward_parity.json");
+    let p =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mb_v0_forward_parity.json");
     serde_json::from_str(&std::fs::read_to_string(p).expect("read fixture")).expect("parse fixture")
 }
 
@@ -29,26 +30,46 @@ fn mb_v0_tokenizer_matches_python_on_fixture_text() {
     // Tokenizer parity on the exact fixture text (cheap; no model needed).
     let fx = fixture();
     let text = fx["text"].as_str().unwrap();
-    let want: Vec<u32> = fx["mb_ids"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u32).collect();
+    let want: Vec<u32> = fx["mb_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_u64().unwrap() as u32)
+        .collect();
     let tok = polymorph::modernbert::get().expect("tokenizer");
     let (ids, _spans) = tok.encode_with_spans(text);
-    assert_eq!(ids, want, "Rust ModernBERT ids must match Python encode_with_spans");
+    assert_eq!(
+        ids, want,
+        "Rust ModernBERT ids must match Python encode_with_spans"
+    );
 }
 
 #[test]
 fn mb_v0_forward_probs_match_python() {
     let mp = model_path();
     if !mp.exists() {
-        eprintln!("SKIP mb_v0 forward parity: model not found at {}", mp.display());
+        eprintln!(
+            "SKIP mb_v0 forward parity: model not found at {}",
+            mp.display()
+        );
         return;
     }
     let fx = fixture();
     let text = fx["text"].as_str().unwrap();
-    let want_probs: Vec<f32> = fx["probs"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32).collect();
+    let want_probs: Vec<f32> = fx["probs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_f64().unwrap() as f32)
+        .collect();
 
     let tok = polymorph::modernbert::get().expect("tokenizer");
     let (mb_ids, _spans) = tok.encode_with_spans(text);
-    assert_eq!(mb_ids.len(), want_probs.len(), "token count must match fixture");
+    assert_eq!(
+        mb_ids.len(),
+        want_probs.len(),
+        "token count must match fixture"
+    );
 
     let model = polymorph::lamr::LamrOnnx::load(&mp).expect("load mb_v0 onnx");
     let got = model.forward_drop_probs(&mb_ids).expect("windowed forward");
@@ -61,8 +82,14 @@ fn mb_v0_forward_probs_match_python() {
     for (a, b) in got.iter().zip(want_probs.iter()) {
         max_abs = max_abs.max((a - b).abs());
     }
-    eprintln!("mb_v0 forward parity: max_abs_prob_diff = {max_abs:.6} over {} tokens", got.len());
-    assert!(max_abs < 2e-2, "max prob diff {max_abs} exceeds tolerance (windowing/padding mismatch?)");
+    eprintln!(
+        "mb_v0 forward parity: max_abs_prob_diff = {max_abs:.6} over {} tokens",
+        got.len()
+    );
+    assert!(
+        max_abs < 2e-2,
+        "max prob diff {max_abs} exceeds tolerance (windowing/padding mismatch?)"
+    );
 }
 
 #[test]
@@ -91,8 +118,14 @@ fn mb_v0_compress_text_preserves_needle_and_shrinks() {
         "compress_text: used_model={} in={} out={} ratio={:.2}",
         res.used_model, res.input_tokens, res.output_tokens, res.ratio
     );
-    assert!(res.used_model, "the real ONNX model must have run (not the no-model passthrough)");
-    assert!(res.output_tokens < res.input_tokens, "compression must shrink the token count");
+    assert!(
+        res.used_model,
+        "the real ONNX model must have run (not the no-model passthrough)"
+    );
+    assert!(
+        res.output_tokens < res.input_tokens,
+        "compression must shrink the token count"
+    );
     assert!(
         res.compressed.contains("DiskControllerFirmwareDeadlock"),
         "the error needle must survive compression"
@@ -158,7 +191,10 @@ fn e2e_ten_mb_log_compress_preserves_needles() {
         res.used_model, orig_tokens, res.output_tokens, ratio
     );
     assert!(res.used_model, "neural pruner must have run");
-    assert!(ratio > 5.0, "a highly repetitive 10MB log should compress hugely (got {ratio:.1}x)");
+    assert!(
+        ratio > 5.0,
+        "a highly repetitive 10MB log should compress hugely (got {ratio:.1}x)"
+    );
     for (_, needle) in &needles {
         assert!(
             res.compressed.contains(needle),
@@ -176,13 +212,26 @@ fn plaintext_avoids_spurious_ast_locks_on_non_json() {
     let text = fx["text"].as_str().unwrap();
     let grammars = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("grammars");
 
-    let as_json = polymorph::compress_deterministic(text, polymorph::Language::Json, &[], &grammars).unwrap();
+    let as_json =
+        polymorph::compress_deterministic(text, polymorph::Language::Json, &[], &grammars).unwrap();
     let json_locked = as_json.mask.iter().filter(|&&m| m).count();
 
-    let as_text = polymorph::compress_deterministic(text, polymorph::Language::PlainText, &[], &grammars).unwrap();
+    let as_text =
+        polymorph::compress_deterministic(text, polymorph::Language::PlainText, &[], &grammars)
+            .unwrap();
     let text_locked = as_text.mask.iter().filter(|&&m| m).count();
 
-    eprintln!("locked: Json={json_locked}/{} PlainText={text_locked}/{}", as_json.mask.len(), as_text.mask.len());
-    assert!(json_locked > as_json.mask.len() / 4, "Json on non-JSON should over-lock (demonstrates the bug)");
-    assert_eq!(text_locked, 0, "PlainText with no keywords must lock nothing");
+    eprintln!(
+        "locked: Json={json_locked}/{} PlainText={text_locked}/{}",
+        as_json.mask.len(),
+        as_text.mask.len()
+    );
+    assert!(
+        json_locked > as_json.mask.len() / 4,
+        "Json on non-JSON should over-lock (demonstrates the bug)"
+    );
+    assert_eq!(
+        text_locked, 0,
+        "PlainText with no keywords must lock nothing"
+    );
 }

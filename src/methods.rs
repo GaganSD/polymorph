@@ -100,7 +100,10 @@ static NORM_PATTERNS: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
             "<TS>",
         ),
         (
-            Regex::new(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b").unwrap(),
+            Regex::new(
+                r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b",
+            )
+            .unwrap(),
             "<UUID>",
         ),
         (Regex::new(r"\b\d{1,3}(?:\.\d{1,3}){3}\b").unwrap(), "<IP>"),
@@ -170,7 +173,14 @@ impl CompressionMethod for DeterministicDedup {
 // Keep-severity heuristic
 // ---------------------------------------------------------------------------
 
-const SEVERITY_ORDER: &[&str] = &["FATAL", "CRITICAL", "ERROR", "EXCEPTION", "TRACEBACK", "WARN"];
+const SEVERITY_ORDER: &[&str] = &[
+    "FATAL",
+    "CRITICAL",
+    "ERROR",
+    "EXCEPTION",
+    "TRACEBACK",
+    "WARN",
+];
 
 fn severity_rank(line: &str) -> usize {
     let up = line.to_uppercase();

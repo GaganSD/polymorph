@@ -130,14 +130,7 @@ fn append_on_conn(
     now: i64,
 ) -> Result<MessageRow> {
     let tx = conn.transaction()?;
-    let row = insert_turn(
-        &tx,
-        &conversation_id,
-        &role,
-        &content,
-        token_count,
-        now,
-    )?;
+    let row = insert_turn(&tx, &conversation_id, &role, &content, token_count, now)?;
     tx.commit()?;
     Ok(row)
 }
@@ -152,14 +145,7 @@ fn append_and_maybe_archive_on_conn(
     soft_threshold: u64,
 ) -> Result<AppendResult> {
     let tx = conn.transaction()?;
-    let row = insert_turn(
-        &tx,
-        &conversation_id,
-        &role,
-        &content,
-        token_count,
-        now,
-    )?;
+    let row = insert_turn(&tx, &conversation_id, &role, &content, token_count, now)?;
     let archived_node_id = maybe_archive_core(&tx, &conversation_id, soft_threshold)?;
     tx.commit()?;
     Ok(AppendResult {

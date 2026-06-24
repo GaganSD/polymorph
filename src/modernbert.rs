@@ -85,9 +85,11 @@ impl ModernBertTokenizer {
     /// Parse the embedded tokenizer.json and build the BPE engine + added-token
     /// tables. Done once (cached via [`get`]).
     fn build() -> Result<Self> {
-        let v: serde_json::Value =
-            serde_json::from_str(TOKENIZER_JSON).context("parse bundled ModernBERT tokenizer.json")?;
-        let model = v.get("model").ok_or_else(|| anyhow!("tokenizer.json: no model"))?;
+        let v: serde_json::Value = serde_json::from_str(TOKENIZER_JSON)
+            .context("parse bundled ModernBERT tokenizer.json")?;
+        let model = v
+            .get("model")
+            .ok_or_else(|| anyhow!("tokenizer.json: no model"))?;
         let vocab = model
             .get("vocab")
             .and_then(|x| x.as_object())
@@ -110,7 +112,10 @@ impl ModernBertTokenizer {
         let mut added_sorted: Vec<(Vec<u8>, u32)> = Vec::with_capacity(added.len());
         let mut id_to_bytes: HashMap<u32, Vec<u8>> = HashMap::new();
         for t in added {
-            let id = t.get("id").and_then(|x| x.as_u64()).ok_or_else(|| anyhow!("added token: no id"))? as u32;
+            let id = t
+                .get("id")
+                .and_then(|x| x.as_u64())
+                .ok_or_else(|| anyhow!("added token: no id"))? as u32;
             let content = t
                 .get("content")
                 .and_then(|x| x.as_str())
@@ -128,15 +133,17 @@ impl ModernBertTokenizer {
         let mut encoder: FxHashMap<Vec<u8>, u32> = FxHashMap::default();
         encoder.reserve(vocab.len());
         for (tok, id_val) in vocab {
-            let id = id_val.as_u64().ok_or_else(|| anyhow!("vocab {tok}: non-int id"))? as u32;
+            let id = id_val
+                .as_u64()
+                .ok_or_else(|| anyhow!("vocab {tok}: non-int id"))? as u32;
             if added_ids.contains(&id) {
                 continue;
             }
             let mut raw = Vec::with_capacity(tok.len());
             for ch in tok.chars() {
-                let b = *u2b
-                    .get(&ch)
-                    .ok_or_else(|| anyhow!("vocab token {tok:?}: char {ch:?} not in byte-level map"))?;
+                let b = *u2b.get(&ch).ok_or_else(|| {
+                    anyhow!("vocab token {tok:?}: char {ch:?} not in byte-level map")
+                })?;
                 raw.push(b);
             }
             encoder.insert(raw.clone(), id);
@@ -254,7 +261,8 @@ mod tests {
     use std::path::PathBuf;
 
     fn fixtures() -> Vec<serde_json::Value> {
-        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/modernbert_parity.json");
+        let p =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/modernbert_parity.json");
         let raw = std::fs::read_to_string(p).expect("read parity fixtures");
         serde_json::from_str(&raw).expect("parse parity fixtures")
     }
@@ -276,8 +284,9 @@ mod tests {
         // vocab omits (0xC0, 0xC1, 0xF5..=0xFF) are exactly the bytes that CANNOT
         // occur in valid UTF-8 — and our input is always a Rust `&str` — so their
         // absence is correct, not a gap.
-        const INVALID_UTF8: [u8; 13] =
-            [0xC0, 0xC1, 0xF5, 0xF6, 0xF7, 0xF8, 0xF9, 0xFA, 0xFB, 0xFC, 0xFD, 0xFE, 0xFF];
+        const INVALID_UTF8: [u8; 13] = [
+            0xC0, 0xC1, 0xF5, 0xF6, 0xF7, 0xF8, 0xF9, 0xFA, 0xFB, 0xFC, 0xFD, 0xFE, 0xFF,
+        ];
         let tok = get().expect("build tokenizer");
         for b in 0u8..=255 {
             if INVALID_UTF8.contains(&b) {
@@ -306,15 +315,22 @@ mod tests {
         let tok = get().expect("build tokenizer");
         for fx in fixtures() {
             let text = fx["text"].as_str().unwrap();
-            let want_ids: Vec<u32> =
-                fx["ids"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u32).collect();
+            let want_ids: Vec<u32> = fx["ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_u64().unwrap() as u32)
+                .collect();
             let want_spans: Vec<(usize, usize)> = fx["spans"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .map(|s| {
                     let a = s.as_array().unwrap();
-                    (a[0].as_u64().unwrap() as usize, a[1].as_u64().unwrap() as usize)
+                    (
+                        a[0].as_u64().unwrap() as usize,
+                        a[1].as_u64().unwrap() as usize,
+                    )
                 })
                 .collect();
             let (ids, spans) = tok.encode_with_spans(text);
@@ -329,7 +345,11 @@ mod tests {
         for fx in fixtures() {
             let text = fx["text"].as_str().unwrap();
             let (ids, _) = tok.encode_with_spans(text);
-            assert_eq!(tok.decode(&ids).unwrap(), text, "decode round-trip for {text:?}");
+            assert_eq!(
+                tok.decode(&ids).unwrap(),
+                text,
+                "decode round-trip for {text:?}"
+            );
         }
     }
 
@@ -342,7 +362,10 @@ mod tests {
             let (ids, spans) = tok.encode_with_spans(text);
             assert_eq!(ids.len(), spans.len());
             for &(s, e) in &spans {
-                assert!(s < e && e <= raw.len(), "span ({s},{e}) out of range for {text:?}");
+                assert!(
+                    s < e && e <= raw.len(),
+                    "span ({s},{e}) out of range for {text:?}"
+                );
             }
         }
     }

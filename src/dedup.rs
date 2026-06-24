@@ -76,10 +76,7 @@ static PATTERNS: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
             "<UUID>",
         ),
         // IPv4
-        (
-            Regex::new(r"\b\d{1,3}(?:\.\d{1,3}){3}\b").unwrap(),
-            "<IP>",
-        ),
+        (Regex::new(r"\b\d{1,3}(?:\.\d{1,3}){3}\b").unwrap(), "<IP>"),
         // 0x-prefixed hex
         (Regex::new(r"\b0[xX][0-9a-fA-F]+\b").unwrap(), "<HEX>"),
         // long bare hex (>=16 chars: object ids, hashes, span ids)
@@ -165,9 +162,7 @@ pub fn normalize_line(line: &str) -> String {
 /// Carries the group index, count, and key so the output is self-describing and
 /// the persistence layer can attach a `cache_id` for retrieval.
 fn summary_line(group_idx: usize, elided_count: usize, key: &str) -> String {
-    format!(
-        "\u{27EA}polymorph:elided idx={group_idx} lines={elided_count} key={key:?}\u{27EB}"
-    )
+    format!("\u{27EA}polymorph:elided idx={group_idx} lines={elided_count} key={key:?}\u{27EB}")
 }
 
 /// Pure, deterministic dedup pass. No DB, no RNG, no clock.
@@ -343,7 +338,10 @@ mod tests {
     fn normalize_masks_variable_tokens() {
         let a = normalize_line("233.223.117.90 - - [27/Dec/2037:12:00:00 +0530] \"GET /x\" 200 42");
         let b = normalize_line("162.253.4.179 - - [27/Dec/2037:13:00:00 +0530] \"GET /x\" 200 99");
-        assert_eq!(a, b, "lines differing only in IP/timestamp/number must share a key");
+        assert_eq!(
+            a, b,
+            "lines differing only in IP/timestamp/number must share a key"
+        );
         assert!(a.contains("<IP>") && a.contains("<TS>") && a.contains("<NUM>"));
     }
 
@@ -358,7 +356,7 @@ mod tests {
         // All 50 share the same normalized key -> one collapsed group.
         assert_eq!(plan.groups.len(), 1);
         assert_eq!(plan.groups[0].elided.len(), 50 - 2); // head=1 + tail=1 kept
-        // Reduced is much shorter.
+                                                         // Reduced is much shorter.
         assert!(plan.reduced.lines().count() < 5);
         // Round-trip is exact.
         assert_eq!(reconstruct(&plan), text);
@@ -392,7 +390,10 @@ mod tests {
         // A retry storm: the same 5xx line 1000x. Must collapse, but the error
         // must remain visible (first + last kept).
         let err = "ERROR 503 upstream payment timeout";
-        let text = std::iter::repeat(err).take(1000).collect::<Vec<_>>().join("\n");
+        let text = std::iter::repeat(err)
+            .take(1000)
+            .collect::<Vec<_>>()
+            .join("\n");
         let plan = dedup_plan(&text, DedupOpts::default());
         assert_eq!(plan.groups.len(), 1);
         assert_eq!(plan.groups[0].elided.len(), 998);
@@ -457,7 +458,11 @@ mod tests {
                      UNIQUE-MARKER-A\n\
                      rep\nrep\nrep\nrep\nrep";
         let plan = dedup_plan(input, DedupOpts::default());
-        assert_eq!(reconstruct(&plan), input, "round-trip must be exact despite sentinel collision");
+        assert_eq!(
+            reconstruct(&plan),
+            input,
+            "round-trip must be exact despite sentinel collision"
+        );
     }
 
     #[test]

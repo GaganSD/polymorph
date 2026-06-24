@@ -232,13 +232,13 @@ pub fn bootstrap_ci(bits: &[bool], resamples: usize, conf: f64, seed: u64) -> Bo
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct McNemarResult {
-    pub b: usize,           // A right / B wrong  (A better)
-    pub c: usize,           // A wrong / B right  (A worse)
+    pub b: usize, // A right / B wrong  (A better)
+    pub c: usize, // A wrong / B right  (A worse)
     pub n_discordant: usize,
-    pub chi2: f64,          // Yates-corrected chi-square (1 dof)
-    pub p_chi2: f64,        // p from the chi-square approximation
-    pub p_exact: f64,       // two-sided exact binomial p on the discordant pairs
-    pub a_better: bool,     // b > c
+    pub chi2: f64,      // Yates-corrected chi-square (1 dof)
+    pub p_chi2: f64,    // p from the chi-square approximation
+    pub p_exact: f64,   // two-sided exact binomial p on the discordant pairs
+    pub a_better: bool, // b > c
 }
 
 impl McNemarResult {
@@ -361,15 +361,26 @@ impl MethodStats {
 fn per_domain(items: &[Item]) -> Value {
     let mut buckets: BTreeMap<String, Vec<&Item>> = BTreeMap::new();
     for it in items {
-        buckets.entry(domain_of(&it.fact_type)).or_default().push(it);
+        buckets
+            .entry(domain_of(&it.fact_type))
+            .or_default()
+            .push(it);
     }
     let mut out = serde_json::Map::new();
     for (d, b) in buckets {
         let judge_survived = b.iter().filter(|x| x.judge).count();
         let exact_survived = b.iter().filter(|x| x.exact).count();
         let n = b.len();
-        let judge_rate = if n > 0 { judge_survived as f64 / n as f64 } else { 0.0 };
-        let exact_rate = if n > 0 { exact_survived as f64 / n as f64 } else { 0.0 };
+        let judge_rate = if n > 0 {
+            judge_survived as f64 / n as f64
+        } else {
+            0.0
+        };
+        let exact_rate = if n > 0 {
+            exact_survived as f64 / n as f64
+        } else {
+            0.0
+        };
         out.insert(
             d,
             json!({
@@ -470,10 +481,7 @@ pub fn analyze(
                 ));
             }
             for metric in metrics {
-                let res = mcnemar_paired(
-                    &survival_bits(ia, *metric),
-                    &survival_bits(ib, *metric),
-                )?;
+                let res = mcnemar_paired(&survival_bits(ia, *metric), &survival_bits(ib, *metric))?;
                 pts.push(PairTest {
                     ratio_key: rk.clone(),
                     method_a: a.clone(),
@@ -496,8 +504,7 @@ pub fn analyze(
 
 /// Load the `per_item` map from a judge_bench results JSON.
 pub fn load_per_item(path: &Path) -> Result<BTreeMap<String, Vec<Item>>> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| anyhow!("{}: {e}", path.display()))?;
+    let text = std::fs::read_to_string(path).map_err(|e| anyhow!("{}: {e}", path.display()))?;
     let payload: Value = serde_json::from_str(&text)?;
     let pi = payload.get("per_item").ok_or_else(|| {
         anyhow!(
@@ -529,7 +536,12 @@ fn ci_cell(ci: &Value) -> String {
     let point = ci["point"].as_f64().unwrap_or(0.0);
     let lo = ci["lo"].as_f64().unwrap_or(0.0);
     let hi = ci["hi"].as_f64().unwrap_or(0.0);
-    format!("{:4.0}% [{:.0}-{:.0}]", 100.0 * point, 100.0 * lo, 100.0 * hi)
+    format!(
+        "{:4.0}% [{:.0}-{:.0}]",
+        100.0 * point,
+        100.0 * lo,
+        100.0 * hi
+    )
 }
 
 fn ljust(s: &str, width: usize) -> String {
@@ -696,10 +708,7 @@ mod tests {
         // leading '@' (empty method) is treated as an all-method key (mirrors
         // Python rpartition + `if not method`).
         assert_eq!(split_key("@b"), ("@b".to_string(), String::new()));
-        assert_eq!(
-            split_key("a@b@c"),
-            ("a@b".to_string(), "c".to_string())
-        );
+        assert_eq!(split_key("a@b@c"), ("a@b".to_string(), "c".to_string()));
     }
 
     // ---- McNemar on a known 2x2 ----
@@ -806,8 +815,20 @@ mod tests {
         let items = mk_items(&["x", "y"], &[true, false]);
         // exact mirrors judge in mk_items; build a custom case for exact != judge.
         let items = vec![
-            Item { doc_id: None, fact_type: "x".into(), judge: true, exact: false, judge_error: false },
-            Item { doc_id: None, fact_type: "y".into(), judge: false, exact: true, judge_error: false },
+            Item {
+                doc_id: None,
+                fact_type: "x".into(),
+                judge: true,
+                exact: false,
+                judge_error: false,
+            },
+            Item {
+                doc_id: None,
+                fact_type: "y".into(),
+                judge: false,
+                exact: true,
+                judge_error: false,
+            },
             items[0].clone(),
         ];
         let bits = survival_bits(&items[..2], Metric::Judge);
@@ -821,16 +842,35 @@ mod tests {
     #[test]
     fn method_stats_per_domain_breakdown() {
         let items = vec![
-            Item { doc_id: Some("a".into()), fact_type: "loghub:spark".into(), judge: true, exact: true, judge_error: false },
-            Item { doc_id: Some("b".into()), fact_type: "loghub:spark".into(), judge: false, exact: false, judge_error: false },
-            Item { doc_id: Some("c".into()), fact_type: "loghub:bgl".into(), judge: true, exact: false, judge_error: false },
+            Item {
+                doc_id: Some("a".into()),
+                fact_type: "loghub:spark".into(),
+                judge: true,
+                exact: true,
+                judge_error: false,
+            },
+            Item {
+                doc_id: Some("b".into()),
+                fact_type: "loghub:spark".into(),
+                judge: false,
+                exact: false,
+                judge_error: false,
+            },
+            Item {
+                doc_id: Some("c".into()),
+                fact_type: "loghub:bgl".into(),
+                judge: true,
+                exact: false,
+                judge_error: false,
+            },
         ];
         let ms = method_stats(&items, "lamr+span", "iso3.0", 200, 0.95, 5);
         assert_eq!(ms.n, 3);
         let pd = ms.per_domain.as_object().unwrap();
         let keys: std::collections::BTreeSet<&String> = pd.keys().collect();
-        let expected: std::collections::BTreeSet<String> =
-            ["spark".to_string(), "bgl".to_string()].into_iter().collect();
+        let expected: std::collections::BTreeSet<String> = ["spark".to_string(), "bgl".to_string()]
+            .into_iter()
+            .collect();
         assert_eq!(keys, expected.iter().collect());
         assert_eq!(pd["spark"]["n"], 2);
         assert_eq!(pd["spark"]["judge_survived"], 1);
@@ -869,17 +909,13 @@ mod tests {
             .iter()
             .map(|m| m["method"].as_str().unwrap())
             .collect();
-        assert_eq!(
-            names,
-            ["keep-severity", "lamr+span"].into_iter().collect()
-        );
+        assert_eq!(names, ["keep-severity", "lamr+span"].into_iter().collect());
         let pair: Vec<&Value> = blob["pairs"]
             .as_array()
             .unwrap()
             .iter()
             .filter(|p| {
-                p["method_a"].as_str() == Some("lamr+span")
-                    && p["metric"].as_str() == Some("judge")
+                p["method_a"].as_str() == Some("lamr+span") && p["metric"].as_str() == Some("judge")
             })
             .collect();
         assert_eq!(pair.len(), 1);
@@ -898,11 +934,23 @@ mod tests {
         let mut per_item: BTreeMap<String, Vec<Item>> = BTreeMap::new();
         per_item.insert(
             "lamr+span@iso3.0".into(),
-            vec![Item { doc_id: Some("x".into()), fact_type: "loghub:spark".into(), judge: true, exact: true, judge_error: false }],
+            vec![Item {
+                doc_id: Some("x".into()),
+                fact_type: "loghub:spark".into(),
+                judge: true,
+                exact: true,
+                judge_error: false,
+            }],
         );
         per_item.insert(
             "keep-severity@iso3.0".into(),
-            vec![Item { doc_id: Some("y".into()), fact_type: "loghub:spark".into(), judge: false, exact: false, judge_error: false }],
+            vec![Item {
+                doc_id: Some("y".into()),
+                fact_type: "loghub:spark".into(),
+                judge: false,
+                exact: false,
+                judge_error: false,
+            }],
         );
         assert!(analyze(
             &per_item,

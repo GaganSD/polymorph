@@ -58,7 +58,9 @@ fn fixture_ids_and_probs() -> (Vec<u32>, Vec<f32>) {
 }
 
 fn file_size_mb(p: &std::path::Path) -> f64 {
-    std::fs::metadata(p).map(|m| m.len() as f64 / 1e6).unwrap_or(0.0)
+    std::fs::metadata(p)
+        .map(|m| m.len() as f64 / 1e6)
+        .unwrap_or(0.0)
 }
 
 /// THE KEY TEST. Loads the INT8 graph via the same `LamrOnnx::load` the runtime
@@ -95,7 +97,10 @@ fn mb_v0_int8_tract_load_run_and_parity() {
         }
     };
     let load_ms = t0.elapsed().as_millis();
-    eprintln!("[int8] tract LOAD time: {load_ms} ms ({:.1} s)", load_ms as f64 / 1000.0);
+    eprintln!(
+        "[int8] tract LOAD time: {load_ms} ms ({:.1} s)",
+        load_ms as f64 / 1000.0
+    );
 
     // --- INFERENCE (windowed forward over the 2077-token fixture doc) ---
     let t1 = Instant::now();
@@ -109,7 +114,11 @@ fn mb_v0_int8_tract_load_run_and_parity() {
         mb_ids.len()
     );
 
-    assert_eq!(got.len(), want_probs.len(), "int8 prob count must match fixture");
+    assert_eq!(
+        got.len(),
+        want_probs.len(),
+        "int8 prob count must match fixture"
+    );
 
     // --- PARITY (INT8 will be LOOSER than fp32's 3e-6; just report it) ---
     let mut max_abs = 0f32;
@@ -127,7 +136,11 @@ fn mb_v0_int8_tract_load_run_and_parity() {
     let drop_set = |probs: &[f32]| -> std::collections::HashSet<usize> {
         let k = ((0.30 * probs.len() as f64).round() as usize).min(probs.len());
         let mut idx: Vec<usize> = (0..probs.len()).collect();
-        idx.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap_or(std::cmp::Ordering::Equal));
+        idx.sort_by(|&a, &b| {
+            probs[b]
+                .partial_cmp(&probs[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         idx.into_iter().take(k).collect()
     };
     let fp32_drops = drop_set(&want_probs);
@@ -174,12 +187,18 @@ fn mb_v0_fp32_baseline_timing() {
     let t0 = Instant::now();
     let model = LamrOnnx::load(&path).expect("load fp32 model");
     let load_ms = t0.elapsed().as_millis();
-    eprintln!("[fp32] tract LOAD time: {load_ms} ms ({:.1} s)", load_ms as f64 / 1000.0);
+    eprintln!(
+        "[fp32] tract LOAD time: {load_ms} ms ({:.1} s)",
+        load_ms as f64 / 1000.0
+    );
 
     let t1 = Instant::now();
     let got = model.forward_drop_probs(&mb_ids).expect("fp32 forward");
     let infer_ms = t1.elapsed().as_millis();
-    eprintln!("[fp32] inference time: {infer_ms} ms over {} tokens", mb_ids.len());
+    eprintln!(
+        "[fp32] inference time: {infer_ms} ms over {} tokens",
+        mb_ids.len()
+    );
 
     let mut max_abs = 0f32;
     for (a, b) in got.iter().zip(want_probs.iter()) {
@@ -222,7 +241,10 @@ fn mb_v0_dynbatch_tract_loads() {
     let t1 = Instant::now();
     let got = model.forward_drop_probs(&mb_ids).expect("dynbatch forward");
     let infer_ms = t1.elapsed().as_millis();
-    eprintln!("[dynbatch] inference time: {infer_ms} ms over {} tokens", mb_ids.len());
+    eprintln!(
+        "[dynbatch] inference time: {infer_ms} ms over {} tokens",
+        mb_ids.len()
+    );
 
     let mut max_abs = 0f32;
     for (a, b) in got.iter().zip(want_probs.iter()) {

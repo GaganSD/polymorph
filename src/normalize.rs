@@ -25,7 +25,10 @@ static NORMALIZE_PATTERNS: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
             "<TS>",
         ),
         (
-            Regex::new(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b").unwrap(),
+            Regex::new(
+                r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b",
+            )
+            .unwrap(),
             "<UUID>",
         ),
         (Regex::new(r"\b\d{1,3}(?:\.\d{1,3}){3}\b").unwrap(), "<IP>"),
@@ -221,10 +224,31 @@ mod tests {
     ];
 
     const REAL_VALUES: &[&str] = &[
-        "Database", "connection", "failure", "Security", "Scan", "Failure", "Jenkins",
-        "inventory", "Internal", "server", "error", "Unauthorized", "Optimize", "Resource",
-        "Exhaustion", "windows", "latest", "Python", "getUserAccountBalance", "synchronized",
-        "authentication", "getProfileByUserName", "team", "alpha", "pipeline",
+        "Database",
+        "connection",
+        "failure",
+        "Security",
+        "Scan",
+        "Failure",
+        "Jenkins",
+        "inventory",
+        "Internal",
+        "server",
+        "error",
+        "Unauthorized",
+        "Optimize",
+        "Resource",
+        "Exhaustion",
+        "windows",
+        "latest",
+        "Python",
+        "getUserAccountBalance",
+        "synchronized",
+        "authentication",
+        "getProfileByUserName",
+        "team",
+        "alpha",
+        "pipeline",
     ];
 
     #[test]

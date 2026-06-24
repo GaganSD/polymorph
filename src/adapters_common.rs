@@ -55,7 +55,9 @@ where
     }
     let mut written = 0;
     let mut skipped = 0;
-    let mut rdr = csv::ReaderBuilder::new().flexible(true).from_path(csv_path)?;
+    let mut rdr = csv::ReaderBuilder::new()
+        .flexible(true)
+        .from_path(csv_path)?;
     let headers = rdr.headers()?.clone();
     let mut out = std::io::BufWriter::new(std::fs::File::create(out_path)?);
     for record in rdr.records() {
@@ -116,12 +118,11 @@ pub fn iter_json_array_elements(content: &str, array_key: &str) -> Vec<Option<Va
     let mut element_depth: i64 = 0;
     let mut element_parts = String::new();
 
-    let emit = |parts: &str, out: &mut Vec<Option<Value>>| {
-        match serde_json::from_str::<Value>(parts) {
+    let emit =
+        |parts: &str, out: &mut Vec<Option<Value>>| match serde_json::from_str::<Value>(parts) {
             Ok(v) => out.push(Some(v)),
             Err(_) => out.push(None),
-        }
-    };
+        };
 
     let mut i = 0;
     while i < chars.len() {
@@ -270,7 +271,11 @@ mod tests {
     fn stream_json_array_basic() {
         let dir = tempfile::tempdir().unwrap();
         let json_path = dir.path().join("data.json");
-        std::fs::write(&json_path, r#"{"meta": 1, "data": [[1, "ok"], [2, "skip"]]}"#).unwrap();
+        std::fs::write(
+            &json_path,
+            r#"{"meta": 1, "data": [[1, "ok"], [2, "skip"]]}"#,
+        )
+        .unwrap();
         let out_path = dir.path().join("out.txt");
         let mut render = |item: &Value| {
             if item[1] == "ok" {

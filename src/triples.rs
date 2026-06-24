@@ -68,8 +68,7 @@ static EXTRACTORS: Lazy<Vec<Extractor>> = Lazy::new(|| {
         },
         Extractor {
             fact_type: "error_code",
-            re: Regex::new(r"\berrno[=:]\s*(\d+)\b|\berror code\s+(0x[0-9A-Fa-f]+|\d+)\b")
-                .unwrap(),
+            re: Regex::new(r"\berrno[=:]\s*(\d+)\b|\berror code\s+(0x[0-9A-Fa-f]+|\d+)\b").unwrap(),
             grp: 0,
             question: "What error code was reported?",
         },
@@ -93,7 +92,10 @@ static EXTRACTORS: Lazy<Vec<Extractor>> = Lazy::new(|| {
 const SEMANTIC_KEYS: &[(&str, &str)] = &[
     ("root_cause", "What was the root cause?"),
     ("resolution", "What resolution or action was applied?"),
-    ("resolution_action", "What resolution or action was applied?"),
+    (
+        "resolution_action",
+        "What resolution or action was applied?",
+    ),
     ("remediation", "What remediation was applied?"),
     ("reason", "What reason was given?"),
     ("failure_reason", "What was the failure reason?"),
@@ -130,8 +132,7 @@ fn candidates(text: &str) -> Vec<(String, String, String)> {
         for caps in ex.re.captures_iter(text) {
             let answer = if ex.grp == 0 {
                 // alternation: first non-None group
-                (1..caps.len())
-                    .find_map(|i| caps.get(i).map(|m| m.as_str().to_string()))
+                (1..caps.len()).find_map(|i| caps.get(i).map(|m| m.as_str().to_string()))
             } else {
                 caps.get(ex.grp).map(|m| m.as_str().to_string())
             };
@@ -191,14 +192,16 @@ fn best_from_candidates(
         }
     }
     // Fall back to the first candidate even if it repeats.
-    cands.first().map(|(fact_type, question, answer)| AnswerTriple {
-        doc_id: doc_id.to_string(),
-        text: text.to_string(),
-        question: question.clone(),
-        answer: answer.clone(),
-        fact_type: fact_type.clone(),
-        source: source.to_string(),
-    })
+    cands
+        .first()
+        .map(|(fact_type, question, answer)| AnswerTriple {
+            doc_id: doc_id.to_string(),
+            text: text.to_string(),
+            question: question.clone(),
+            answer: answer.clone(),
+            fact_type: fact_type.clone(),
+            source: source.to_string(),
+        })
 }
 
 /// Pick the highest-priority structural candidate whose answer is unique.
@@ -254,7 +257,10 @@ pub fn build_triples_from_text(
         .map(|ln| ln.to_string())
         .collect();
     let mut triples = Vec::new();
-    for (ci, chunk_lines) in line_windows(&lines, window_lines, stride).into_iter().enumerate() {
+    for (ci, chunk_lines) in line_windows(&lines, window_lines, stride)
+        .into_iter()
+        .enumerate()
+    {
         if let Some(mc) = max_chunks {
             if ci >= mc {
                 break;
@@ -319,7 +325,10 @@ pub fn collect_log_files(root: &Path) -> Vec<PathBuf> {
                     .map(|s| s.to_string_lossy().to_lowercase())
                     .unwrap_or_default();
                 if matches!(ext.as_str(), "log" | "txt" | "json" | "jsonl") {
-                    let name = p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                    let name = p
+                        .file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default();
                     if name.ends_with(".survive") || name.starts_with("potentialAnomalies") {
                         continue;
                     }
@@ -359,7 +368,11 @@ fn fixture_docs() -> Vec<(String, String)> {
     };
     let traceback = "Traceback (most recent call last): File \"app.py\", line 42, in run\n  File \"db.py\", line 10, in connect\nConnectionResetError: connection reset by peer".to_string();
     let servicenow = (0..5)
-        .map(|i| format!("29/2/2016 0{i}:23 incident=INC000004{i} state=New priority=3 category=Category 55"))
+        .map(|i| {
+            format!(
+                "29/2/2016 0{i}:23 incident=INC000004{i} state=New priority=3 category=Category 55"
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n");
     let api = {
@@ -367,9 +380,7 @@ fn fixture_docs() -> Vec<(String, String)> {
             .map(|i| format!("GET /v1/items 200 ok latency=12ms id=req{i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        text.push_str(
-            "\nPOST /v1/checkout HTTP status=503 service unavailable id=reqX9 retries=3",
-        );
+        text.push_str("\nPOST /v1/checkout HTTP status=503 service unavailable id=reqX9 retries=3");
         text
     };
     vec![
@@ -415,7 +426,10 @@ mod tests {
     fn curated_triple_fact_types_are_deterministic() {
         let triples = curated_triples();
         let types: Vec<&str> = triples.iter().map(|t| t.fact_type.as_str()).collect();
-        assert_eq!(types, vec!["request_id", "exception", "incident", "http_status"]);
+        assert_eq!(
+            types,
+            vec!["request_id", "exception", "incident", "http_status"]
+        );
         assert_eq!(triples[0].answer, "1000");
         assert_eq!(triples[1].answer, "ConnectionResetError");
         assert_eq!(triples[2].answer, "INC0000040");

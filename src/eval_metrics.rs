@@ -91,7 +91,11 @@ fn empty() -> RankingMetrics {
 /// the gold drop rate). `gold[i]` is 0/1. Tie order on equal drop-probs is
 /// resolved by ascending index (a stable sort), matching the common case of
 /// distinct continuous sigmoid outputs.
-pub fn ranking_metrics(drop_prob: &[f64], gold: &[i64], target_rate: Option<f64>) -> RankingMetrics {
+pub fn ranking_metrics(
+    drop_prob: &[f64],
+    gold: &[i64],
+    target_rate: Option<f64>,
+) -> RankingMetrics {
     let n = gold.len();
     if n == 0 {
         let mut m = empty();
@@ -255,7 +259,11 @@ mod tests {
         let m = ranking_metrics(&[0.9, 0.8, 0.3, 0.1], &[1, 0, 1, 0], Some(0.5));
         assert_eq!(m.tokens, 4);
         assert!(close(m.gold_rate, 0.5));
-        assert!(close(m.pr_auc, (1.0 + 2.0 / 3.0) / 2.0), "pr_auc={}", m.pr_auc);
+        assert!(
+            close(m.pr_auc, (1.0 + 2.0 / 3.0) / 2.0),
+            "pr_auc={}",
+            m.pr_auc
+        );
         assert!(close(m.roc_auc, 0.75), "roc_auc={}", m.roc_auc);
         assert!(close(m.best_f1, 0.8), "best_f1={}", m.best_f1);
         assert!(close(m.best_f1_thr, 0.3));
