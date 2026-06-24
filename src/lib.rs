@@ -5,6 +5,7 @@ pub mod bench;
 pub mod ccr;
 pub mod cli;
 pub mod compress;
+pub mod config;
 pub mod daac;
 pub mod db;
 pub mod dedup;
@@ -30,6 +31,7 @@ pub mod transport;
 pub mod triples;
 
 pub use ast::extract_ast_intervals;
+pub use config::expand_home_path;
 pub use daac::DaacScanner;
 pub use locking::build_mask;
 pub use tokenizer::token_spans;
@@ -48,7 +50,7 @@ pub enum Language {
 }
 
 impl Language {
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "json" => Some(Language::Json),
             "python" => Some(Language::Python),
@@ -76,6 +78,14 @@ impl Language {
     }
 }
 
+impl std::str::FromStr for Language {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s).ok_or(())
+    }
+}
+
 pub struct LockResult {
     pub token_ids: Vec<u32>,
     pub token_spans: Vec<(usize, usize)>,
@@ -92,16 +102,13 @@ pub struct LockResult {
     pub kept_tokens: usize,
 }
 
-/// Expand a leading `~/` in user-facing config paths. Environment variables are
-/// passed verbatim otherwise so absolute and relative paths keep their meaning.
-pub fn expand_home_path(path: &str) -> std::path::PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
-    }
-    std::path::PathBuf::from(path)
-}
+type LockCoreResult = (
+    Vec<u32>,
+    Vec<(usize, usize)>,
+    Vec<(usize, usize)>,
+    Vec<(usize, usize)>,
+    Vec<bool>,
+);
 
 /// Resolves the directory holding `tree-sitter-*.wasm` files. Honors the
 /// `POLYMORPH_GRAMMARS_DIR` env var, otherwise walks up from the binary
@@ -135,13 +142,7 @@ fn lock_core(
     language: Language,
     keywords: &[String],
     grammars_dir: &std::path::Path,
-) -> anyhow::Result<(
-    Vec<u32>,
-    Vec<(usize, usize)>,
-    Vec<(usize, usize)>,
-    Vec<(usize, usize)>,
-    Vec<bool>,
-)> {
+) -> anyhow::Result<LockCoreResult> {
     let (token_ids, token_spans) = tokenizer::token_spans(text)?;
     let mut scanner = daac::DaacScanner::build(keywords)?;
     let daac_token_intervals = scanner.scan(&token_ids);
@@ -214,9 +215,9 @@ mod tests {
 
     #[test]
     fn language_from_str_known() {
-        assert_eq!(Language::from_str("json"), Some(Language::Json));
-        assert_eq!(Language::from_str("python"), Some(Language::Python));
-        assert_eq!(Language::from_str("typescript"), None);
+        assert_eq!(Language::parse("json"), Some(Language::Json));
+        assert_eq!(Language::parse("python"), Some(Language::Python));
+        assert_eq!(Language::parse("typescript"), None);
     }
 
     #[test]

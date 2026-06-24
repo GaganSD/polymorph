@@ -64,7 +64,7 @@ impl PolymorphServer {
         Parameters(input): Parameters<LockMaskInput>,
     ) -> Result<CallToolResult, ErrorData> {
         check_lock_mask_input(&input).map_err(validation_err)?;
-        let lang = Language::from_str(&input.language).ok_or_else(|| {
+        let lang = Language::parse(&input.language).ok_or_else(|| {
             let language = input.language.clone();
             ErrorData::invalid_params(
                 format!("unsupported language: {language}"),
@@ -111,7 +111,7 @@ impl PolymorphServer {
         let lang = input
             .language
             .as_deref()
-            .and_then(Language::from_str)
+            .and_then(Language::parse)
             .unwrap_or(Language::PlainText);
         let original = match (input.text.clone(), input.path.clone()) {
             (Some(t), _) => t,

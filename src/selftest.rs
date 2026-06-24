@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use std::path::Path;
 
-use crate::{db, lamr, lock_payload, Language};
+use crate::{config, db, lock_payload, Language};
 
 /// Runs install-critical checks plus locking scenarios and prints a PASS/FAIL summary.
 pub fn run(grammars_dir: &Path) -> Result<()> {
@@ -59,17 +59,17 @@ fn db_case() -> Result<()> {
 }
 
 fn model_case() -> Result<()> {
-    match lamr::model_path_status() {
-        lamr::ModelPathStatus::Unset => {
+    match config::lamr_model_status() {
+        config::LamrModelStatus::Unset => {
             println!("model: unset (deterministic mode; compress_log returns used_model=false)");
             Ok(())
         }
-        lamr::ModelPathStatus::Found(path) => {
+        config::LamrModelStatus::Found(path) => {
             println!("model: found ({})", path.display());
             Ok(())
         }
-        lamr::ModelPathStatus::Empty => Err(anyhow!("POLYMORPH_LAMR_MODEL is set but empty")),
-        lamr::ModelPathStatus::Missing { raw, resolved } => Err(anyhow!(
+        config::LamrModelStatus::Empty => Err(anyhow!("POLYMORPH_LAMR_MODEL is set but empty")),
+        config::LamrModelStatus::Missing { raw, resolved } => Err(anyhow!(
             "POLYMORPH_LAMR_MODEL={raw:?} resolved to {}, but no file exists there",
             resolved.display()
         )),

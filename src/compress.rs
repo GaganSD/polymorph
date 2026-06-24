@@ -200,15 +200,15 @@ mod tests {
     fn no_model_returns_text_unchanged() {
         // With no POLYMORPH_LAMR_MODEL configured, compress_text must return the
         // input verbatim (never the random mock) so an audit log is never corrupted.
-        let prev = std::env::var(lamr::LAMR_MODEL_ENV).ok();
-        std::env::remove_var(lamr::LAMR_MODEL_ENV);
+        let prev = std::env::var(crate::config::LAMR_MODEL_ENV).ok();
+        std::env::remove_var(crate::config::LAMR_MODEL_ENV);
         let text = "ERROR db connection refused at pool.rs:42\nINFO heartbeat ok\n";
         let res = compress_text(text, Language::Json, &[], &grammars(), None, None).unwrap();
         assert_eq!(res.compressed, text, "no model → verbatim");
         assert!(!res.used_model);
         assert_eq!(res.input_tokens, res.output_tokens);
         if let Some(v) = prev {
-            std::env::set_var(lamr::LAMR_MODEL_ENV, v);
+            std::env::set_var(crate::config::LAMR_MODEL_ENV, v);
         }
     }
 

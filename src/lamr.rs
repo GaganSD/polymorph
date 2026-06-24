@@ -23,7 +23,7 @@
 //! invariant: `lock_mask[i] == true  =>  drop_mask[i] == false`.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::OnceLock;
 
 use rand::RngCore;
@@ -44,19 +44,6 @@ pub const LAMR_SEED: u64 = 0xA5C3_B6D2_E91F_4471;
 /// per unlocked token; the ONNX path drops this fraction of unlocked tokens when
 /// `decode.json` doesn't specify one.
 pub const DEFAULT_DROP_RATE: f64 = 0.30;
-
-/// Env var pointing at the exported `model.onnx`. If set and the file exists,
-/// [`apply_lamr`] uses the real ONNX path; otherwise it falls back to the mock.
-pub const LAMR_MODEL_ENV: &str = "POLYMORPH_LAMR_MODEL";
-
-/// Install-time status for the configured LaMR model path.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ModelPathStatus {
-    Unset,
-    Empty,
-    Missing { raw: String, resolved: PathBuf },
-    Found(PathBuf),
-}
 
 /// Default inference window used when the exported graph does NOT fix the
 /// sequence axis. The model is run over consecutive windows of this many tokens
@@ -583,10 +570,13 @@ impl LamrOnnx {
         mask.resize(t, false);
         let mask_tensor = tract_ndarray::Array2::from_shape_vec((1, t), mask)?.into_tensor();
 
-        let outputs = self
-            .model
-            .run(tvec!(ids_tensor.into(), mask_tensor.into()))
-            .map_err(|e| anyhow::anyhow!("onnx run failed: {e}"))?;
+        let outputs = match catch_unwind(AssertUnwindSafe(|| {
+            self.model.run(tvec!(ids_tensor.into(), mask_tensor.into()))
+        })) {
+            Ok(Ok(outputs)) => outputs,
+            Ok(Err(e)) => anyhow::bail!("onnx run failed: {e}"),
+            Err(_) => anyhow::bail!("onnx run panicked"),
+        };
         anyhow::ensure!(
             !outputs.is_empty(),
             "expected 1 onnx output (logits), got {}",
@@ -615,40 +605,12 @@ impl LamrOnnx {
 /// config (see the README `mcpServers` example), so the model is live once
 /// registered without any auto-discovery. Returns `None` when unset/missing →
 /// deterministic-only (`compress_text`) or mock (`apply_lamr`).
-pub fn model_path_status() -> ModelPathStatus {
-    let raw = match std::env::var(LAMR_MODEL_ENV) {
-        Ok(value) => value,
-        Err(_) => return ModelPathStatus::Unset,
-    };
-    if raw.is_empty() {
-        return ModelPathStatus::Empty;
+fn resolve_model_path() -> Option<std::path::PathBuf> {
+    let status = crate::config::lamr_model_status();
+    if let Some(message) = status.inactive_warning() {
+        eprintln!("{message}");
     }
-    let resolved = crate::expand_home_path(&raw);
-    if resolved.exists() {
-        ModelPathStatus::Found(resolved)
-    } else {
-        ModelPathStatus::Missing { raw, resolved }
-    }
-}
-
-fn resolve_model_path() -> Option<PathBuf> {
-    match model_path_status() {
-        ModelPathStatus::Found(path) => Some(path),
-        ModelPathStatus::Missing { raw, resolved } => {
-            eprintln!(
-                "[lamr] {LAMR_MODEL_ENV} is set to {raw:?}, resolved to {}, but the file does not exist; leaving compress_log in deterministic mode (used_model=false)",
-                resolved.display()
-            );
-            None
-        }
-        ModelPathStatus::Empty => {
-            eprintln!(
-                "[lamr] {LAMR_MODEL_ENV} is set but empty; leaving compress_log in deterministic mode (used_model=false)"
-            );
-            None
-        }
-        ModelPathStatus::Unset => None,
-    }
+    status.found_path().map(Path::to_path_buf)
 }
 
 /// Process-wide cached model. Loaded once on first use — model parse + tract
@@ -672,6 +634,19 @@ fn cached_model() -> Option<&'static LamrOnnx> {
             }
         })
         .as_ref()
+}
+
+fn run_model_mask<F>(operation: F, failure_action: &str) -> Option<Vec<bool>>
+where
+    F: FnOnce() -> anyhow::Result<Vec<bool>>,
+{
+    match operation() {
+        Ok(mask) => Some(mask),
+        Err(e) => {
+            eprintln!("[lamr] ONNX inference failed: {e}; {failure_action}");
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -699,12 +674,11 @@ pub fn apply_lamr(
 ) -> Vec<bool> {
     debug_assert_eq!(token_ids.len(), lock_mask.len());
     if let Some(model) = cached_model() {
-        match catch_unwind(AssertUnwindSafe(|| {
-            apply_lamr_with_model(token_ids, lock_mask, token_spans, text, model)
-        })) {
-            Ok(Ok(mask)) => return mask,
-            Ok(Err(e)) => eprintln!("[lamr] ONNX inference failed: {e}; using mock pruner"),
-            Err(_) => eprintln!("[lamr] ONNX inference panicked; using mock pruner"),
+        if let Some(mask) = run_model_mask(
+            || apply_lamr_with_model(token_ids, lock_mask, token_spans, text, model),
+            "using mock pruner",
+        ) {
+            return mask;
         }
     }
     apply_lamr_mock(token_ids, lock_mask)
@@ -788,23 +762,16 @@ pub fn apply_lamr_if_model(
     target_rate: Option<f64>,
 ) -> Option<Vec<bool>> {
     let model = cached_model()?;
-    match catch_unwind(AssertUnwindSafe(|| {
-        apply_lamr_with_model_rate(token_ids, lock_mask, token_spans, text, model, target_rate)
-    })) {
-        Ok(Ok(mask)) => Some(mask),
-        Ok(Err(e)) => {
-            eprintln!("[lamr] ONNX inference failed: {e}; leaving text uncompressed");
-            None
-        }
-        Err(_) => {
-            eprintln!("[lamr] ONNX inference panicked; leaving text uncompressed");
-            None
-        }
-    }
+    run_model_mask(
+        || apply_lamr_with_model_rate(token_ids, lock_mask, token_spans, text, model, target_rate),
+        "leaving text uncompressed",
+    )
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     // ---- mock backend ----
@@ -971,36 +938,6 @@ mod tests {
     fn decode_config_defaults_when_absent() {
         let c = DecodeConfig::from_json_path_or_default(Path::new("/nonexistent/decode.json"));
         assert!((c.default_target_rate - DEFAULT_DROP_RATE).abs() < 1e-9);
-    }
-
-    #[test]
-    fn model_path_status_reports_unset() {
-        let prev = std::env::var(LAMR_MODEL_ENV).ok();
-        std::env::remove_var(LAMR_MODEL_ENV);
-        assert_eq!(model_path_status(), ModelPathStatus::Unset);
-        if let Some(v) = prev {
-            std::env::set_var(LAMR_MODEL_ENV, v);
-        }
-    }
-
-    #[test]
-    fn model_path_status_expands_home_and_reports_missing() {
-        let prev = std::env::var(LAMR_MODEL_ENV).ok();
-        let file_name = format!("no-such-model-{}.onnx", uuid::Uuid::new_v4());
-        let raw = format!("~/.polymorph/{file_name}");
-        std::env::set_var(LAMR_MODEL_ENV, &raw);
-        let home = dirs::home_dir().expect("home dir");
-        assert_eq!(
-            model_path_status(),
-            ModelPathStatus::Missing {
-                raw,
-                resolved: home.join(".polymorph").join(file_name)
-            }
-        );
-        match prev {
-            Some(v) => std::env::set_var(LAMR_MODEL_ENV, v),
-            None => std::env::remove_var(LAMR_MODEL_ENV),
-        }
     }
 
     #[test]

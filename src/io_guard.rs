@@ -185,12 +185,12 @@ pub fn check_compress_log_input(input: &CompressLogInput) -> Result<()> {
         check_string_len(&format!("keywords[{i}]"), kw, MAX_KEYWORD_ITEM_LEN)?;
     }
     if let Some(r) = input.target_rate {
-        if !(r > 0.0 && r < 1.0) || !r.is_finite() {
+        if !(r > 0.0 && r < 1.0 && r.is_finite()) {
             return Err(anyhow!("target_rate must be a finite number in (0,1)"));
         }
     }
     if let Some(l) = &input.language {
-        if crate::Language::from_str(l).is_none() {
+        if crate::Language::parse(l).is_none() {
             return Err(anyhow!("unsupported language: {l} (use text|json|python)"));
         }
     }

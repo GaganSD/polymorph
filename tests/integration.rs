@@ -142,9 +142,9 @@ fn empty_text_produces_empty_mask() {
 
 #[test]
 fn unsupported_language_handled_at_lib_level() {
-    assert!(Language::from_str("rust").is_none());
-    assert!(Language::from_str("json").is_some());
-    assert!(Language::from_str("python").is_some());
+    assert!(Language::parse("rust").is_none());
+    assert!(Language::parse("json").is_some());
+    assert!(Language::parse("python").is_some());
 }
 
 #[test]
