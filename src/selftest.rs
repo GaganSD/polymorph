@@ -1,12 +1,21 @@
 use anyhow::{anyhow, Result};
 use std::path::Path;
 
-use crate::{lock_payload, Language};
+use crate::{db, lamr, lock_payload, Language};
 
-/// Runs the three end-to-end scenarios and prints a one-line PASS/FAIL summary.
+/// Runs install-critical checks plus locking scenarios and prints a PASS/FAIL summary.
 pub fn run(grammars_dir: &Path) -> Result<()> {
     let mut failures: Vec<String> = Vec::new();
 
+    if let Err(e) = grammars_case(grammars_dir) {
+        failures.push(format!("grammars: {e}"));
+    }
+    if let Err(e) = db_case() {
+        failures.push(format!("db: {e}"));
+    }
+    if let Err(e) = model_case() {
+        failures.push(format!("model: {e}"));
+    }
     if let Err(e) = json_case(grammars_dir) {
         failures.push(format!("json: {e}"));
     }
@@ -18,13 +27,52 @@ pub fn run(grammars_dir: &Path) -> Result<()> {
     }
 
     if failures.is_empty() {
-        println!("PASS: all 3 scenarios");
+        println!("PASS: install checks + 3 locking scenarios");
         Ok(())
     } else {
         for f in &failures {
             eprintln!("FAIL: {f}");
         }
         Err(anyhow!("selftest failed ({} failure(s))", failures.len()))
+    }
+}
+
+fn grammars_case(g: &Path) -> Result<()> {
+    if !g.is_dir() {
+        return Err(anyhow!("{} is not a directory", g.display()));
+    }
+    for file in ["tree-sitter-json.wasm", "tree-sitter-python.wasm"] {
+        let path = g.join(file);
+        if !path.is_file() {
+            return Err(anyhow!("missing {}", path.display()));
+        }
+    }
+    println!("grammars: ok ({})", g.display());
+    Ok(())
+}
+
+fn db_case() -> Result<()> {
+    let path = db::default_path()?;
+    let _db = db::open_pool(&path)?;
+    println!("db: ok ({})", path.display());
+    Ok(())
+}
+
+fn model_case() -> Result<()> {
+    match lamr::model_path_status() {
+        lamr::ModelPathStatus::Unset => {
+            println!("model: unset (deterministic mode; compress_log returns used_model=false)");
+            Ok(())
+        }
+        lamr::ModelPathStatus::Found(path) => {
+            println!("model: found ({})", path.display());
+            Ok(())
+        }
+        lamr::ModelPathStatus::Empty => Err(anyhow!("POLYMORPH_LAMR_MODEL is set but empty")),
+        lamr::ModelPathStatus::Missing { raw, resolved } => Err(anyhow!(
+            "POLYMORPH_LAMR_MODEL={raw:?} resolved to {}, but no file exists there",
+            resolved.display()
+        )),
     }
 }
 
@@ -105,7 +153,9 @@ def hello(name):
     // Docstring prose: pick a word inside the docstring and check at least one
     // unlocked token covers it.
     let prose = "docstring is filler prose";
-    let pos = text.find(prose).ok_or_else(|| anyhow!("prose not in fixture"))?;
+    let pos = text
+        .find(prose)
+        .ok_or_else(|| anyhow!("prose not in fixture"))?;
     let prose_range = pos..(pos + prose.len());
     let any_unlocked = res
         .token_spans
@@ -118,7 +168,9 @@ def hello(name):
 
     // Comment body should have unlocked tokens.
     let comment = "comment body also unlocked";
-    let pos = text.find(comment).ok_or_else(|| anyhow!("comment not in fixture"))?;
+    let pos = text
+        .find(comment)
+        .ok_or_else(|| anyhow!("comment not in fixture"))?;
     let c_range = pos..(pos + comment.len());
     let any_unlocked = res
         .token_spans
@@ -134,12 +186,7 @@ def hello(name):
 
 fn invariants_case(g: &Path) -> Result<()> {
     let text = r#"{"a":[1,2,3],"b":"text"}"#;
-    let res = lock_payload(
-        text,
-        Language::Json,
-        &["needle-not-present".to_string()],
-        g,
-    )?;
+    let res = lock_payload(text, Language::Json, &["needle-not-present".to_string()], g)?;
 
     if res.mask.len() != res.token_spans.len() {
         return Err(anyhow!("mask length mismatch"));

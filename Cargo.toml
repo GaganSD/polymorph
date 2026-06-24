@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "Polymorph: lossless context compressor MCP server (token-locking pipeline)"
+repository = "https://github.com/GaganSD/lulu-polymorph"
+readme = "README.md"
 
 [lib]
 name = "polymorph"

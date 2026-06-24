@@ -22,6 +22,7 @@
 //! with the lock-aware span decode ([`span_drop_bits`]). Both honour the
 //! invariant: `lock_mask[i] == true  =>  drop_mask[i] == false`.
 
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -47,6 +48,15 @@ pub const DEFAULT_DROP_RATE: f64 = 0.30;
 /// Env var pointing at the exported `model.onnx`. If set and the file exists,
 /// [`apply_lamr`] uses the real ONNX path; otherwise it falls back to the mock.
 pub const LAMR_MODEL_ENV: &str = "POLYMORPH_LAMR_MODEL";
+
+/// Install-time status for the configured LaMR model path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelPathStatus {
+    Unset,
+    Empty,
+    Missing { raw: String, resolved: PathBuf },
+    Found(PathBuf),
+}
 
 /// Default inference window used when the exported graph does NOT fix the
 /// sequence axis. The model is run over consecutive windows of this many tokens
@@ -140,7 +150,11 @@ fn sigmoid(x: f32) -> f32 {
 /// global-bias oscillation that made the old argmax decode look like it
 /// collapsed. Deterministic: ties in probability break by original token order
 /// (stable sort).
-pub fn target_rate_drop_bits(drop_probs: &[f32], lock_mask: &[bool], target_rate: f64) -> Vec<bool> {
+pub fn target_rate_drop_bits(
+    drop_probs: &[f32],
+    lock_mask: &[bool],
+    target_rate: f64,
+) -> Vec<bool> {
     assert_eq!(
         drop_probs.len(),
         lock_mask.len(),
@@ -213,9 +227,7 @@ impl SpanAggregator {
         match self {
             SpanAggregator::Min => probs.iter().copied().fold(f32::INFINITY, f32::min),
             SpanAggregator::Max => probs.iter().copied().fold(f32::NEG_INFINITY, f32::max),
-            SpanAggregator::Mean => {
-                probs.iter().copied().sum::<f32>() / probs.len() as f32
-            }
+            SpanAggregator::Mean => probs.iter().copied().sum::<f32>() / probs.len() as f32,
         }
     }
 }
@@ -472,9 +484,9 @@ impl LamrOnnx {
     /// directory (optional → default target rate). External-weights files
     /// (`model.onnx.data`) are resolved by tract relative to the model path.
     pub fn load(model_path: &Path) -> anyhow::Result<Self> {
-        let dir = model_path
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("model path has no parent dir: {}", model_path.display()))?;
+        let dir = model_path.parent().ok_or_else(|| {
+            anyhow::anyhow!("model path has no parent dir: {}", model_path.display())
+        })?;
         Self::load_with_decode(model_path, &dir.join("decode.json"))
     }
 
@@ -553,7 +565,10 @@ impl LamrOnnx {
     /// the window runs at its true length with an all-true mask.
     fn forward_window(&self, chunk: &[u32]) -> anyhow::Result<Vec<f32>> {
         let l = chunk.len();
-        debug_assert!(l > 0 && l <= self.window, "window chunk len {l} out of bounds");
+        debug_assert!(
+            l > 0 && l <= self.window,
+            "window chunk len {l} out of bounds"
+        );
         // Tensor sequence length: the fixed export demands exactly `self.window`;
         // the dynamic export takes the chunk's true length.
         let t = if self.fixed_seq { self.window } else { l };
@@ -600,13 +615,40 @@ impl LamrOnnx {
 /// config (see the README `mcpServers` example), so the model is live once
 /// registered without any auto-discovery. Returns `None` when unset/missing →
 /// deterministic-only (`compress_text`) or mock (`apply_lamr`).
-fn resolve_model_path() -> Option<PathBuf> {
-    let p = std::env::var(LAMR_MODEL_ENV).ok()?;
-    if p.is_empty() {
-        return None;
+pub fn model_path_status() -> ModelPathStatus {
+    let raw = match std::env::var(LAMR_MODEL_ENV) {
+        Ok(value) => value,
+        Err(_) => return ModelPathStatus::Unset,
+    };
+    if raw.is_empty() {
+        return ModelPathStatus::Empty;
     }
-    let pb = PathBuf::from(p);
-    pb.exists().then_some(pb)
+    let resolved = crate::expand_home_path(&raw);
+    if resolved.exists() {
+        ModelPathStatus::Found(resolved)
+    } else {
+        ModelPathStatus::Missing { raw, resolved }
+    }
+}
+
+fn resolve_model_path() -> Option<PathBuf> {
+    match model_path_status() {
+        ModelPathStatus::Found(path) => Some(path),
+        ModelPathStatus::Missing { raw, resolved } => {
+            eprintln!(
+                "[lamr] {LAMR_MODEL_ENV} is set to {raw:?}, resolved to {}, but the file does not exist; leaving compress_log in deterministic mode (used_model=false)",
+                resolved.display()
+            );
+            None
+        }
+        ModelPathStatus::Empty => {
+            eprintln!(
+                "[lamr] {LAMR_MODEL_ENV} is set but empty; leaving compress_log in deterministic mode (used_model=false)"
+            );
+            None
+        }
+        ModelPathStatus::Unset => None,
+    }
 }
 
 /// Process-wide cached model. Loaded once on first use — model parse + tract
@@ -657,11 +699,12 @@ pub fn apply_lamr(
 ) -> Vec<bool> {
     debug_assert_eq!(token_ids.len(), lock_mask.len());
     if let Some(model) = cached_model() {
-        match apply_lamr_with_model(token_ids, lock_mask, token_spans, text, model) {
-            Ok(mask) => return mask,
-            // Configured model failed at runtime (oversize input, shape mismatch,
-            // ...). Log it (degraded inference must be observable) and fall back.
-            Err(e) => eprintln!("[lamr] ONNX inference failed: {e}; using mock pruner"),
+        match catch_unwind(AssertUnwindSafe(|| {
+            apply_lamr_with_model(token_ids, lock_mask, token_spans, text, model)
+        })) {
+            Ok(Ok(mask)) => return mask,
+            Ok(Err(e)) => eprintln!("[lamr] ONNX inference failed: {e}; using mock pruner"),
+            Err(_) => eprintln!("[lamr] ONNX inference panicked; using mock pruner"),
         }
     }
     apply_lamr_mock(token_ids, lock_mask)
@@ -745,10 +788,16 @@ pub fn apply_lamr_if_model(
     target_rate: Option<f64>,
 ) -> Option<Vec<bool>> {
     let model = cached_model()?;
-    match apply_lamr_with_model_rate(token_ids, lock_mask, token_spans, text, model, target_rate) {
-        Ok(mask) => Some(mask),
-        Err(e) => {
+    match catch_unwind(AssertUnwindSafe(|| {
+        apply_lamr_with_model_rate(token_ids, lock_mask, token_spans, text, model, target_rate)
+    })) {
+        Ok(Ok(mask)) => Some(mask),
+        Ok(Err(e)) => {
             eprintln!("[lamr] ONNX inference failed: {e}; leaving text uncompressed");
+            None
+        }
+        Err(_) => {
+            eprintln!("[lamr] ONNX inference panicked; leaving text uncompressed");
             None
         }
     }
@@ -888,7 +937,9 @@ mod tests {
         let probs = vec![0.1, 0.9, 0.5, 0.7];
         let lock = vec![false, false, false, false];
         // rate 0 -> drop nothing.
-        assert!(target_rate_drop_bits(&probs, &lock, 0.0).iter().all(|&d| !d));
+        assert!(target_rate_drop_bits(&probs, &lock, 0.0)
+            .iter()
+            .all(|&d| !d));
         // rate 1 -> drop every unlocked token.
         assert!(target_rate_drop_bits(&probs, &lock, 1.0).iter().all(|&d| d));
         // rate clamps above 1.
@@ -911,13 +962,45 @@ mod tests {
     fn target_rate_all_locked_drops_nothing() {
         let probs = vec![0.9, 0.9, 0.9];
         let lock = vec![true, true, true];
-        assert!(target_rate_drop_bits(&probs, &lock, 0.5).iter().all(|&d| !d));
+        assert!(target_rate_drop_bits(&probs, &lock, 0.5)
+            .iter()
+            .all(|&d| !d));
     }
 
     #[test]
     fn decode_config_defaults_when_absent() {
         let c = DecodeConfig::from_json_path_or_default(Path::new("/nonexistent/decode.json"));
         assert!((c.default_target_rate - DEFAULT_DROP_RATE).abs() < 1e-9);
+    }
+
+    #[test]
+    fn model_path_status_reports_unset() {
+        let prev = std::env::var(LAMR_MODEL_ENV).ok();
+        std::env::remove_var(LAMR_MODEL_ENV);
+        assert_eq!(model_path_status(), ModelPathStatus::Unset);
+        if let Some(v) = prev {
+            std::env::set_var(LAMR_MODEL_ENV, v);
+        }
+    }
+
+    #[test]
+    fn model_path_status_expands_home_and_reports_missing() {
+        let prev = std::env::var(LAMR_MODEL_ENV).ok();
+        let file_name = format!("no-such-model-{}.onnx", uuid::Uuid::new_v4());
+        let raw = format!("~/.polymorph/{file_name}");
+        std::env::set_var(LAMR_MODEL_ENV, &raw);
+        let home = dirs::home_dir().expect("home dir");
+        assert_eq!(
+            model_path_status(),
+            ModelPathStatus::Missing {
+                raw,
+                resolved: home.join(".polymorph").join(file_name)
+            }
+        );
+        match prev {
+            Some(v) => std::env::set_var(LAMR_MODEL_ENV, v),
+            None => std::env::remove_var(LAMR_MODEL_ENV),
+        }
     }
 
     #[test]
@@ -958,7 +1041,11 @@ mod tests {
         // words so the budget naturally targets the filler.
         // Word 0 = "needle" (the needle), words 2..=4 = filler.
         let groups = super::word_spans(text, &spans);
-        assert!(groups.len() >= 5, "expected >=5 words, got {}", groups.len());
+        assert!(
+            groups.len() >= 5,
+            "expected >=5 words, got {}",
+            groups.len()
+        );
         let mut probs = vec![0.1f32; n];
         // One hot token inside the needle word.
         let needle_tok = groups[0][0];
@@ -1068,7 +1155,10 @@ mod tests {
         let achieved = dropped as f64 / n as f64;
         // Atomic whole-word drops can't land exactly on k, but must be close and
         // never exceed the budget.
-        assert!(dropped <= (rate * n as f64).round() as usize, "exceeded budget");
+        assert!(
+            dropped <= (rate * n as f64).round() as usize,
+            "exceeded budget"
+        );
         assert!(
             (achieved - rate).abs() < 0.20,
             "achieved drop {achieved} too far from target {rate}"
@@ -1144,7 +1234,10 @@ mod tests {
     #[test]
     fn span_chunk_granularity_groups_fixed_runs() {
         let groups = super::chunk_spans(10, 3);
-        assert_eq!(groups, vec![vec![0, 1, 2], vec![3, 4, 5], vec![6, 7, 8], vec![9]]);
+        assert_eq!(
+            groups,
+            vec![vec![0, 1, 2], vec![3, 4, 5], vec![6, 7, 8], vec![9]]
+        );
         // chunk_size 0 clamps to 1.
         assert_eq!(super::chunk_spans(3, 0), vec![vec![0], vec![1], vec![2]]);
     }
@@ -1156,7 +1249,14 @@ mod tests {
         let (ids, spans) = crate::tokenizer::token_spans(text).unwrap();
         let lock = vec![false; ids.len()];
         let probs = vec![0.9f32; ids.len()];
-        let drop = span_drop_bits(&probs, &lock, &spans, text, 0.0, SpanDecodeConfig::default());
+        let drop = span_drop_bits(
+            &probs,
+            &lock,
+            &spans,
+            text,
+            0.0,
+            SpanDecodeConfig::default(),
+        );
         assert!(drop.iter().all(|&d| !d), "rate 0 must drop nothing");
     }
 
@@ -1182,8 +1282,7 @@ mod tests {
 
         // A real text so word-grouping has byte-spans to work with.
         let text = "This page seems to point to the";
-        let (token_ids, token_spans) =
-            crate::tokenizer::token_spans(text).expect("tokenize");
+        let (token_ids, token_spans) = crate::tokenizer::token_spans(text).expect("tokenize");
         // Lock every third token (synthetic mix of locked / unlocked positions).
         let lock_mask: Vec<bool> = (0..token_ids.len()).map(|i| i % 3 == 0).collect();
 
@@ -1221,7 +1320,10 @@ mod tests {
     fn onnx_forward_drop_probs_are_in_unit_interval() {
         let path = smoke_model_path();
         if !path.exists() {
-            eprintln!("skipping onnx prob-range test: {} not found", path.display());
+            eprintln!(
+                "skipping onnx prob-range test: {} not found",
+                path.display()
+            );
             return;
         }
         let model = LamrOnnx::load(&path).expect("load smoke model");
@@ -1237,13 +1339,15 @@ mod tests {
     fn onnx_all_unlocked_returns_full_length() {
         let path = smoke_model_path();
         if !path.exists() {
-            eprintln!("skipping onnx full-length test: {} not found", path.display());
+            eprintln!(
+                "skipping onnx full-length test: {} not found",
+                path.display()
+            );
             return;
         }
         let model = LamrOnnx::load(&path).expect("load smoke model");
         let text = "alpha beta gamma delta epsilon";
-        let (token_ids, token_spans) =
-            crate::tokenizer::token_spans(text).expect("tokenize");
+        let (token_ids, token_spans) = crate::tokenizer::token_spans(text).expect("tokenize");
         let lock_mask: Vec<bool> = vec![false; token_ids.len()];
         let mask = apply_lamr_with_model(&token_ids, &lock_mask, &token_spans, text, &model)
             .expect("apply");
@@ -1261,9 +1365,15 @@ mod tests {
         }
         let model = LamrOnnx::load(&path).expect("load smoke model");
         // > 4 windows at the default 512; exercises the partial-last-window path.
-        let long: Vec<u32> = (0..(model.window * 4 + 7)).map(|i| (i % 1000) as u32).collect();
+        let long: Vec<u32> = (0..(model.window * 4 + 7))
+            .map(|i| (i % 1000) as u32)
+            .collect();
         let probs = model.forward_drop_probs(&long).expect("windowed forward");
-        assert_eq!(probs.len(), long.len(), "windowed scoring must cover every token");
+        assert_eq!(
+            probs.len(),
+            long.len(),
+            "windowed scoring must cover every token"
+        );
         assert!(
             probs.iter().all(|&p| (0.0..=1.0).contains(&p)),
             "all windowed drop-probs must be in [0,1]"

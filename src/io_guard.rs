@@ -73,14 +73,17 @@ pub const MAX_PATH_LEN: usize = 4_096;
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CompressLogInput {
     /// Inline log text (≤ 1 MB). Provide this OR `path`, not both.
+    #[schemars(length(max = MAX_TEXT_LEN))]
     #[serde(default)]
     pub text: Option<String>,
     /// Local filesystem path to read the log from — use this for large logs
     /// (≤ 64 MB) that exceed the inline text/payload caps. Provide this OR `text`.
+    #[schemars(length(max = MAX_PATH_LEN))]
     #[serde(default)]
     pub path: Option<String>,
     /// Structural-lock grammar: "text" (default, no AST locking — correct for raw
     /// logs), "json", or "python".
+    #[schemars(length(max = 16))]
     #[serde(default)]
     pub language: Option<String>,
     /// Extra substrings to force-keep (API keys, resource ids, anything the model

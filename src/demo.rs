@@ -1,19 +1,58 @@
 use anyhow::{anyhow, Result};
 use std::path::Path;
 
-use crate::{ccr, db, lcm, tokenizer};
+use crate::{ccr, compress, db, dedup, lcm, tokenizer, Language};
+
+const SAMPLE_LOG: &str = include_str!("../examples/sample.log");
 
 /// `polymorph-mcp --demo <kind>` entry point. Prints visible output so a new
 /// user can confirm the system works in under 10 seconds.
-pub fn run(kind: &str, _grammars_dir: &Path) -> Result<()> {
+pub fn run(kind: &str, grammars_dir: &Path) -> Result<()> {
     match kind {
+        "compress" => demo_compress(grammars_dir),
         "lcm-loop" => demo_lcm_loop(),
         "ccr" => demo_ccr(),
         "" => Err(anyhow!(
-            "missing demo kind. try: polymorph-mcp --demo lcm-loop  OR  --demo ccr"
+            "missing demo kind. try: polymorph-mcp --demo compress  OR  --demo lcm-loop  OR  --demo ccr"
         )),
-        other => Err(anyhow!("unknown demo: {other}. try `lcm-loop` or `ccr`")),
+        other => Err(anyhow!(
+            "unknown demo: {other}. try `compress`, `lcm-loop`, or `ccr`"
+        )),
     }
+}
+
+fn demo_compress(grammars_dir: &Path) -> Result<()> {
+    println!("Compression demo: examples/sample.log");
+    println!("---");
+
+    let input_tokens = tokenizer::count_tokens(SAMPLE_LOG)?;
+    let plan = dedup::dedup_plan(SAMPLE_LOG, dedup::DedupOpts::default());
+    let res = compress::compress_text(
+        &plan.reduced,
+        Language::PlainText,
+        &[],
+        grammars_dir,
+        None,
+        Some(65_536),
+    )?;
+    let overall_ratio = input_tokens as f64 / res.output_tokens.max(1) as f64;
+    let needle = "DiskControllerFirmwareDeadlock";
+
+    println!("input_tokens: {input_tokens}");
+    println!("output_tokens: {}", res.output_tokens);
+    println!("ratio: {overall_ratio:.2}x");
+    println!("dedup_elided_lines: {}", plan.elided_line_count());
+    println!("used_model: {}", res.used_model);
+    println!("needle_preserved: {}", res.compressed.contains(needle));
+    println!("--- compressed preview ---");
+    println!("{}", res.compressed.trim());
+    println!("---");
+    if res.used_model {
+        println!("done. LaMR model was active.");
+    } else {
+        println!("done. Deterministic mode ran; set POLYMORPH_LAMR_MODEL to enable LaMR.");
+    }
+    Ok(())
 }
 
 fn demo_lcm_loop() -> Result<()> {

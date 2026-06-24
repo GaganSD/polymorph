@@ -313,22 +313,12 @@ impl ServerHandler for PolymorphServer {
     }
 }
 
-/// Expand a leading `~/` to the user's home dir; otherwise pass through.
-fn expand_tilde(p: &str) -> PathBuf {
-    if let Some(rest) = p.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
-    }
-    PathBuf::from(p)
-}
-
 /// Read a local log file for `compress_log`, bounded to [`MAX_LOG_FILE_BYTES`] and
 /// required to be valid UTF-8. The server is local/single-user, so reading a
 /// caller-named local path is in-scope (the same trust model as the SQLite cache).
 fn read_log_file(path: &str) -> anyhow::Result<String> {
     use std::io::Read;
-    let pb = expand_tilde(path);
+    let pb = crate::expand_home_path(path);
     let meta = std::fs::metadata(&pb).map_err(|e| anyhow::anyhow!("stat {}: {e}", pb.display()))?;
     if !meta.is_file() {
         anyhow::bail!("{} is not a regular file", pb.display());

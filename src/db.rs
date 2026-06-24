@@ -53,7 +53,7 @@ impl DbHandle {
 /// `~/.polymorph/cache.db`. Creates the parent directory if missing.
 pub fn default_path() -> Result<PathBuf> {
     if let Ok(env) = std::env::var("POLYMORPH_DB_PATH") {
-        return Ok(PathBuf::from(env));
+        return Ok(crate::expand_home_path(&env));
     }
     let home = dirs::home_dir().ok_or_else(|| anyhow!("could not determine home directory"))?;
     Ok(home.join(".polymorph").join("cache.db"))
@@ -187,6 +187,21 @@ mod tests {
         assert_eq!(
             default_path().unwrap(),
             PathBuf::from("/tmp/some/specific/db")
+        );
+        match prev {
+            Some(v) => std::env::set_var("POLYMORPH_DB_PATH", v),
+            None => std::env::remove_var("POLYMORPH_DB_PATH"),
+        }
+    }
+
+    #[test]
+    fn default_path_expands_home_env_var() {
+        let prev = std::env::var("POLYMORPH_DB_PATH").ok();
+        std::env::set_var("POLYMORPH_DB_PATH", "~/.polymorph/test-cache.db");
+        let home = dirs::home_dir().expect("home dir");
+        assert_eq!(
+            default_path().unwrap(),
+            home.join(".polymorph").join("test-cache.db")
         );
         match prev {
             Some(v) => std::env::set_var("POLYMORPH_DB_PATH", v),

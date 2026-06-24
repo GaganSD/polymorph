@@ -1,0 +1,11 @@
+2026-06-24T16:00:00Z INFO svc=api path=/healthz status=200 region=us-east-1 cache=hit
+2026-06-24T16:00:01Z INFO svc=api path=/healthz status=200 region=us-east-1 cache=hit
+2026-06-24T16:00:02Z INFO svc=api path=/healthz status=200 region=us-east-1 cache=hit
+2026-06-24T16:00:03Z INFO svc=api path=/healthz status=200 region=us-east-1 cache=hit
+2026-06-24T16:00:04Z INFO svc=api path=/healthz status=200 region=us-east-1 cache=hit
+2026-06-24T16:00:05Z ERROR svc=payments txn=TX-88f3 status=503 err=DiskControllerFirmwareDeadlock host=10.4.2.9 trace_id=6f1d3b2a9c
+2026-06-24T16:00:06Z INFO svc=api path=/healthz status=200 region=us-east-1 cache=hit
+2026-06-24T16:00:07Z INFO svc=api path=/healthz status=200 region=us-east-1 cache=hit
+2026-06-24T16:00:08Z INFO svc=api path=/healthz status=200 region=us-east-1 cache=hit
+2026-06-24T16:00:09Z INFO svc=api path=/healthz status=200 region=us-east-1 cache=hit
+2026-06-24T16:00:10Z INFO svc=api path=/healthz status=200 region=us-east-1 cache=hit

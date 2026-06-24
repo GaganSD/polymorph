@@ -8,11 +8,11 @@ pub mod compress;
 pub mod daac;
 pub mod db;
 pub mod dedup;
-pub mod eval_metrics;
 pub mod demo;
+pub mod eval_metrics;
 pub mod io_guard;
-pub mod lamr;
 pub mod label_ceiling;
+pub mod lamr;
 pub mod lcm;
 pub mod locking;
 pub mod loghub;
@@ -92,13 +92,24 @@ pub struct LockResult {
     pub kept_tokens: usize,
 }
 
+/// Expand a leading `~/` in user-facing config paths. Environment variables are
+/// passed verbatim otherwise so absolute and relative paths keep their meaning.
+pub fn expand_home_path(path: &str) -> std::path::PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    std::path::PathBuf::from(path)
+}
+
 /// Resolves the directory holding `tree-sitter-*.wasm` files. Honors the
 /// `POLYMORPH_GRAMMARS_DIR` env var, otherwise walks up from the binary
 /// location (`target/debug/polymorph-mcp` → repo root → `grammars/`), and
 /// finally falls back to a relative `grammars` path.
 pub fn resolve_grammars_dir() -> std::path::PathBuf {
     if let Ok(env) = std::env::var("POLYMORPH_GRAMMARS_DIR") {
-        return std::path::PathBuf::from(env);
+        return expand_home_path(&env);
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(candidate) = exe
@@ -158,7 +169,7 @@ pub fn lock_payload(
 ) -> anyhow::Result<LockResult> {
     let (token_ids, token_spans, ast_intervals, daac_token_intervals, mask) =
         lock_core(text, language, keywords, grammars_dir)?;
-    let drop_mask = lamr::apply_lamr(&token_ids, &mask, &token_spans, text);
+    let drop_mask = lamr::apply_lamr_mock(&token_ids, &mask);
     let kept_tokens = drop_mask.iter().filter(|&&d| !d).count();
     Ok(LockResult {
         token_ids,
@@ -213,7 +224,10 @@ mod tests {
         assert_eq!(Language::Json.name(), "json");
         assert_eq!(Language::Python.name(), "python");
         assert_eq!(Language::Json.grammar_filename(), "tree-sitter-json.wasm");
-        assert_eq!(Language::Python.grammar_filename(), "tree-sitter-python.wasm");
+        assert_eq!(
+            Language::Python.grammar_filename(),
+            "tree-sitter-python.wasm"
+        );
     }
 
     #[test]
@@ -222,6 +236,18 @@ mod tests {
         std::env::set_var("POLYMORPH_GRAMMARS_DIR", "/tmp/some/path");
         let resolved = resolve_grammars_dir();
         assert_eq!(resolved, std::path::PathBuf::from("/tmp/some/path"));
+        match prev {
+            Some(v) => std::env::set_var("POLYMORPH_GRAMMARS_DIR", v),
+            None => std::env::remove_var("POLYMORPH_GRAMMARS_DIR"),
+        }
+    }
+
+    #[test]
+    fn resolve_grammars_dir_expands_home_env_var() {
+        let prev = std::env::var("POLYMORPH_GRAMMARS_DIR").ok();
+        std::env::set_var("POLYMORPH_GRAMMARS_DIR", "~/polymorph-grammars");
+        let home = dirs::home_dir().expect("home dir");
+        assert_eq!(resolve_grammars_dir(), home.join("polymorph-grammars"));
         match prev {
             Some(v) => std::env::set_var("POLYMORPH_GRAMMARS_DIR", v),
             None => std::env::remove_var("POLYMORPH_GRAMMARS_DIR"),
@@ -240,7 +266,10 @@ mod tests {
     fn compress_deterministic_drops_nothing() {
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("grammars");
         let res = compress_deterministic(r#"{"a":1,"b":2}"#, Language::Json, &[], &dir).unwrap();
-        assert!(res.drop_mask.iter().all(|&d| !d), "Identity pruner drops nothing");
+        assert!(
+            res.drop_mask.iter().all(|&d| !d),
+            "Identity pruner drops nothing"
+        );
         assert_eq!(res.kept_tokens, res.token_ids.len());
     }
 
@@ -251,10 +280,7 @@ mod tests {
         let res = lock_payload(text, Language::Json, &["secret".to_string()], &dir).unwrap();
         for (i, &locked) in res.mask.iter().enumerate() {
             let (s, e) = res.token_spans[i];
-            let in_ast = res
-                .ast_intervals
-                .iter()
-                .any(|&(a, b)| a < e && s < b);
+            let in_ast = res.ast_intervals.iter().any(|&(a, b)| a < e && s < b);
             let in_daac = res
                 .daac_token_intervals
                 .iter()
