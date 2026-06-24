@@ -104,8 +104,8 @@ Output JSONL schema (per chunk): `original`, `outputs{teacher->text}`,
 ```bash
 # QC: drop top-VR (hallucination) then top-AG (alignment failure)
 #   filter operates on the distilled JSONL (see polymorph_lamr/qc/)
-# label: LCS alignment -> cl100k keep/drop mask + AST hop-decay split
-# train: joint dual-CRF NLL with the learned head gate
+# label: byte alignment -> keep/drop mask + AST hop-decay split
+# train: ModernBERT token classifier with a single drop head
 lamr-train  --config configs/default.yaml --shards data/labeled/*.jsonl --out artifacts/ckpts
 lamr-export --ckpt artifacts/ckpts/ckpt-final.pt --out artifacts/lamr-v0 --config configs/default.yaml
 ```
@@ -131,6 +131,6 @@ lamr-export --ckpt artifacts/ckpts/ckpt-final.pt --out artifacts/lamr-v0 --confi
 - Verified live 2026-06-05: Bedrock deepseek-v32 produces clean extractive output;
   kimi free is 429-rate-limited but the ensemble degrades gracefully.
 
-The architecture target if/when the neural pruner is built is a compact
-**bidirectional chunked encoder + dual-CRF (LLMLingua-2 family), NOT Gated
-DeltaNet-2** (`backbone.py` is still a stub). Verify before committing — see TODOS.md.
+The shipped neural pruner is the ModernBERT LaMR classifier exported to ONNX and
+decoded in Rust with span-aware word grouping. Older dual-CRF / DeltaNet notes are
+historical and should not guide new training runs.

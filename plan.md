@@ -1,10 +1,10 @@
-> **STATUS 2026-06-07 — partly superseded. Read [`README.md`](README.md) + [`TODOS.md`](TODOS.md) first.**
+> **STATUS 2026-06-24 — historical blueprint. Read [`README.md`](README.md) first for install and runtime reality.**
 > The **dual-CRF / query-adaptive head-gate** design below was **dropped**. The shipped LaMR
 > pruner is a **single per-token sigmoid "drop" head** on a pretrained **ModernBERT-150M**
 > encoder with **span-aware (word, `max`) decode** to a target rate. It is trained and
-> **SOTA-for-class on answer survival** (68% @3× vs keep-severity 14%, vs LLMLingua-2 ~20%).
-> The deterministic locking/dedup/CCR layer below is accurate and shipping. Latency
-> optimization and wiring the ONNX model into the Rust runtime are the open items.
+> **SOTA-for-class on answer survival** and live in the Rust MCP runtime. The deterministic
+> locking/dedup/CCR layer below is accurate and shipping; the neural architecture details are
+> historical.
 
 ---
 
@@ -49,5 +49,5 @@ A long-running incident timeline is the ultimate semi-structured stream. Compact
 
 Logs are dominated by repeated templates. Before any model runs, a deterministic single-pass pattern/template dedup stage collapses the repetition (the same log line emitted 10,000 times becomes one template + counts), and CCR + LCM handle arrays and long timelines. On real logs this captures most of the compression win with zero ML, microsecond latency, and full reversibility.
 
-- **Then, only if earned:** a benchmark measures the residual. If the deterministic stack leaves meaningful compressible prose, a compact bidirectional pruner (dual-CRF) surgically targets the residual heartbeat lines, repetitive INFO chatter, and duplicated frames. If it doesn't, the deterministic stack is the product and the model is skipped.
+- **Then, only if earned:** a benchmark measures the residual. If the deterministic stack leaves meaningful compressible prose, the ModernBERT LaMR drop classifier surgically targets residual heartbeat lines, repetitive INFO chatter, and duplicated frames. If it doesn't, the deterministic stack is the product and the model is skipped.
 - **Result:** the parseable records, error codes, and state transitions stay perfectly intact whether or not the neural stage ever ships, and every drop is recoverable from the cache/archive.

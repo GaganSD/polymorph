@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "polymorph": {
+      "command": "/absolute/path/to/lulu-polymorph/target/release/polymorph-mcp",
+      "env": {
+        "POLYMORPH_DB_PATH": "~/.polymorph/cache.db",
+        "POLYMORPH_GRAMMARS_DIR": "/absolute/path/to/lulu-polymorph/grammars"
+      }
+    }
+  }
+}

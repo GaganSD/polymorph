@@ -31,7 +31,7 @@ A working log of how we built a local-first, log-domain token compressor that be
 - Built an **iso-ratio** gate so methods are compared at *equal compression*, not equal target rate (the earlier tables compared apples to oranges).
 - Trained `mb_v0` to PR-AUC 0.873 / ROC 0.933, exported to ONNX (parity 3.9e-6).
 - Ran the decisive gate: **`lamr+span` 68% @3×, 48% @5× vs keep-severity 14%/10%, vs LLMLingua-2 ~20%.** Accuracy SOTA-for-class.
-- Benchmarked local latency — and hit a wall (see below).
+- Benchmarked local latency in the Rust `tract` runtime. The early scary number was a debug/cold-load artifact; release is interactive enough for the MCP path.
 
 ## Challenges
 
@@ -39,14 +39,14 @@ A working log of how we built a local-first, log-domain token compressor that be
 - **Long docs vs short training window:** real logs are ~4400 tokens; the model trains on 512. Naively truncating to one window silently drops every tail token. Fixed with windowed inference (score the whole doc in 512-token windows, concat probs).
 - **Comparing fairly:** every method hits a different ratio at the same target drop rate. Built per-item bisection to a target compression ratio.
 - **Judge design:** "answer the open question, then substring-match the gold" scored *correctly recovered* facts as 0 (paraphrase, generic question, truncation). Rewrote as a YES/NO entailment on the gold fact.
-- **Latency, still open:** 150M on CPU is ~5–7 s/doc — barely faster than a 3.7× larger model, i.e. the inference path is unoptimized. CoreML made it *worse* (graph shatters). The win needs quantization / dynamic-batch / tract — not yet done.
+- **Latency:** release `tract` loads the fp32 model in ~2.4 s and scores the 2077-token fixture in ~2.8 s. CoreML made it worse (graph shatters). INT8 is smaller but slower at inference, so fp32 remains the default.
 - **Infra flakiness:** Modal's default function timeout killed the first run; a worker preemption killed the second.
 
 ## Where we landed
 
 - **Accuracy: SOTA-for-class. ✓** ~4.9× over keep-severity, ~3.4× over LLMLingua-2, at matched compression, judged on answerability.
 - **Runs locally: ✓** (150M, ONNX, extractive).
-- **Low latency: ✗ not yet.** The one remaining bar. It's an engineering problem (optimize inference), not a research one (we proved a local small model can win).
+- **Low latency: ✓ for the source-install release path.** Build with `--release`; debug inference is still misleadingly slow.
 
 ## Mistakes made
 
@@ -61,5 +61,5 @@ A working log of how we built a local-first, log-domain token compressor that be
 ## What we'd tell the next person
 
 - Prove the *uncertain* thing first (can a local small model win on accuracy?) before polishing the certain things. We did, and it's yes.
-- Measure latency on a cool machine, in the actual runtime (tract), after quantization — the dev-Mac PyTorch/onnxruntime numbers are a floor, not the verdict.
+- Measure latency in the actual release runtime (`tract`), not debug builds or PyTorch notebooks. Quantization is a size trade, not automatically a speed win.
 - The infra (MCP + locking + dedup + structural floor + Rust runtime) is the moat; the model is a swappable, optimizable component.

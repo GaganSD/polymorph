@@ -1,9 +1,10 @@
-# Polymorph LaMR — Training & Distillation Pipeline
+# Polymorph LaMR - Training & Distillation Pipeline
 
-Python pipeline that trains the **Latent Multi-Rubric (LaMR)** dual-CRF token
-classifier used by the Polymorph Rust MCP server. Produces a self-contained
-ONNX artifact (`model.onnx` + side-car CRF transitions) that the Rust runtime
-loads at inference time to replace the mock pruner at `src/lamr.rs`.
+Python pipeline for training the optional **LaMR** learned pruner used by the
+Rust MCP server. The shipped `mb_v0` model is a ModernBERT-150M token classifier
+with a single per-token drop head. Export emits `model.onnx` plus optional
+`decode.json`; the Rust runtime handles tokenization, windowed `tract` inference,
+and span-aware word decode.
 
 ```
 ml_pipeline/
@@ -11,9 +12,9 @@ ml_pipeline/
 │   ├── distill/    # async litellm client, Claude + GPT-4o
 │   ├── qc/         # LLMLingua-2 VR + AG metrics + percentile filter
 │   ├── label/      # LCS alignment + tree-sitter AST hop-decay split
-│   ├── model/      # stubbed Gated DeltaNet-2 + head gate + dual CRF
-│   ├── train/      # IterableDataset, joint NLL loss, AMP loop
-│   └── export/     # ONNX + transitions.npz + parity check
+│   ├── model/      # ModernBERT / transformer / legacy stub backbones
+│   ├── train/      # IterableDataset, token-classifier loss, AMP loop
+│   └── export/     # ONNX + decode.json + parity check
 ├── tests/          # pytest, runs CPU-only with no API keys
 ├── scripts/run_e2e_smoke.sh
 └── configs/default.yaml
@@ -28,8 +29,10 @@ uv pip install -e '.[dev]'                   # core + pytest
 uv pip install -e '.[train]'                 # + wandb (optional)
 ```
 
-Tokenizer is `tiktoken cl100k_base` — must match `src/tokens.rs` in the Rust
-runtime. Don't change without re-training.
+Training labels are derived from byte alignment and can be projected across
+tokenizers. The shipped runtime uses the ModernBERT tokenizer in
+`assets/modernbert/tokenizer.json`; keep the training/export tokenizer aligned
+with that artifact.
 
 ## End-to-end smoke (no API spend, no GPU)
 
@@ -84,14 +87,14 @@ from polymorph_lamr.label.ast_split import split_labels
 
 align = derive_mask(original, compressed)
 split = split_labels(original, align.keep_mask, align.spans, lang="python")
-# split.w_semantic[i] + split.w_dependency[i] == 1.0 for each token
+# split.keep_mask is the extractive keep/drop target for each token
 ```
 
-- `align.derive_mask`: LCS over cl100k token-id streams produces a binary
-  keep/drop mask.
+- `align.derive_mask`: byte-level LCS alignment produces a binary keep/drop mask.
 - `split_labels`: walks the tree-sitter AST (via `tree-sitter-languages`,
   which ships compiled grammars matching `grammars/tree-sitter-*.wasm`),
-  computes hop distance to scaffold nodes, applies `exp(-α·h)` decay.
+  computes hop distance to scaffold nodes, and preserves dependency weights used
+  by older experiments.
 
 ### 4. Train (`polymorph_lamr.train`)
 
@@ -102,9 +105,8 @@ lamr-train --config configs/default.yaml --shards data/labeled/*.jsonl --out art
 - Dry-run (no shards, prints param count + memory estimate):
   `lamr-train --config configs/default.yaml --dry-run`
 - Single-node `torchrun` works; cluster deployment is the user's problem.
-- Joint loss uses the learned sequence-level head gate:
-  `L = λ_s · gate_sem · NLL_sem + λ_d · gate_dep · NLL_dep`, with per-token
-  hop-decay weights inside each CRF likelihood.
+- ModernBERT configs train a per-token drop classifier. Older configs still keep
+  the lightweight transformer and stub backbones for ablations.
 
 ### 5. Export (`polymorph_lamr.export.to_onnx`)
 
@@ -115,32 +117,28 @@ lamr-export --ckpt artifacts/ckpts/ckpt-final.pt --out artifacts/lamr-v0 \
 
 Emits:
 
-- `model.onnx` — backbone + semantic/dependency head gate + emission heads (dynamic seq axis).
-- `transitions.npz` — `{sem,dep}_{trans,start,end}` (2×2 each, tiny).
+- `model.onnx` — backbone + per-token drop logits.
+- `decode.json` — default target rate used by the Rust span decoder.
 - `config.yaml`, `README.md`, `parity.json`.
 
-Viterbi runs in Rust; see `ARTIFACT_OUT/README.md` for the decode protocol.
+The Rust runtime applies sigmoid, scores consecutive 512-token windows, and
+drops whole whitespace-word spans most-droppable-first while respecting the
+structural lock mask.
 
 ## Architecture notes
 
-### Stubbed backbone
-`polymorph_lamr/model/backbone.py:GatedDeltaNet2Stub` is a small ONNX-friendly
-feed-forward encoder. Search for the marker `_TODO_REAL_DELTANET` when swapping
-to the real kernel.
+### Backbones
+`modernbert` is the shipped path. `transformer` and `deltanet_stub` remain for
+tests and ablations; they are not the production runtime.
 
-### Dual CRF rationale
-Single-CRF pruning collapses semantic-evidence and dependency-scaffold
-transitions into one matrix — see
-`research/Context Management Papers Analysis.md`. We train two independent
-linear-chain CRFs over the same backbone hidden states. A learned softmax head
-gate produces semantic/dependency weights per sequence. At inference the Rust
-side builds one weighted CRF from both heads and runs one Viterbi decode.
+### Decode
+The earlier dual-CRF / Viterbi design was dropped. The production decode is a
+calibrated target-rate cut over model probabilities, grouped into word spans.
+This matched the answer-survival benchmark better and simplified the Rust path.
 
 ### ONNX export strategy
-Viterbi is dynamic-length and brittle under ONNX/TRT export. We export only
-the static graph (backbone + head gate + emissions) and ship the tiny `(2,2)`
-transition matrices as a side-car. Rust decodes the weighted CRF — the runtime
-already does sequential work, so the marginal cost is negligible.
+Only the static classifier graph is exported. Rust owns tokenization, windowing,
+sigmoid, and span decode so the deployed server has no Python dependency.
 
 ## Testing
 
@@ -153,6 +151,5 @@ RUN_REAL_API=1 pytest tests/test_distill_smoke.py::test_distill_pair_real_api
 ## Out of scope
 
 - RLAIF / RLHF post-training (described in the research doc, not built here).
-- The real Gated DeltaNet-2 kernel (stub now, swap later).
-- Rust-side ONNX loader + Viterbi decoder (separate work item in `src/lamr.rs`).
+- Replacing the shipped ModernBERT model with a smaller distilled model.
 - Distributed multi-node training scripts.

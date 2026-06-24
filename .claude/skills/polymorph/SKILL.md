@@ -84,10 +84,13 @@ it's specialized for operational logs and traces.
 ## Setup (one-time)
 
 - The Polymorph MCP server must be registered with your client (see the repo
-  README `mcpServers` block). Build it with `cargo build --release`.
-- For the **neural** pruner (best compression), point the server at the trained
-  model via its env: `POLYMORPH_LAMR_MODEL=/path/to/mb_v0/onnx/model.onnx`. Without
-  it, `compress_log` still runs the deterministic dedup + locking layer
-  (`used_model:false`).
+  README Claude Code or Cursor setup). Build it with `cargo build --release`.
+- Verify the local install before using the skill:
+  `./target/release/polymorph-mcp --selftest` and
+  `./target/release/polymorph-mcp --demo compress`.
+- For the **neural** pruner (best compression), install the model with
+  `bash scripts/fetch_model.sh` or point the server at an existing artifact via
+  `POLYMORPH_LAMR_MODEL=/path/to/mb_v0/onnx/model.onnx`. Without it,
+  `compress_log` still runs deterministic dedup + locking (`used_model:false`).
 - To use this skill outside this repo, copy `.claude/skills/polymorph/` to
   `~/.claude/skills/polymorph/`.

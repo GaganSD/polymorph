@@ -1,7 +1,7 @@
 [project]
 name = "polymorph-lamr"
 version = "0.1.0"
-description = "Training and distillation pipeline for Polymorph's LaMR dual-CRF token classifier"
+description = "Training and distillation pipeline for Polymorph's ModernBERT LaMR token classifier"
 requires-python = ">=3.11"
 dependencies = [
     "torch>=2.4",

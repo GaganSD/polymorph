@@ -1,9 +1,10 @@
 # Project: Polymorph
 
-> **STATUS 2026-06-07:** vision below is current. Implementation reality + results live in
+> **STATUS 2026-06-24:** vision below is product context. Implementation reality + install steps live in
 > [`README.md`](README.md); the learned pruner is now a single-head sigmoid token classifier on
 > ModernBERT-150M (the "dual-CRF" in [`plan.md`](plan.md) was dropped) and is SOTA-for-class on
-> answer survival. Open work (latency, Rust runtime wiring) is in [`TODOS.md`](TODOS.md).
+> answer survival. The Rust MCP runtime, `compress_log`, path-based setup, and local verification
+> commands are shipping.
 
 ## One-Line Description
 
@@ -72,7 +73,7 @@ LLM-driven log and trace analysis burns money and latency on input bloat, but ex
 
 **Observability / SRE Engineer:**
 
-1. Engineer installs Polymorph locally via standard package managers.
+1. Engineer installs Polymorph locally from source with `cargo build --release` (prebuilt package managers are a later distribution layer).
 2. Engineer connects Polymorph as an MCP server (or inline in the log-ingestion path) within their configuration (e.g., `.claude/settings.json`, an incident copilot, or a gateway).
 3. Every block of audit logs or trace spans bound for the LLM is piped through Polymorph's token-locking pipeline.
 4. Polymorph parses embedded JSON, locks the structural fields, error codes, and state transitions, uses its ML classifier to drop redundant heartbeat/INFO chatter and duplicated frames, and caches dropped spans locally.
@@ -89,7 +90,7 @@ LLM-driven log and trace analysis burns money and latency on input bloat, but ex
 
 A three-layer product strictly tailored for audit logs and production traces:
 
-1. **Open-source Core (Apache 2.0):** A native Rust binary leveraging a linear-time sequence model for ML inference, complete with the DAAC and Tree-sitter token-locking pipelines.
+1. **Open-source Core (MIT):** A native Rust binary with DAAC scanning, Tree-sitter token locking, template dedup, SQLite retrieval, and optional ModernBERT ONNX inference.
 2. **MCP Server Integration:** A fully compliant Model Context Protocol server that plugs directly into incident copilots, trace-analysis agents, and the broader observability ecosystem.
 3. **Hosted API (SaaS):** A managed endpoint with autoscaling, observability, and custom DAAC configuration profiles. Priced strictly on tokens saved.
 
@@ -101,7 +102,7 @@ A three-layer product strictly tailored for audit logs and production traces:
 * **DAAC Lexical Scanning:** Employs a Double-Array Aho-Corasick automaton to scan 100k-token log streams in $O(N)$ time (tens of microseconds) to identify and lock error codes, trace/span IDs, severity levels, API keys, and resource identifiers.
 * **Byte-to-Token Mapping:** Integrates Tiktoken's `decode_with_offsets` to translate physical character byte intervals perfectly into LLM token boundaries, solving UTF-8 misalignment.
 * **Compress-Cache-Retrieve (CCR) for arrays & logs:** Dynamically identifies massive JSON event arrays and dense log streams, retains the first/last elements to preserve boundaries, aggressively drops redundant operational statuses while rigorously preserving state transitions and explicit error codes, and caches the rest locally. The agent is provided a tool to retrieve the uncompressed cache instantly if needed.
-* **Evidence-gated ML pruner (dual-CRF):** Built only if a benchmark shows the deterministic stack leaves meaningful compressible residual. When built, the leading candidate is a compact bidirectional chunked encoder (LLMLingua-2 family) feeding dual Conditional Random Field heads (semantic evidence vs. dependency scaffolding) governed by a learned head gate. The architecture is a candidate pending verification, not a locked choice; the deterministic stack stands on its own without it.
+* **Evidence-gated ML pruner:** A ModernBERT-150M per-token drop classifier over the unlocked prose residual. Rust runs the ONNX graph with `tract`, then span-aware word decode drops low-salience prose while never dropping locked structure.
 * **Zero Data Retention Mode:** Fully self-hostable. No logging of proprietary audit payloads.
 
 ---
@@ -122,7 +123,7 @@ A three-layer product strictly tailored for audit logs and production traces:
 │    └── DAAC Automaton (O(N) error code / ID / severity lock) │
 │ 3. Sweep-Line Intersection (Generates Boolean Lock Mask)     │
 │ 4. Pattern/Template Dedup + CCR (deterministic compression)  │
-│ 5. Evidence-gated ML pruner (dual-CRF, on prose residual)    │
+│ 5. Optional ModernBERT LaMR pruner (on prose residual)       │
 └─────────────────────────┬────────────────────────────────────┘
                           ▼
 ┌───────────────────────────────────────────────────────────── ┐

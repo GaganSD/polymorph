@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "polymorph": {
+      "command": "/absolute/path/to/lulu-polymorph/target/release/polymorph-mcp",
+      "env": {
+        "POLYMORPH_DB_PATH": "~/.polymorph/cache.db",
+        "POLYMORPH_GRAMMARS_DIR": "/absolute/path/to/lulu-polymorph/grammars",
+        "POLYMORPH_LAMR_MODEL": "/absolute/path/to/lulu-polymorph/data/modal_out/mb_v0/onnx/model.onnx"
+      }
+    }
+  }
+}
