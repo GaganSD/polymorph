@@ -1,8 +1,10 @@
 # Polymorph
 
+> *wip*
+
 The fastest way to break a coding agent (like Claude or GPT) is to feed it massive log files and ask it to debug. **Polymorph** solves this with a low-latency, NLP-driven compression layer that drastically reduces token usage while safeguarding essential debugging data.
 
-## Evaluation Leaderboard [WIP]
+## Evaluation Leaderboard
 Log compression is inherently lossy; stripping text introduces a strict trade-off between token savings and LLM reasoning accuracy.
 
 Polymorph outperforms the current state-of-the-art (Microsoft's LLMLingua-2) by 3x specifically on log and trace compression. The leaderboard below tracks "answer survival"—how often an LLM can still successfully identify and fix a bug under matched log-compression workloads.
@@ -11,9 +13,9 @@ While local log compression remains a highly challenging frontier, Polymorph est
 
 | Model name | Reported Score |
 |---|---|
-| **Polymorph (LaMR with Span)** | **62% @3x / 44% @5x answer survival** |
+| **Polymorph (LaMR with Span)** | **62%  answer survival |
 | Microsoft's LLMLingua-2 | ~20% answer survival |
-| keep-severity method | 17% @3x / 14% @5x answer survival |
+| keep-severity method | 17% answer survival |
 
 ### How it Works
 
