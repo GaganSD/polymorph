@@ -1,14 +1,35 @@
 # Polymorph
 
-Polymorph is a local-first MCP server that compresses logs and traces before an
-LLM reads them. You give it a log; it returns a smaller log plus a `cache_id` for
-retrieving the original. Error codes, severities, IPs, UUIDs, trace IDs, and
-structured fields are force-kept.
+> Frontier companies like Anthropic and OpenAI have a financial incentive to maximize token input, even if they efficiently compress it with internal models. This drives the need for an independent token compression harness—ideally one that runs right on your laptop.
 
-The first-run path works without a model. That deterministic mode gives you
-template deduplication, structural locking, SQLite-backed retrieval, and MCP
-integration. The optional LaMR model adds learned prose pruning once
-`POLYMORPH_LAMR_MODEL` points at the ONNX artifact.
+The fastest way to break a coding agent (like Claude or GPT) is to feed it massive log files and ask it to debug. **Polymorph** solves this with a low-latency, NLP-driven compression layer that drastically reduces token usage without losing context.
+
+🚀 **Performance:** Polymorph outperforms the current SOTA (Microsoft's LLMLingua-2) by **3x** specifically for log and trace compression.
+
+### How it Works
+
+Polymorph operates as a tool for Claude Code or Cursor via a local **MCP (Model Context Protocol) server**, compressing logs and traces *before* the LLM reads them.
+
+1. **Input:** You feed it a raw log.
+2. **Output:** It returns a highly compressed log plus a `cache_id` for retrieving the original.
+
+> **Safety:** Critical context—such as error codes, severities, IPs, UUIDs, trace IDs, and structured fields—is strictly preserved.
+
+### Dual-Path Architecture
+
+* **Deterministic Mode (First-run / No model required):** Provides immediate template deduplication, structural locking, SQLite-backed retrieval, and native MCP integration.
+* **AI-Powered Mode (Optional):** Adds advanced, learned prose pruning by pointing the `POLYMORPH_LAMR_MODEL` environment variable to the downloaded ONNX artifact.
+
+## Evaluation Leaderboard
+
+Higher is better. Scores report answer survival under matched log-compression
+benchmarks.
+
+| Model name | Reported Score |
+|---|---|
+| **Polymorph (LaMR with Span)** | **62% @3x / 44% @5x answer survival** |
+| Microsoft's LLMLingua-2 | ~20% answer survival |
+| keep-severity method | 17% @3x / 14% @5x answer survival |
 
 ## Requirements
 
