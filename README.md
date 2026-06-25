@@ -1,10 +1,19 @@
 # Polymorph
 
-> Frontier companies like Anthropic and OpenAI have a financial incentive to maximize token input, even if they efficiently compress it with internal models. This drives the need for an independent token compression harness—ideally one that runs right on your laptop.
+The fastest way to break a coding agent (like Claude or GPT) is to feed it massive log files and ask it to debug. **Polymorph** solves this with a low-latency, NLP-driven compression layer that drastically reduces token usage while safeguarding essential debugging data.
 
-The fastest way to break a coding agent (like Claude or GPT) is to feed it massive log files and ask it to debug. **Polymorph** solves this with a low-latency, NLP-driven compression layer that drastically reduces token usage without losing context.
+## Evaluation Leaderboard [WIP]
+Log compression is inherently lossy; stripping text introduces a strict trade-off between token savings and LLM reasoning accuracy.
 
-🚀 **Performance:** Polymorph outperforms the current SOTA (Microsoft's LLMLingua-2) by **3x** specifically for log and trace compression.
+Polymorph outperforms the current state-of-the-art (Microsoft's LLMLingua-2) by 3x specifically on log and trace compression. The leaderboard below tracks "answer survival"—how often an LLM can still successfully identify and fix a bug under matched log-compression workloads.
+
+While local log compression remains a highly challenging frontier, Polymorph establishes a massive baseline advantage over existing NLP alternatives.
+
+| Model name | Reported Score |
+|---|---|
+| **Polymorph (LaMR with Span)** | **62% @3x / 44% @5x answer survival** |
+| Microsoft's LLMLingua-2 | ~20% answer survival |
+| keep-severity method | 17% @3x / 14% @5x answer survival |
 
 ### How it Works
 
@@ -20,16 +29,6 @@ Polymorph operates as a tool for Claude Code or Cursor via a local **MCP (Model 
 * **Deterministic Mode (First-run / No model required):** Provides immediate template deduplication, structural locking, SQLite-backed retrieval, and native MCP integration.
 * **AI-Powered Mode (Optional):** Adds advanced, learned prose pruning by pointing the `POLYMORPH_LAMR_MODEL` environment variable to the downloaded ONNX artifact.
 
-## Evaluation Leaderboard
-
-Higher is better. Scores report answer survival under matched log-compression
-benchmarks.
-
-| Model name | Reported Score |
-|---|---|
-| **Polymorph (LaMR with Span)** | **62% @3x / 44% @5x answer survival** |
-| Microsoft's LLMLingua-2 | ~20% answer survival |
-| keep-severity method | 17% @3x / 14% @5x answer survival |
 
 ## Requirements
 
